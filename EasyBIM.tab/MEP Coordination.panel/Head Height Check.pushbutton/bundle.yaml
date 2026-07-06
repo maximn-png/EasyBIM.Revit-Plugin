@@ -1,0 +1,12 @@
+title: |-
+  Head Height
+  Check
+tooltip: >-
+  Build clearance volumes above structural floors for Navisworks clash checking.
+  Extrudes the required head-height clearance (default 2200 mm) upward from each
+  structural-floor top face inside a scope box, reads MEP-Space overrides for
+  special zones, writes DirectShapes to the "+ Mass" workset, and isolates them
+  in the EB_3D_9.Mass 3D view.
+author: EasyBIM
+highlight: new
+min_revit_ver: 2023

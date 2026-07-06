@@ -1,0 +1,8 @@
+# This is a Revit shared parameter file.
+# Do not edit manually.
+*META	VERSION	MINVERSION
+META	2	1
+*GROUP	ID	NAME
+GROUP	1	EasyBIM_Coordination
+*PARAM	GUID	NAME	DATATYPE	DATACATEGORY	GROUP	VISIBLE	DESCRIPTION	USERMODIFIABLE	HIDEWHENNOVALUE
+PARAM	b1e7c4a2-9f3d-4c8a-8e21-6a5f0d2b7c14	Required Clearance Height	LENGTH		1	1	Minimum required head-height clearance for this space, measured normal to the walking surface. Read by the Head Height Check tool; overrides the project default (2200 mm) where set.	1	0
