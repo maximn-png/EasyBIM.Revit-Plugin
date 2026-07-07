@@ -143,29 +143,50 @@ def get_scope_boxes():
     )
 
 
-def _link_discipline_tag(name):
-    parts = name.upper().replace(u"-", u" ").split()
+def _link_discipline_label(name):
+    """Best-effort discipline guess from the link name, for display only.
+    Naming conventions vary a lot between projects/firms, so this is never
+    used to filter the link list — only to pre-select likely structural
+    links and label the rest."""
+    cleaned = name.upper()
+    for sep in (u"-", u"_", u".", u" "):
+        cleaned = cleaned.replace(sep, u" ")
+    parts = cleaned.split()
     for p in parts:
         if p in (u"ST", u"STR", u"STRUCT", u"STRUCTURAL"):
             return u"Structural"
-    return None
+        if p in (u"ME", u"MECH", u"HVAC"):
+            return u"Mechanical"
+        if p in (u"PL", u"PLM", u"PLUMBING"):
+            return u"Plumbing"
+        if p in (u"EL", u"ELEC", u"ELECTRICAL"):
+            return u"Electrical"
+        if p in (u"AR", u"ARC", u"ARCH", u"ARCHITECTURAL"):
+            return u"Architecture"
+    return u"Discipline not detected from name"
 
 
-def get_structural_links():
-    """Structural Revit links in the host model (loaded + unloaded)."""
+def get_available_links():
+    """Every Revit link in the host model (loaded + unloaded), any discipline.
+
+    The tool only reads OST_Floors from whichever link(s) the user selects —
+    it never filters the list down to "structural-looking" names, since that
+    naming heuristic varies per project. Links that look structural by name
+    are pre-checked as a convenience; every other link is still listed and
+    selectable, so a differently-named or alternate/cleaned-up model can be
+    used instead."""
     out = []
     for li in DB.FilteredElementCollector(doc).OfClass(DB.RevitLinkInstance):
         name = li.Name
-        if _link_discipline_tag(name) != u"Structural":
-            continue
+        disc = _link_discipline_label(name)
         link_doc = li.GetLinkDocument()
         out.append({
             u"instance": li,
             u"name": name,
-            u"disc": u"Structural",
+            u"disc": disc,
             u"loaded": link_doc is not None,
             u"doc": link_doc,
-            u"on": link_doc is not None,
+            u"on": (disc == u"Structural") and (link_doc is not None),
         })
     return sorted(out, key=lambda l: l[u"name"])
 
@@ -276,20 +297,22 @@ def _iter_solids(geom_element):
                 yield s
 
 
-def extract_top_face(floor, link_transform):
-    """Return (face, host_space_normal) for the floor's top face — the largest-
-    area face whose normal (transformed into host space) points upward. Works
-    for flat and sloped (ramp) floors alike."""
+def extract_top_faces(floor, link_transform):
+    """Return a list of (face, host_space_normal) for every upward-facing face
+    on the floor's solid(s) — i.e. every face whose normal (transformed into
+    host space) points up. A single floor's walking surface (a ramp, a
+    stepped slab, a slab with a landing) is very often split by Revit into
+    more than one planar face; returning only the single largest one silently
+    drops the rest of the surface, which is why ramps previously came out
+    only half-covered."""
     opt = DB.Options()
     opt.ComputeReferences = False
     opt.DetailLevel = DB.ViewDetailLevel.Fine
     geom = floor.get_Geometry(opt)
     if geom is None:
-        return None, None
+        return []
 
-    best_face = None
-    best_area = -1.0
-    best_normal = None
+    out = []
     for solid in _iter_solids(geom):
         for face in solid.Faces:
             bbox_uv = face.GetBoundingBox()
@@ -302,17 +325,62 @@ def extract_top_face(floor, link_transform):
             normal_host = link_transform.OfVector(normal_local).Normalize()
             if normal_host.Z <= 0.05:
                 continue
-            area = face.Area
-            if area > best_area:
-                best_area = area
-                best_face = face
-                best_normal = normal_host
-    return best_face, best_normal
+            out.append((face, normal_host))
+    return out
+
+
+def _transform_curve_loop(curve_loop, transform):
+    """CurveLoop itself has no CreateTransformed — transform each Curve and
+    rebuild the loop."""
+    new_loop = DB.CurveLoop()
+    for curve in curve_loop:
+        new_loop.Append(curve.CreateTransformed(transform))
+    return new_loop
 
 
 def face_boundary_loops_in_host_space(face, link_transform):
     loops = list(face.GetEdgesAsCurveLoops())
-    return [cl.CreateTransformed(link_transform) for cl in loops]
+    return [_transform_curve_loop(cl, link_transform) for cl in loops]
+
+
+def _face_triangulated_solids(face, link_transform, height_mm):
+    """Fallback for a face whose boundary-loop extrusion fails ("Non-planar
+    CurveLoop" / "extrudeProjCurveLoops failed") — real-world floor sketches
+    (offset edges, edited sub-elements, complex openings) occasionally produce
+    edge loops that don't satisfy CreateExtrusionGeometry's tolerance even
+    though the face reads as planar. Triangulating the face and extruding each
+    triangle individually sidesteps this entirely: three points are always
+    exactly coplanar, so every little prism is guaranteed valid. The prisms
+    are combined into one DirectShape and look like a single continuous
+    volume."""
+    height_ft = mm_to_ft(height_mm)
+    solids = []
+    try:
+        mesh = face.Triangulate()
+    except Exception:
+        mesh = None
+    if mesh is None:
+        return solids
+    for i in range(mesh.NumTriangles):
+        try:
+            tri = mesh.get_Triangle(i)
+            p0 = link_transform.OfPoint(tri.get_Vertex(0))
+            p1 = link_transform.OfPoint(tri.get_Vertex(1))
+            p2 = link_transform.OfPoint(tri.get_Vertex(2))
+            normal = (p1 - p0).CrossProduct(p2 - p0)
+            if normal.GetLength() < 1e-9:
+                continue
+            normal = normal.Normalize()
+            loop = DB.CurveLoop()
+            loop.Append(DB.Line.CreateBound(p0, p1))
+            loop.Append(DB.Line.CreateBound(p1, p2))
+            loop.Append(DB.Line.CreateBound(p2, p0))
+            solid = DB.GeometryCreationUtilities.CreateExtrusionGeometry(
+                SCG.List[DB.CurveLoop]([loop]), normal, height_ft)
+            solids.append(solid)
+        except Exception:
+            continue
+    return solids
 
 
 def _space_boundary_loops(space):
@@ -346,7 +414,7 @@ def _vertical_column_solid(loops):
         return None
     down = DB.Transform.CreateTranslation(DB.XYZ(0, 0, -COLUMN_MARGIN_FT))
     try:
-        shifted = [cl.CreateTransformed(down) for cl in loops]
+        shifted = [_transform_curve_loop(cl, down) for cl in loops]
         return DB.GeometryCreationUtilities.CreateExtrusionGeometry(
             SCG.List[DB.CurveLoop](shifted), DB.XYZ.BasisZ, COLUMN_HEIGHT_FT)
     except Exception:
@@ -393,12 +461,18 @@ def resolve_height(footprint_loops, candidate_spaces, default_mm):
     return [(height_mm, True), (default_mm, True)], False
 
 
-def create_clearance_shape(footprint_loops, host_normal, height_mm, ws_id):
+def create_clearance_shape(face, footprint_loops, host_normal, height_mm, ws_id, link_transform):
     height_ft = mm_to_ft(height_mm)
-    loop_list = SCG.List[DB.CurveLoop](footprint_loops)
-    solid = DB.GeometryCreationUtilities.CreateExtrusionGeometry(loop_list, host_normal, height_ft)
+    try:
+        loop_list = SCG.List[DB.CurveLoop](footprint_loops)
+        solid = DB.GeometryCreationUtilities.CreateExtrusionGeometry(loop_list, host_normal, height_ft)
+        solids = [solid]
+    except Exception:
+        solids = _face_triangulated_solids(face, link_transform, height_mm)
+        if not solids:
+            raise
     ds = DB.DirectShape.CreateElement(doc, DB.ElementId(DB.BuiltInCategory.OST_Floors))
-    ds.SetShape(SCG.List[DB.GeometryObject]([solid]))
+    ds.SetShape(SCG.List[DB.GeometryObject](solids))
     ds.Name = SHAPE_NAME
     if ws_id is not None:
         try:
@@ -481,18 +555,19 @@ def _gather_floor_footprints(scope_box, struct_links):
         link_doc = link_info[u"doc"]
         link_transform = link_info[u"instance"].GetTotalTransform()
         for floor in collect_structural_floors(link_doc, link_transform, scope_bbox):
-            face, normal = extract_top_face(floor, link_transform)
-            if face is None:
-                continue
-            loops = face_boundary_loops_in_host_space(face, link_transform)
-            if not loops:
-                continue
-            out.append({
-                u"link_name": link_info[u"name"],
-                u"label": _floor_label(floor),
-                u"loops": loops,
-                u"normal": normal,
-            })
+            label = _floor_label(floor)
+            for face, normal in extract_top_faces(floor, link_transform):
+                loops = face_boundary_loops_in_host_space(face, link_transform)
+                if not loops:
+                    continue
+                out.append({
+                    u"link_name": link_info[u"name"],
+                    u"label": label,
+                    u"loops": loops,
+                    u"normal": normal,
+                    u"face": face,
+                    u"link_transform": link_transform,
+                })
     return out
 
 
@@ -557,15 +632,17 @@ def run(footprints, struct_links, candidate_spaces, default_mm, clear_previous):
         t2 = DB.Transaction(doc, u"EasyBIM: Generate clearance volumes")
         t2.Start()
         zone_usage = {}
+        processed_floor_labels = set()
         for f in relevant:
-            summary[u"floors"] += 1
+            processed_floor_labels.add(f[u"label"])
             assignments, conflict = resolve_height(f[u"loops"], candidate_spaces, default_mm)
             if conflict:
                 summary[u"conflicts"].append(f[u"label"])
                 continue
             for height_mm, is_partial in assignments:
                 try:
-                    create_clearance_shape(f[u"loops"], f[u"normal"], height_mm, ws_id)
+                    create_clearance_shape(
+                        f[u"face"], f[u"loops"], f[u"normal"], height_mm, ws_id, f[u"link_transform"])
                 except Exception as ex:
                     logger.warning(u"Shape creation failed for {}: {}".format(f[u"label"], ex))
                     continue
@@ -573,6 +650,7 @@ def run(footprints, struct_links, candidate_spaces, default_mm, clear_previous):
                 bucket = zone_usage.setdefault(height_mm, {u"count": 0, u"partial": False})
                 bucket[u"count"] += 1
                 bucket[u"partial"] = bucket[u"partial"] or is_partial
+        summary[u"floors"] = len(processed_floor_labels)
         t2.Commit()
 
         t3 = DB.Transaction(doc, u"EasyBIM: Update 3D view")
@@ -772,7 +850,7 @@ XAML = u"""
           </Grid>
           <Border x:Name="NoLinksBanner" Background="#fbecec" BorderBrush="#f0c6c6" BorderThickness="1"
                   CornerRadius="8" Padding="11,9" Margin="0,0,0,16" Visibility="Collapsed">
-            <TextBlock Text="No loaded structural links found. Load one to run the check."
+            <TextBlock Text="No loaded links found. Load the link containing your structural floors and try again."
                        FontSize="12.5" Foreground="#374151" TextWrapping="Wrap"/>
           </Border>
           <Border x:Name="LinksCard" Background="White" BorderBrush="#e8eaff" BorderThickness="1"
@@ -1216,7 +1294,7 @@ class HeadHeightCheckDialog(object):
         loadable = [r for r in self._link_rows if r[u"info"][u"loaded"]]
         sel_count = sum(1 for r in loadable if r[u"info"][u"on"])
         self._window.FindName(u"LinksLabel").Text = (
-            u"STRUCTURAL LINKS · {} OF {} SELECTED".format(sel_count, len(loadable)))
+            u"LINKED MODELS · {} OF {} SELECTED".format(sel_count, len(loadable)))
         all_on = all(r[u"info"][u"on"] for r in loadable) if loadable else False
         toggle_btn = self._window.FindName(u"ToggleAllLinksBtn")
         toggle_btn.Content = u"Deselect all" if all_on else u"Select all"
@@ -1799,10 +1877,10 @@ def main():
                 traceback.format_exc()),
             title=u"EasyBIM — Error", exitscript=True)
 
-    struct_links = get_structural_links()
+    struct_links = get_available_links()
     if not struct_links:
         forms.alert(
-            u"No structural links found in this model. Load a structural link and try again.",
+            u"No Revit links found in this model. Load the link containing your structural floors and try again.",
             title=u"EasyBIM", exitscript=True)
 
     scope_boxes = get_scope_boxes()
@@ -1812,7 +1890,13 @@ def main():
             title=u"EasyBIM", exitscript=True)
 
     dlg = HeadHeightCheckDialog(struct_links, scope_boxes)
-    dlg.show()
+    try:
+        dlg.show()
+    except Exception:
+        forms.alert(
+            u"Head Height Check failed while building the dialog:\n\n{}".format(
+                traceback.format_exc()),
+            title=u"EasyBIM — Error", exitscript=True)
 
     if dlg.cancelled:
         return
