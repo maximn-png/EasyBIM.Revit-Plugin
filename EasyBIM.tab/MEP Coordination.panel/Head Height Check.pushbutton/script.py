@@ -55,8 +55,14 @@ SHARED_PARAM_FILE = os.path.join(os.path.dirname(__file__),
 SHARED_PARAM_GROUP_NAME = u"EasyBIM_Coordination"
 
 MM_PER_FT          = 304.8
-COLUMN_MARGIN_FT   = 50.0    # vertical margin (below) for the shadow-column overlap test
-COLUMN_HEIGHT_FT   = 100.0   # total height of the shadow column
+# Vertical margin/height for the horizontal-overlap "shadow column" (see
+# _vertical_column_solid): just enough to tolerate a Space's Base
+# Offset/Upper Limit not lining up exactly with the floor's top face within
+# the SAME story — must stay well under a typical story height (10-13 ft),
+# or a zone on one level will incorrectly "reach" the floors of other levels
+# above/below it.
+COLUMN_MARGIN_FT   = 5.0     # vertical margin (below) for the shadow-column overlap test
+COLUMN_HEIGHT_FT   = 10.0    # total height of the shadow column
 FULL_OVERLAP_RATIO = 0.98    # >= this fraction of footprint area counts as "full" overlap
 
 # BuiltInParameterGroup was replaced by GroupTypeId in newer Revit API versions.
@@ -191,15 +197,22 @@ def get_available_links():
     return sorted(out, key=lambda l: l[u"name"])
 
 
-def _bbox_intersects(a, b):
+def _bbox_intersects_xy(a, b):
+    """Horizontal-only bbox overlap. A Space's vertical extent (its Level,
+    Base Offset and Upper Limit) essentially never lines up with a floor's
+    actual elevation or a scope box's Z range, and the rest of this tool's
+    height-resolution logic (the vertical "shadow column" technique) already
+    ignores Z entirely for exactly that reason — so this pre-filter must too,
+    or a perfectly valid Space gets silently dropped before it's ever
+    considered."""
     return not (a.Max.X < b.Min.X or a.Min.X > b.Max.X or
-                a.Max.Y < b.Min.Y or a.Min.Y > b.Max.Y or
-                a.Max.Z < b.Min.Z or a.Min.Z > b.Max.Z)
+                a.Max.Y < b.Min.Y or a.Min.Y > b.Max.Y)
 
 
 def get_clearance_spaces_in_scope(scope_box):
-    """MEP Spaces carrying a CLEARANCE_PARAM override whose bbox intersects the
-    scope box. Returns a list of (space, height_mm) tuples."""
+    """MEP Spaces carrying a CLEARANCE_PARAM override whose footprint (in X/Y
+    only — see _bbox_intersects_xy) overlaps the scope box. Returns a list of
+    (space, height_mm) tuples."""
     scope_bbox = scope_box.get_BoundingBox(None)
     if scope_bbox is None:
         return []
@@ -212,7 +225,7 @@ def get_clearance_spaces_in_scope(scope_box):
         if not (p and p.HasValue and p.AsDouble() > 0):
             continue
         sp_bbox = sp.get_BoundingBox(None)
-        if sp_bbox is None or not _bbox_intersects(scope_bbox, sp_bbox):
+        if sp_bbox is None or not _bbox_intersects_xy(scope_bbox, sp_bbox):
             continue
         out.append((sp, ft_to_mm(p.AsDouble())))
     return out
@@ -356,7 +369,10 @@ def _face_triangulated_solids(face, link_transform, height_mm):
     height_ft = mm_to_ft(height_mm)
     solids = []
     try:
-        mesh = face.Triangulate()
+        mesh = face.Triangulate(1.0)  # finest level of detail — minimizes real
+        # gaps between triangles on large/complex faces (a coarse default
+        # mesh can leave small uncovered slivers even though the combined
+        # bounding box spans the whole face correctly)
     except Exception:
         mesh = None
     if mesh is None:
@@ -405,74 +421,491 @@ def _space_boundary_loops(space):
     return loops
 
 
-def _vertical_column_solid(loops):
-    """Extrude loops (translated down by COLUMN_MARGIN_FT, then swept vertically
-    by COLUMN_HEIGHT_FT) into a tall vertical prism. Used purely to test
-    horizontal footprint overlap between two loops regardless of their actual
-    Z elevation (a floor's top face vs. a Space's own base elevation)."""
+def _vertical_column_solid(loops, margin_ft=COLUMN_MARGIN_FT, height_ft=COLUMN_HEIGHT_FT):
+    """Extrude loops (translated down by margin_ft, then swept vertically by
+    height_ft) into a tall vertical prism. Used purely to test horizontal
+    footprint overlap between two loops regardless of their actual Z
+    elevation (a floor's top face vs. a Space's own base elevation)."""
     if not loops:
         return None
-    down = DB.Transform.CreateTranslation(DB.XYZ(0, 0, -COLUMN_MARGIN_FT))
+    down = DB.Transform.CreateTranslation(DB.XYZ(0, 0, -margin_ft))
     try:
         shifted = [_transform_curve_loop(cl, down) for cl in loops]
         return DB.GeometryCreationUtilities.CreateExtrusionGeometry(
-            SCG.List[DB.CurveLoop](shifted), DB.XYZ.BasisZ, COLUMN_HEIGHT_FT)
+            SCG.List[DB.CurveLoop](shifted), DB.XYZ.BasisZ, height_ft)
     except Exception:
         return None
 
 
-def resolve_height(footprint_loops, candidate_spaces, default_mm):
-    """candidate_spaces: list of (space_element, height_mm) — the zones the
-    caller has applied. Returns (assignments, conflict):
-      - no overlapping Space -> [(default_mm, False)]
-      - one overlapping value, full coverage -> [(value, False)]
-      - one overlapping value, partial coverage -> [(value, True), (default_mm, True)]
-      - multiple overlapping Spaces with DIFFERENT values -> ([], True)  (flag, don't guess)
-    """
-    footprint_col = _vertical_column_solid(footprint_loops)
-    if footprint_col is None or footprint_col.Volume <= 0:
-        return [(default_mm, False)], False
+def _space_shadow_column(sp, loops):
+    """Zone shadow column for a Space, built from its OWN real vertical
+    extent (bounding box — reflecting its actual Level/Base Offset through
+    Upper Limit/Limit Offset) instead of a generic fixed margin around one Z
+    value. A properly configured Space already spans its whole story height,
+    so this naturally and reliably covers any reasonable clearance height
+    above the floor without needing to guess a tolerance — and it stays
+    confined to roughly one story, since that's genuinely how tall the Space
+    is, avoiding the "reaches other floors" problem a large fixed margin has.
+    Falls back to the generic margin-based column if the bbox is unusable."""
+    if not loops:
+        return None
+    bbox = sp.get_BoundingBox(None)
+    if bbox is None or bbox.Max.Z <= bbox.Min.Z:
+        return _vertical_column_solid(loops)
+    tol_ft = 1.0
+    try:
+        loop_z = next(iter(loops[0])).GetEndPoint(0).Z
+    except Exception:
+        return _vertical_column_solid(loops)
+    bottom_z = bbox.Min.Z - tol_ft
+    total_height = (bbox.Max.Z - bbox.Min.Z) + 2 * tol_ft
+    shift = DB.Transform.CreateTranslation(DB.XYZ(0, 0, bottom_z - loop_z))
+    try:
+        shifted = [_transform_curve_loop(cl, shift) for cl in loops]
+        return DB.GeometryCreationUtilities.CreateExtrusionGeometry(
+            SCG.List[DB.CurveLoop](shifted), DB.XYZ.BasisZ, total_height)
+    except Exception:
+        return _vertical_column_solid(loops)
 
-    overlapping_heights = set()
-    covered_volume = 0.0
-    for sp, sp_height_mm in candidate_spaces:
-        sp_col = _vertical_column_solid(_space_boundary_loops(sp))
-        if sp_col is None or sp_col.Volume <= 0:
-            continue
+
+def _vertical_column_solids_from_face(face, link_transform, margin_ft, height_ft):
+    """Fallback for _vertical_column_solid when the edge-loop version fails
+    (the same fragile-geometry cases that can break the real clearance
+    extrusion). Triangulates the face and builds one small vertical column
+    per triangle instead of one clean solid for the whole face — always
+    valid, since three points are always coplanar. Without this, a floor
+    with imperfect boundary geometry silently looks like it has "no
+    override Space" overlap (falls back to the default height with no
+    warning) even though its clearance shape itself generates fine via the
+    same triangulation fallback."""
+    solids = []
+    try:
+        mesh = face.Triangulate(1.0)  # finest level of detail — minimizes real
+        # gaps between triangles on large/complex faces (a coarse default
+        # mesh can leave small uncovered slivers even though the combined
+        # bounding box spans the whole face correctly)
+    except Exception:
+        mesh = None
+    if mesh is None:
+        return solids
+    down = DB.Transform.CreateTranslation(DB.XYZ(0, 0, -margin_ft))
+    for i in range(mesh.NumTriangles):
         try:
-            inter = DB.BooleanOperationsUtils.ExecuteBooleanOperation(
-                footprint_col, sp_col, DB.BooleanOperationsType.Intersect)
+            tri = mesh.get_Triangle(i)
+            p0 = down.OfPoint(link_transform.OfPoint(tri.get_Vertex(0)))
+            p1 = down.OfPoint(link_transform.OfPoint(tri.get_Vertex(1)))
+            p2 = down.OfPoint(link_transform.OfPoint(tri.get_Vertex(2)))
+            loop = DB.CurveLoop()
+            loop.Append(DB.Line.CreateBound(p0, p1))
+            loop.Append(DB.Line.CreateBound(p1, p2))
+            loop.Append(DB.Line.CreateBound(p2, p0))
+            solid = DB.GeometryCreationUtilities.CreateExtrusionGeometry(
+                SCG.List[DB.CurveLoop]([loop]), DB.XYZ.BasisZ, height_ft)
+            solids.append(solid)
         except Exception:
             continue
-        if inter is None or inter.Volume <= 1e-9:
-            continue
-        overlapping_heights.add(sp_height_mm)
-        covered_volume += inter.Volume
+    return solids
 
-    if not overlapping_heights:
-        return [(default_mm, False)], False
-    if len(overlapping_heights) > 1:
+
+def _footprint_shadow_columns(loops, face, link_transform, margin_ft=COLUMN_MARGIN_FT, height_ft=COLUMN_HEIGHT_FT):
+    """Robust version of _vertical_column_solid for a floor footprint: try the
+    single-solid loop method first (cheap, exact); fall back to the
+    per-triangle method (via `face`/`link_transform`) if that fails. Returns
+    a list of solids (normally just one).
+
+    `margin_ft`/`height_ft` control how far this reaches below/above the
+    floor's own top face — callers doing the real height-resolution (see
+    resolve_height) should size `height_ft` to comfortably cover whatever
+    clearance heights are actually in play, so this "is there overlap" test
+    can never disagree with what the real boolean clip later finds."""
+    col = _vertical_column_solid(loops, margin_ft, height_ft)
+    if col is not None and col.Volume > 0:
+        return [col]
+    if face is None or link_transform is None:
+        return []
+    return [s for s in _vertical_column_solids_from_face(face, link_transform, margin_ft, height_ft)
+            if s.Volume > 0]
+
+
+def _union_solids(solids):
+    """Boolean-union a list of solids into one. Falls back to keeping the
+    running result as-is if a particular union fails (e.g. numerically
+    degenerate overlap) rather than losing everything."""
+    result = None
+    for s in solids:
+        if result is None:
+            result = s
+            continue
+        try:
+            merged = DB.BooleanOperationsUtils.ExecuteBooleanOperation(
+                result, s, DB.BooleanOperationsType.Union)
+            if merged is not None:
+                result = merged
+        except Exception:
+            pass
+    return result
+
+
+def _log_no_coverage_gap(f):
+    """Loud, unmistakable warning for the rare case where NONE of a
+    fragment's assignments produced any shape at all — a genuine coverage
+    gap (no clearance mass whatsoever at that spot), as opposed to the
+    routine fallback cases in create_clearance_shape that still end up
+    producing something. Should almost never fire; if it does, it pinpoints
+    exactly where to look instead of hunting through coordinates."""
+    try:
+        pts = []
+        for cl in f[u"loops"]:
+            for curve in cl:
+                pts.append(curve.GetEndPoint(0))
+        xs = [p.X for p in pts]
+        ys = [p.Y for p in pts]
+        bbox_line = u"X=[{:.2f}, {:.2f}] Y=[{:.2f}, {:.2f}] Z~{:.2f}ft".format(
+            min(xs), max(xs), min(ys), max(ys), pts[0].Z)
+    except Exception:
+        bbox_line = u"bbox unavailable"
+    logger.warning(
+        u"*** COVERAGE GAP *** {}: no clearance shape at all could be built for this "
+        u"fragment (every assignment failed, including fallbacks) — {}".format(f[u"label"], bbox_line))
+
+
+def resolve_height(footprint_loops, candidate_spaces, default_mm, face=None, link_transform=None):
+    """candidate_spaces: list of (space_element, height_mm) — the zones the
+    caller has applied. `face`/`link_transform` are optional, used only as a
+    fallback (see _footprint_shadow_columns) when the footprint's own edge
+    loops fail to build a valid overlap-test solid.
+
+    Returns (assignments, conflict). Each assignment is a dict:
+      {"height_mm": ..., "is_partial": bool, "clip": solid_or_None, "exclude": solid_or_None,
+       "expected_ratio": float_or_None}
+    "clip" means "keep only the part of the extrusion inside this solid" (used
+    to confine the override height to the zone's own footprint); "exclude"
+    means the opposite (used to carve the zone's footprint out of the
+    default-height extrusion so the two don't overlap). "expected_ratio" is
+    the fraction of the floor's total top-face area this assignment should
+    end up covering once built — used by create_clearance_shape as a sanity
+    check against a silent partial geometry loss; None where no clip/exclude
+    is applied (nothing to check).
+
+      - no overlapping Space -> [{default_mm, clip=None, exclude=None}]
+      - one overlapping value, full coverage -> [{value, clip=None, exclude=None}]
+      - one overlapping value, partial coverage ->
+            [{value, clip=zone}, {default_mm, exclude=zone}]
+      - multiple overlapping Spaces with DIFFERENT values -> ([], True)  (flag, don't guess)
+    """
+    def _plain(height_mm):
+        return [{u"height_mm": height_mm, u"is_partial": False, u"clip": None, u"exclude": None,
+                  u"expected_ratio": None}]
+
+    # Reach exactly as high as the tallest clearance height actually in play
+    # (plus a small tolerance) — never a generic fixed guess. This is what
+    # keeps this "is there overlap" test from ever disagreeing with what the
+    # real boolean clip in create_clearance_shape finds: if the floor's
+    # shadow column stopped short of the real clearance height, this could
+    # say "no overlap" for a case that, once actually extruded that high,
+    # would have overlapped the zone after all.
+    all_heights_mm = [default_mm] + [h for _, h in candidate_spaces]
+    reach_ft = mm_to_ft(max(all_heights_mm)) + 1.0
+    margin_ft = 1.0
+
+    footprint_cols = _footprint_shadow_columns(footprint_loops, face, link_transform, margin_ft, reach_ft)
+    footprint_volume = sum(c.Volume for c in footprint_cols)
+    if not footprint_cols or footprint_volume <= 0:
+        return _plain(default_mm), False
+
+    overlapping = {}   # height_mm -> {"volume": float, "cols": [space_col, ...]}
+    for sp, sp_height_mm in candidate_spaces:
+        sp_col = _space_shadow_column(sp, _space_boundary_loops(sp))
+        if sp_col is None or sp_col.Volume <= 0:
+            continue
+        overlap_vol = 0.0
+        for fcol in footprint_cols:
+            try:
+                inter = DB.BooleanOperationsUtils.ExecuteBooleanOperation(
+                    fcol, sp_col, DB.BooleanOperationsType.Intersect)
+            except Exception:
+                continue
+            if inter is not None and inter.Volume > 1e-9:
+                overlap_vol += inter.Volume
+        if overlap_vol <= 1e-9:
+            continue
+        bucket = overlapping.setdefault(sp_height_mm, {u"volume": 0.0, u"cols": []})
+        bucket[u"volume"] += overlap_vol
+        bucket[u"cols"].append(sp_col)
+
+    if not overlapping:
+        return _plain(default_mm), False
+    if len(overlapping) > 1:
         return [], True
 
-    height_mm = next(iter(overlapping_heights))
-    ratio = min(covered_volume / footprint_col.Volume, 1.0)
+    height_mm, bucket = next(iter(overlapping.items()))
+    ratio = min(bucket[u"volume"] / footprint_volume, 1.0)
     if ratio >= FULL_OVERLAP_RATIO:
-        return [(height_mm, False)], False
-    return [(height_mm, True), (default_mm, True)], False
+        return _plain(height_mm), False
+
+    zone_col = _union_solids(bucket[u"cols"])
+    if zone_col is None:
+        # Couldn't build a clip volume — fall back to the old full-footprint
+        # behavior rather than losing the override entirely.
+        return _plain(height_mm), False
+
+    return [
+        {u"height_mm": height_mm, u"is_partial": True, u"clip": zone_col, u"exclude": None,
+         u"expected_ratio": ratio},
+        {u"height_mm": default_mm, u"is_partial": True, u"clip": None, u"exclude": zone_col,
+         u"expected_ratio": 1.0 - ratio},
+    ], False
 
 
-def create_clearance_shape(face, footprint_loops, host_normal, height_mm, ws_id, link_transform):
+def _solids_bbox_text(solids):
+    """Best-effort bounding-box text for a list of solids, via edge
+    tessellation (Solid has no direct GetBoundingBox()) — used to verify
+    WHERE a fallback-built solid actually ended up, since a bad per-triangle
+    normal from the triangulated fallback could point a piece sideways
+    instead of straight up."""
+    try:
+        pts = []
+        for s in solids:
+            for edge in s.Edges:
+                pts.extend(edge.Tessellate())
+        if not pts:
+            return u"no points"
+        xs = [p.X for p in pts]
+        ys = [p.Y for p in pts]
+        zs = [p.Z for p in pts]
+        return u"X=[{:.2f}, {:.2f}] Y=[{:.2f}, {:.2f}] Z=[{:.2f}, {:.2f}]".format(
+            min(xs), max(xs), min(ys), max(ys), min(zs), max(zs))
+    except Exception:
+        return u"bbox unavailable"
+
+
+def _apply_clip(solids, clip_solid, op):
+    out = []
+    for s in solids:
+        try:
+            r = DB.BooleanOperationsUtils.ExecuteBooleanOperation(s, clip_solid, op)
+        except Exception:
+            r = None
+        try:
+            if r is not None and r.Volume > 1e-6:
+                out.append(r)
+        except Exception:
+            pass
+    return out
+
+
+def _piece_centroid(solid):
+    try:
+        pts = []
+        for edge in solid.Edges:
+            pts.extend(edge.Tessellate())
+        if not pts:
+            return None
+        n = float(len(pts))
+        return DB.XYZ(sum(p.X for p in pts) / n, sum(p.Y for p in pts) / n, sum(p.Z for p in pts) / n)
+    except Exception:
+        return None
+
+
+def _point_inside_solid(point, solid, probe_half_ft=50.0):
+    """Point-in-solid test via a vertical ray cast (Solid.IntersectWithCurve)
+    rather than a solid-vs-solid boolean op — used to classify whole pieces as
+    inside/outside a zone (see _apply_clip_by_containment) without relying on
+    an exact cut at the zone boundary."""
+    try:
+        p0 = DB.XYZ(point.X, point.Y, point.Z - probe_half_ft)
+        p1 = DB.XYZ(point.X, point.Y, point.Z + probe_half_ft)
+        line = DB.Line.CreateBound(p0, p1)
+        opts = DB.SolidCurveIntersectionOptions()
+        opts.ResultType = DB.SolidCurveIntersectionMode.CurveSegmentsInside
+        result = solid.IntersectWithCurve(line, opts)
+        for i in range(result.SegmentCount):
+            seg = result.GetCurveSegment(i)
+            z0, z1 = seg.GetEndPoint(0).Z, seg.GetEndPoint(1).Z
+            if min(z0, z1) <= point.Z <= max(z0, z1):
+                return True
+        return False
+    except Exception:
+        return False
+
+
+def _apply_clip_by_containment(solids, clip_solid, keep_inside):
+    """Per-piece containment test used ONLY for the triangulated fallback
+    (many small triangle-prisms — see _face_triangulated_solids). Cutting each
+    tiny prism exactly at the zone boundary (_apply_clip) fails silently on
+    the cluster of triangles that straddle a mesh crease very close to the cut
+    plane (e.g. a ramp-to-flat transition) — Revit's boolean engine is
+    unreliable right at near-tangent/coincident cuts, and _apply_clip only
+    warns when EVERY piece is lost, so a partial loss along that crease
+    produces a real, silent coverage gap. Classifying each whole piece by its
+    centroid sidesteps exact-boundary boolean failures entirely; the only
+    cost is the zone edge follows the mesh's own triangle edges instead of
+    the precise zone polygon, which is a far better trade than a gap."""
+    out = []
+    for s in solids:
+        c = _piece_centroid(s)
+        if c is None:
+            continue
+        if _point_inside_solid(c, clip_solid) == keep_inside:
+            out.append(s)
+    return out
+
+
+def _try_set_shape(solids):
+    """Attempt to build a DirectShape from `solids`. DirectShape.SetShape has
+    its own stricter validation than a plain Volume check — boolean clip
+    results can look fine (positive volume) yet still contain a sliver at the
+    cut boundary that SetShape rejects outright ("does not satisfy DirectShape
+    validation criteria"). Rather than guess at a pre-check, just try it: on
+    failure, clean up the half-created element and return None so the caller
+    can fall back to different geometry."""
+    if not solids:
+        return None
+    ds = DB.DirectShape.CreateElement(doc, DB.ElementId(DB.BuiltInCategory.OST_Floors))
+    try:
+        ds.SetShape(SCG.List[DB.GeometryObject](solids))
+        return ds
+    except Exception:
+        try:
+            doc.Delete(ds.Id)
+        except Exception:
+            pass
+        return None
+
+
+def _filter_individually_valid(solids):
+    """SetShape validates the WHOLE batch at once — a single bad solid among
+    many good ones (typical after clipping many small triangulated pieces,
+    see _face_triangulated_solids) makes Revit reject the entire list, not
+    just the offending piece. Test each solid on its own via a throwaway
+    DirectShape and keep only the ones that individually pass, so one bad
+    triangle doesn't take down all its neighbors."""
+    if len(solids) <= 1:
+        return solids
+    good = []
+    for s in solids:
+        ds = _try_set_shape([s])
+        if ds is not None:
+            try:
+                doc.Delete(ds.Id)
+            except Exception:
+                pass
+            good.append(s)
+    return good
+
+
+def _check_clip_area(label, face, height_ft, height_mm, solids, expected_ratio):
+    """Sanity check: compare the actual footprint area of a clipped/excluded
+    assignment against the area resolve_height already expected it to cover
+    (from the floor/zone overlap ratio it computed). A silent partial
+    geometry loss — from a boolean-cut edge case, a containment-test blind
+    spot, or anything else — would otherwise look just like a normal,
+    successful (but wrong) result. Volume/height_ft recovers footprint area
+    for any of these uniform-prism pieces regardless of extrusion direction,
+    since Volume = cross_section_area * length along that direction."""
+    try:
+        total_area = face.Area
+        if total_area <= 0 or height_ft <= 0:
+            return
+        actual_area = sum(s.Volume for s in solids) / height_ft
+        expected_area = total_area * expected_ratio
+        if expected_area <= 1e-6:
+            return
+        pct = actual_area / expected_area
+        if pct < 0.85 or pct > 1.15:
+            logger.warning(
+                u"*** CLIP AREA MISMATCH *** {}: expected ~{:.1f} sqft at {}mm ({:.0f}% of the floor's "
+                u"{:.1f} sqft top face) but got {:.1f} sqft ({:.0f}% of expected) — possible silent "
+                u"geometry loss, please verify this floor visually.".format(
+                    label, expected_area, height_mm, expected_ratio * 100, total_area, actual_area, pct * 100))
+    except Exception:
+        pass
+
+
+def create_clearance_shape(face, footprint_loops, host_normal, height_mm, ws_id, link_transform,
+                            clip=None, exclude=None, label=None, expected_ratio=None):
+    """Build the DirectShape for one assignment. `clip`/`exclude` (mutually
+    exclusive in practice) confine the extrusion to inside or outside a zone's
+    footprint for the partial-overlap case — see resolve_height. `label` is
+    only used for warning messages. `expected_ratio` (set only for
+    partial-overlap assignments) drives the _check_clip_area sanity check.
+    Returns None if nothing could be built at all (always logged — this
+    should be rare, since a partial-overlap assignment is expected to produce
+    real geometry on both sides)."""
     height_ft = mm_to_ft(height_mm)
+    needs_clip = clip is not None or exclude is not None
+
+    triangulated = False
     try:
         loop_list = SCG.List[DB.CurveLoop](footprint_loops)
         solid = DB.GeometryCreationUtilities.CreateExtrusionGeometry(loop_list, host_normal, height_ft)
-        solids = [solid]
-    except Exception:
-        solids = _face_triangulated_solids(face, link_transform, height_mm)
-        if not solids:
+        base_solids = [solid]
+    except Exception as base_ex:
+        base_solids = _face_triangulated_solids(face, link_transform, height_mm)
+        triangulated = True
+        if not base_solids:
             raise
-    ds = DB.DirectShape.CreateElement(doc, DB.ElementId(DB.BuiltInCategory.OST_Floors))
-    ds.SetShape(SCG.List[DB.GeometryObject](solids))
+        logger.info(
+            u"*** BASE FALLBACK *** {}: clean extrusion failed ({}) at {}mm — used triangulated "
+            u"fallback ({} piece(s)), resulting bbox {}".format(
+                label, base_ex, height_mm, len(base_solids), _solids_bbox_text(base_solids)))
+
+    solids = base_solids
+    if needs_clip and not triangulated:
+        # A partial zone clip against a single large solid still relies on an
+        # EXACT boolean cut at the zone boundary — the same class of Revit
+        # boolean fragility that silently drops geometry on the triangulated
+        # fallback path, just less likely to trigger on one big solid. Always
+        # triangulate for the clip step itself, even when the un-clipped
+        # extrusion was clean, so every partial-overlap assignment goes
+        # through the same robust, per-piece containment test rather than a
+        # fragile single-cut. Falls back to the exact-cut path only if
+        # triangulation itself yields nothing.
+        clip_solids = _face_triangulated_solids(face, link_transform, height_mm)
+        if clip_solids:
+            solids = clip_solids
+            triangulated = True
+
+    if clip is not None:
+        if triangulated:
+            # Exact boolean cutting of each tiny triangle prism at the zone
+            # boundary fails silently on the cluster of triangles straddling
+            # a mesh crease (e.g. a ramp-to-flat transition) close to the cut
+            # plane — see _apply_clip_by_containment. Classify whole pieces
+            # by centroid instead.
+            solids = _apply_clip_by_containment(solids, clip, True)
+        else:
+            solids = _apply_clip(solids, clip, DB.BooleanOperationsType.Intersect)
+        if not solids:
+            logger.info(u"{}: zone clip left no overlapping geometry at {}mm — "
+                        u"falling back to the un-clipped floor.".format(label, height_mm))
+    elif exclude is not None:
+        if triangulated:
+            solids = _apply_clip_by_containment(solids, exclude, False)
+        else:
+            solids = _apply_clip(solids, exclude, DB.BooleanOperationsType.Difference)
+        if not solids:
+            logger.info(u"{}: excluding the zone left nothing at {}mm — "
+                        u"falling back to the un-clipped floor.".format(label, height_mm))
+
+    if expected_ratio is not None and solids:
+        _check_clip_area(label, face, height_ft, height_mm, solids, expected_ratio)
+
+    solids = _filter_individually_valid(solids)
+    ds = _try_set_shape(solids)
+    if ds is None and solids:
+        logger.warning(u"{}: DirectShape rejected the clipped geometry at {}mm even "
+                        u"individually — highly unusual.".format(label, height_mm))
+    if ds is None and (clip is not None or exclude is not None):
+        # Clipping either produced nothing or Revit rejected the boolean
+        # result outright — fall back to the un-clipped extrusion rather than
+        # losing the floor entirely.
+        ds = _try_set_shape(_filter_individually_valid(base_solids))
+        if ds is None:
+            logger.warning(u"{}: fallback un-clipped shape also rejected at {}mm.".format(label, height_mm))
+    if ds is None:
+        return None
+
     ds.Name = SHAPE_NAME
     if ws_id is not None:
         try:
@@ -554,11 +987,26 @@ def _gather_floor_footprints(scope_box, struct_links):
             continue
         link_doc = link_info[u"doc"]
         link_transform = link_info[u"instance"].GetTotalTransform()
-        for floor in collect_structural_floors(link_doc, link_transform, scope_bbox):
+        collected = collect_structural_floors(link_doc, link_transform, scope_bbox)
+        for floor in collected:
             label = _floor_label(floor)
-            for face, normal in extract_top_faces(floor, link_transform):
+            faces = extract_top_faces(floor, link_transform)
+            if not faces:
+                try:
+                    fbbox = floor.get_BoundingBox(None)
+                    bbox_txt = (u"link-local bbox X=[{:.2f}, {:.2f}] Y=[{:.2f}, {:.2f}] Z=[{:.2f}, {:.2f}]".format(
+                        fbbox.Min.X, fbbox.Max.X, fbbox.Min.Y, fbbox.Max.Y, fbbox.Min.Z, fbbox.Max.Z)
+                        if fbbox is not None else u"bbox unavailable")
+                except Exception:
+                    bbox_txt = u"bbox unavailable"
+                logger.warning(u"Floor {} ({}): no upward-facing face found — {} — skipped.".format(
+                    floor.Id.IntegerValue, label, bbox_txt))
+                continue
+            for face, normal in faces:
                 loops = face_boundary_loops_in_host_space(face, link_transform)
                 if not loops:
+                    logger.warning(u"Floor {} ({}): face found but boundary loops empty — skipped.".format(
+                        floor.Id.IntegerValue, label))
                     continue
                 out.append({
                     u"link_name": link_info[u"name"],
@@ -575,15 +1023,18 @@ def _analyze_zones(scope_box, footprints):
     """Classify every clearance-Space in scope as 'full' or 'partial' overlap
     against the union of all structural floors found in the scope (for the
     dialog's special-zones preview table)."""
+    zone_spaces = get_clearance_spaces_in_scope(scope_box)
+    reach_ft = mm_to_ft(max([DEFAULT_CLEARANCE] + [h for _, h in zone_spaces])) + 1.0
+    margin_ft = 1.0
+
     floor_cols = []
     for f in footprints:
-        col = _vertical_column_solid(f[u"loops"])
-        if col is not None and col.Volume > 0:
-            floor_cols.append(col)
+        floor_cols.extend(
+            _footprint_shadow_columns(f[u"loops"], f[u"face"], f[u"link_transform"], margin_ft, reach_ft))
 
     zones = []
-    for sp, height_mm in get_clearance_spaces_in_scope(scope_box):
-        sp_col = _vertical_column_solid(_space_boundary_loops(sp))
+    for sp, height_mm in zone_spaces:
+        sp_col = _space_shadow_column(sp, _space_boundary_loops(sp))
         if sp_col is None or sp_col.Volume <= 0:
             continue
         covered = 0.0
@@ -635,21 +1086,32 @@ def run(footprints, struct_links, candidate_spaces, default_mm, clear_previous):
         processed_floor_labels = set()
         for f in relevant:
             processed_floor_labels.add(f[u"label"])
-            assignments, conflict = resolve_height(f[u"loops"], candidate_spaces, default_mm)
+            assignments, conflict = resolve_height(
+                f[u"loops"], candidate_spaces, default_mm, f[u"face"], f[u"link_transform"])
             if conflict:
                 summary[u"conflicts"].append(f[u"label"])
                 continue
-            for height_mm, is_partial in assignments:
+            any_created = False
+            for assignment in assignments:
+                height_mm = assignment[u"height_mm"]
+                is_partial = assignment[u"is_partial"]
                 try:
-                    create_clearance_shape(
-                        f[u"face"], f[u"loops"], f[u"normal"], height_mm, ws_id, f[u"link_transform"])
+                    ds = create_clearance_shape(
+                        f[u"face"], f[u"loops"], f[u"normal"], height_mm, ws_id, f[u"link_transform"],
+                        clip=assignment.get(u"clip"), exclude=assignment.get(u"exclude"), label=f[u"label"],
+                        expected_ratio=assignment.get(u"expected_ratio"))
                 except Exception as ex:
                     logger.warning(u"Shape creation failed for {}: {}".format(f[u"label"], ex))
                     continue
+                if ds is None:
+                    continue
+                any_created = True
                 summary[u"created"] += 1
                 bucket = zone_usage.setdefault(height_mm, {u"count": 0, u"partial": False})
                 bucket[u"count"] += 1
                 bucket[u"partial"] = bucket[u"partial"] or is_partial
+            if not any_created and assignments:
+                _log_no_coverage_gap(f)
         summary[u"floors"] = len(processed_floor_labels)
         t2.Commit()
 
@@ -1573,7 +2035,8 @@ class HeadHeightCheckDialog(object):
         default_mm = self._read_clearance_mm()
         conflicts = []
         for f in footprints:
-            _, conflict = resolve_height(f[u"loops"], candidates, default_mm)
+            _, conflict = resolve_height(
+                f[u"loops"], candidates, default_mm, f[u"face"], f[u"link_transform"])
             if conflict:
                 conflicts.append(f[u"label"])
         self._conflicts_preview = conflicts
