@@ -301,6 +301,17 @@ def collect_structural_floors(link_doc, link_transform, scope_bbox):
 
 
 def _iter_solids(geom_element):
+    """Yield every Solid with positive volume, recursing into GeometryInstance
+    wrappers. NOTE: this used to also accept Volume<=0 Solids that still had
+    Faces (meant to rescue floors whose B-rep never closed to a valid
+    volume) — reverted. The diagnostic that motivated it proved those
+    specific floors have Faces.Size == 0 too, so the relaxation never helped
+    them; it only let through OTHER Volume<=0-but-faced Solids elsewhere in
+    a structural link sourced from an import/conversion pipeline — exactly
+    the kind of non-manifold, numerically-degenerate geometry that can send
+    Revit's geometry kernel (Triangulate/CreateExtrusionGeometry/Boolean
+    ops) into an extremely long or effectively-hung computation. Not worth
+    the risk for zero proven benefit."""
     for g in geom_element:
         if isinstance(g, DB.Solid):
             if g.Volume > 0:
@@ -308,6 +319,42 @@ def _iter_solids(geom_element):
         elif isinstance(g, DB.GeometryInstance):
             for s in _iter_solids(g.GetInstanceGeometry()):
                 yield s
+
+
+def _face_area_weighted_normal_z(face, link_transform):
+    """Area-weighted average of a face's normal Z component in host space,
+    via triangulation — used as a fallback in extract_top_faces when the
+    single-UV-midpoint sample doesn't read as upward. A genuinely non-planar
+    top face (e.g. a floor with drainage slopes edited via sub-element point
+    elevations — common on real parking-level slabs) can have a normal that
+    varies enough across its surface that one unlucky sample point looks
+    flat or even downward, even though the face is overwhelmingly
+    upward-facing. Returns None if the face can't be triangulated at all."""
+    try:
+        mesh = face.Triangulate(1.0)
+    except Exception:
+        mesh = None
+    if mesh is None or mesh.NumTriangles == 0:
+        return None
+    total_weight = 0.0
+    weighted_z = 0.0
+    for i in range(mesh.NumTriangles):
+        try:
+            tri = mesh.get_Triangle(i)
+            p0 = link_transform.OfPoint(tri.get_Vertex(0))
+            p1 = link_transform.OfPoint(tri.get_Vertex(1))
+            p2 = link_transform.OfPoint(tri.get_Vertex(2))
+            cross = (p1 - p0).CrossProduct(p2 - p0)
+            weight = cross.GetLength()  # twice the triangle's area
+            if weight < 1e-12:
+                continue
+            total_weight += weight
+            weighted_z += cross.Z
+        except Exception:
+            continue
+    if total_weight <= 0:
+        return None
+    return weighted_z / total_weight
 
 
 def extract_top_faces(floor, link_transform):
@@ -331,13 +378,17 @@ def extract_top_faces(floor, link_transform):
             bbox_uv = face.GetBoundingBox()
             mid_uv = DB.UV((bbox_uv.Min.U + bbox_uv.Max.U) / 2.0,
                             (bbox_uv.Min.V + bbox_uv.Max.V) / 2.0)
+            normal_host = None
             try:
                 normal_local = face.ComputeNormal(mid_uv)
+                normal_host = link_transform.OfVector(normal_local).Normalize()
             except Exception:
-                continue
-            normal_host = link_transform.OfVector(normal_local).Normalize()
-            if normal_host.Z <= 0.05:
-                continue
+                pass
+            if normal_host is None or normal_host.Z <= 0.05:
+                avg_z = _face_area_weighted_normal_z(face, link_transform)
+                if avg_z is None or avg_z <= 0.05:
+                    continue
+                normal_host = DB.XYZ.BasisZ
             out.append((face, normal_host))
     return out
 
@@ -569,11 +620,19 @@ def _log_no_coverage_gap(f):
         u"fragment (every assignment failed, including fallbacks) — {}".format(f[u"label"], bbox_line))
 
 
-def resolve_height(footprint_loops, candidate_spaces, default_mm, face=None, link_transform=None):
+def resolve_height(footprint_loops, candidate_spaces, default_mm, face=None, link_transform=None,
+                    space_col_cache=None):
     """candidate_spaces: list of (space_element, height_mm) — the zones the
     caller has applied. `face`/`link_transform` are optional, used only as a
     fallback (see _footprint_shadow_columns) when the footprint's own edge
     loops fail to build a valid overlap-test solid.
+
+    `space_col_cache`: optional dict the caller keeps alive across a loop of
+    many resolve_height() calls (one per floor). Without it, every call
+    rebuilds every candidate space's shadow column from scratch — fine once,
+    but resolve_height runs once per floor, so on N floors that's the same
+    handful of space columns rebuilt N times for an identical result each
+    time. Pass a shared `{}` from the caller to build each one only once.
 
     Returns (assignments, conflict). Each assignment is a dict:
       {"height_mm": ..., "is_partial": bool, "clip": solid_or_None, "exclude": solid_or_None,
@@ -597,6 +656,17 @@ def resolve_height(footprint_loops, candidate_spaces, default_mm, face=None, lin
         return [{u"height_mm": height_mm, u"is_partial": False, u"clip": None, u"exclude": None,
                   u"expected_ratio": None}]
 
+    if not candidate_spaces:
+        # Nothing to test overlap against — skip building the footprint's own
+        # shadow column entirely instead of doing that (potentially expensive,
+        # triangulation-fallback-prone) work for every floor for nothing. This
+        # matters: resolve_height runs once per floor, both for the actual Run
+        # and for the live conflicts-preview on every scope-box selection/zone
+        # edit, so on a scope box with no special zones at all this used to
+        # burn a full shadow-column build per floor for a result that was
+        # always going to be the plain default anyway.
+        return _plain(default_mm), False
+
     # Reach exactly as high as the tallest clearance height actually in play
     # (plus a small tolerance) — never a generic fixed guess. This is what
     # keeps this "is there overlap" test from ever disagreeing with what the
@@ -615,7 +685,12 @@ def resolve_height(footprint_loops, candidate_spaces, default_mm, face=None, lin
 
     overlapping = {}   # height_mm -> {"volume": float, "cols": [space_col, ...]}
     for sp, sp_height_mm in candidate_spaces:
-        sp_col = _space_shadow_column(sp, _space_boundary_loops(sp))
+        if space_col_cache is not None and sp.Id in space_col_cache:
+            sp_col = space_col_cache[sp.Id]
+        else:
+            sp_col = _space_shadow_column(sp, _space_boundary_loops(sp))
+            if space_col_cache is not None:
+                space_col_cache[sp.Id] = sp_col
         if sp_col is None or sp_col.Volume <= 0:
             continue
         overlap_vol = 0.0
@@ -773,25 +848,40 @@ def _try_set_shape(solids):
         return None
 
 
+def _filter_valid_batch(solids):
+    """Bisection helper for _filter_individually_valid: try the whole batch
+    as one DirectShape first; only split and recurse into halves if that
+    fails. Costs a single DirectShape attempt for an all-good batch instead
+    of one per piece — the difference between ~1 and ~40,000 API calls on a
+    face that triangulates into tens of thousands of tiny pieces (confirmed
+    to effectively hang Revit on a real project when done one-by-one)."""
+    if not solids:
+        return []
+    ds = _try_set_shape(solids)
+    if ds is not None:
+        try:
+            doc.Delete(ds.Id)
+        except Exception:
+            pass
+        return solids
+    if len(solids) == 1:
+        return []
+    mid = len(solids) // 2
+    return _filter_valid_batch(solids[:mid]) + _filter_valid_batch(solids[mid:])
+
+
 def _filter_individually_valid(solids):
     """SetShape validates the WHOLE batch at once — a single bad solid among
     many good ones (typical after clipping many small triangulated pieces,
     see _face_triangulated_solids) makes Revit reject the entire list, not
-    just the offending piece. Test each solid on its own via a throwaway
-    DirectShape and keep only the ones that individually pass, so one bad
-    triangle doesn't take down all its neighbors."""
+    just the offending piece. Narrow down to the individually-valid subset
+    via bisection (see _filter_valid_batch) rather than testing every piece
+    one by one, so one bad triangle doesn't take down all its neighbors —
+    and, critically, so a huge piece count doesn't turn this into tens of
+    thousands of sequential DirectShape create/delete calls."""
     if len(solids) <= 1:
         return solids
-    good = []
-    for s in solids:
-        ds = _try_set_shape([s])
-        if ds is not None:
-            try:
-                doc.Delete(ds.Id)
-            except Exception:
-                pass
-            good.append(s)
-    return good
+    return _filter_valid_batch(solids)
 
 
 def _check_clip_area(label, face, height_ft, height_mm, solids, expected_ratio):
@@ -975,6 +1065,148 @@ def create_or_update_isolated_view(workset_name):
     return view, existed
 
 
+def _raw_geometry_object_counts(geom_element):
+    """Unfiltered inventory of a GeometryElement's top-level objects, recursing
+    one level into GeometryInstance — reports every Solid's raw Volume
+    (including zero/near-zero ones the >0 filter in _iter_solids discards),
+    so a Join-Geometry/Parts situation that leaves a Solid object present but
+    with no net volume can be told apart from there being no Solid at all."""
+    counts = {}
+    volumes = []
+    for g in geom_element:
+        type_name = type(g).__name__
+        counts[type_name] = counts.get(type_name, 0) + 1
+        if isinstance(g, DB.Solid):
+            volumes.append(g.Volume)
+        elif isinstance(g, DB.GeometryInstance):
+            try:
+                inst_geom = g.GetInstanceGeometry()
+            except Exception:
+                inst_geom = None
+            if inst_geom is not None:
+                for g2 in inst_geom:
+                    type_name2 = u"Instance/" + type(g2).__name__
+                    counts[type_name2] = counts.get(type_name2, 0) + 1
+                    if isinstance(g2, DB.Solid):
+                        volumes.append(g2.Volume)
+    return counts, volumes
+
+
+def _floor_geometry_diagnostic(floor, link_transform):
+    """Best-effort diagnostic for a floor with zero detected upward-facing
+    faces — reports solid/face counts and the best normal.Z seen (both the
+    single-point sample and the area-weighted average across each face), plus
+    Parts/Join-Geometry status, so the real cause (no solids at all vs. a
+    Solid present but with no net volume because of Parts/a coincident join
+    vs. faces that are genuinely never upward) can be told apart instead of
+    guessed at."""
+    try:
+        doc = floor.Document
+        extra_bits = []
+        try:
+            if DB.PartUtils.HasAssociatedParts(doc, floor.Id):
+                extra_bits.append(u"has associated Parts")
+        except Exception:
+            pass
+        try:
+            joined_ids = list(DB.JoinGeometryUtils.GetJoinedElements(doc, floor))
+            if joined_ids:
+                extra_bits.append(u"joined with {} element(s) ({})".format(
+                    len(joined_ids), u", ".join(str(i.IntegerValue) for i in joined_ids[:5])))
+        except Exception:
+            pass
+        try:
+            sketch_id = floor.SketchId
+            if sketch_id is not None and sketch_id != DB.ElementId.InvalidElementId:
+                sketch = doc.GetElement(sketch_id)
+                profile = sketch.Profile if sketch is not None else None
+                if profile is not None:
+                    loop_count = profile.Size
+                    curve_count = sum(loop.Size for loop in profile)
+                    extra_bits.append(u"Sketch.Profile: {} loop(s), {} curve(s)".format(
+                        loop_count, curve_count))
+                else:
+                    extra_bits.append(u"Sketch element found but Profile is None")
+            else:
+                extra_bits.append(u"no SketchId (not sketch-based)")
+        except Exception as sk_ex:
+            extra_bits.append(u"Sketch check failed: {}".format(sk_ex))
+
+        opt = DB.Options()
+        opt.ComputeReferences = False
+        opt.DetailLevel = DB.ViewDetailLevel.Fine
+        geom = floor.get_Geometry(opt)
+        if geom is None:
+            return u"get_Geometry returned None" + (u" — " + u"; ".join(extra_bits) if extra_bits else u"")
+        raw_counts, raw_volumes = _raw_geometry_object_counts(geom)
+        counts_txt = u", ".join(u"{}={}".format(k, v) for k, v in sorted(raw_counts.items()))
+        volumes_txt = (u", ".join(u"{:.4f}".format(v) for v in raw_volumes)
+                       if raw_volumes else u"none")
+        solids = list(_iter_solids(geom))
+        if not solids:
+            # NOTE: this used to also retry get_Geometry with
+            # IncludeNonVisibleObjects=True to see if that surfaced anything —
+            # removed. That retry forces Revit to compute hidden/non-visible
+            # geometry, which on a floor whose B-rep is already known to be
+            # degenerate (import/conversion-derived) can be an extremely long
+            # or effectively-hung recompute. This diagnostic runs during
+            # _gather_floor_footprints, i.e. on scope-box selection itself —
+            # a real 5-10+ minute, ~3% CPU hang was traced to exactly this
+            # call. Not worth it for diagnostic-only value.
+            return (u"0 usable solids found (no positive volume, no faces) — raw geometry "
+                     u"objects: [{}] — raw Solid volume(s) (ft3): [{}]{}".format(
+                         counts_txt, volumes_txt,
+                         u" — " + u"; ".join(extra_bits) if extra_bits else u""))
+        face_count = 0
+        best_sample_z = None
+        best_avg_z = None
+        for solid in solids:
+            for face in solid.Faces:
+                face_count += 1
+                try:
+                    bbox_uv = face.GetBoundingBox()
+                    mid_uv = DB.UV((bbox_uv.Min.U + bbox_uv.Max.U) / 2.0,
+                                    (bbox_uv.Min.V + bbox_uv.Max.V) / 2.0)
+                    normal_local = face.ComputeNormal(mid_uv)
+                    z = link_transform.OfVector(normal_local).Normalize().Z
+                    if best_sample_z is None or z > best_sample_z:
+                        best_sample_z = z
+                except Exception:
+                    pass
+                avg_z = _face_area_weighted_normal_z(face, link_transform)
+                if avg_z is not None and (best_avg_z is None or avg_z > best_avg_z):
+                    best_avg_z = avg_z
+        return (u"{} solid(s), {} face(s) total; best sample normal.Z={}, "
+                u"best area-weighted normal.Z={}".format(
+                    len(solids), face_count,
+                    u"{:.3f}".format(best_sample_z) if best_sample_z is not None else u"n/a",
+                    u"{:.3f}".format(best_avg_z) if best_avg_z is not None else u"n/a"))
+    except Exception as ex:
+        return u"diagnostic failed: {}".format(ex)
+
+
+def _count_floors_in_scope(scope_box, struct_links):
+    """Cheap floor count for a scope box — a BoundingBoxIntersectsFilter
+    collector per loaded link, no per-floor geometry extraction. Used to warn
+    the user before they select a scope box and trigger the much more
+    expensive _gather_floor_footprints (which extracts and classifies every
+    floor's top face)."""
+    scope_bbox = scope_box.get_BoundingBox(None)
+    if scope_bbox is None:
+        return 0
+    total = 0
+    for link_info in struct_links:
+        if not link_info[u"loaded"] or link_info[u"doc"] is None:
+            continue
+        link_doc = link_info[u"doc"]
+        link_transform = link_info[u"instance"].GetTotalTransform()
+        try:
+            total += len(collect_structural_floors(link_doc, link_transform, scope_bbox))
+        except Exception:
+            pass
+    return total
+
+
 def _gather_floor_footprints(scope_box, struct_links):
     """One-time (per scope box) extraction of every structural floor's top-face
     footprint from every LOADED structural link, tagged with its source link
@@ -999,8 +1231,9 @@ def _gather_floor_footprints(scope_box, struct_links):
                         if fbbox is not None else u"bbox unavailable")
                 except Exception:
                     bbox_txt = u"bbox unavailable"
-                logger.warning(u"Floor {} ({}): no upward-facing face found — {} — skipped.".format(
-                    floor.Id.IntegerValue, label, bbox_txt))
+                diag = _floor_geometry_diagnostic(floor, link_transform)
+                logger.warning(u"Floor {} ({}): no upward-facing face found — {} — {} — skipped.".format(
+                    floor.Id.IntegerValue, label, bbox_txt, diag))
                 continue
             for face, normal in faces:
                 loops = face_boundary_loops_in_host_space(face, link_transform)
@@ -1019,16 +1252,56 @@ def _gather_floor_footprints(scope_box, struct_links):
     return out
 
 
+def _footprint_bbox_xy(f):
+    """Cheap X/Y bounding box of a footprint fragment's own loop vertices —
+    used only as a broad-phase pre-filter (see _analyze_zones), never for the
+    actual overlap decision."""
+    try:
+        xs, ys = [], []
+        for cl in f[u"loops"]:
+            for curve in cl:
+                p = curve.GetEndPoint(0)
+                xs.append(p.X)
+                ys.append(p.Y)
+        if not xs:
+            return None
+        return (min(xs), max(xs), min(ys), max(ys))
+    except Exception:
+        return None
+
+
+def _bbox_xy_near(fbbox, sp_bbox, margin_ft):
+    fx0, fx1, fy0, fy1 = fbbox
+    return (fx1 >= sp_bbox.Min.X - margin_ft and fx0 <= sp_bbox.Max.X + margin_ft and
+            fy1 >= sp_bbox.Min.Y - margin_ft and fy0 <= sp_bbox.Max.Y + margin_ft)
+
+
 def _analyze_zones(scope_box, footprints):
     """Classify every clearance-Space in scope as 'full' or 'partial' overlap
     against the union of all structural floors found in the scope (for the
     dialog's special-zones preview table)."""
     zone_spaces = get_clearance_spaces_in_scope(scope_box)
+    if not zone_spaces:
+        return []
     reach_ft = mm_to_ft(max([DEFAULT_CLEARANCE] + [h for _, h in zone_spaces])) + 1.0
     margin_ft = 1.0
 
-    floor_cols = []
+    # Broad-phase pre-filter: building a footprint's shadow column is
+    # expensive (can fall back to a per-triangle solid for complex real floor
+    # geometry — see _footprint_shadow_columns), and most floors in a large
+    # scope box are nowhere near a small override zone. Skipping those here
+    # avoids real geometry work that can never affect the result — previously
+    # this ran for EVERY footprint in the whole scope box regardless of
+    # distance from any zone, which could freeze Revit on a large scope box.
+    sp_bboxes = [b for b in (sp.get_BoundingBox(None) for sp, _h in zone_spaces) if b is not None]
+    relevant_footprints = []
     for f in footprints:
+        fbbox = _footprint_bbox_xy(f)
+        if fbbox is not None and any(_bbox_xy_near(fbbox, b, margin_ft) for b in sp_bboxes):
+            relevant_footprints.append(f)
+
+    floor_cols = []
+    for f in relevant_footprints:
         floor_cols.extend(
             _footprint_shadow_columns(f[u"loops"], f[u"face"], f[u"link_transform"], margin_ft, reach_ft))
 
@@ -1084,10 +1357,12 @@ def run(footprints, struct_links, candidate_spaces, default_mm, clear_previous):
         t2.Start()
         zone_usage = {}
         processed_floor_labels = set()
+        space_col_cache = {}
         for f in relevant:
             processed_floor_labels.add(f[u"label"])
             assignments, conflict = resolve_height(
-                f[u"loops"], candidate_spaces, default_mm, f[u"face"], f[u"link_transform"])
+                f[u"loops"], candidate_spaces, default_mm, f[u"face"], f[u"link_transform"],
+                space_col_cache=space_col_cache)
             if conflict:
                 summary[u"conflicts"].append(f[u"label"])
                 continue
@@ -1578,6 +1853,12 @@ MUTED_COLOR = WM.Color.FromRgb(0x9a, 0xa0, 0xac)
 LINE_COLOR  = WM.Color.FromRgb(0xf0, 0xf1, 0xff)
 SEL_BG      = WM.Color.FromArgb(0x16, 0x44, 0xb8, 0xd3)
 
+# Above this many structural floors in a scope box, the per-floor geometry
+# analysis (_gather_floor_footprints) starts taking long enough to be worth
+# flagging in the scope-box list before the user selects it — not a hard
+# limit, just an early heads-up (not yet benchmarked against a hard number).
+SLOW_FLOOR_COUNT_WARNING = 60
+
 
 def _color(c):
     return WM.SolidColorBrush(c)
@@ -1631,8 +1912,13 @@ class HeadHeightCheckDialog(object):
         self._populate_links()
         self._populate_scope_boxes()
         self._on_clearance_changed(clearance_box, None)
-        if self._scope_boxes:
-            self._select_scope(self._scope_boxes[0].Name)
+        # Deliberately do NOT auto-select/auto-analyze a scope box here. Floor
+        # gathering + zone analysis (_refresh_scope_analysis) can be expensive
+        # on a large/complex scope box, and running it unconditionally the
+        # instant the dialog opens — before the user has chosen anything, with
+        # no progress feedback or chance to pick a smaller scope box first —
+        # can freeze Revit long enough to look like a crash on a big project.
+        # Let the user's own click into _select_scope kick it off instead.
         self._update_footer_summary()
         self._update_run_enabled()
         return window
@@ -1831,9 +2117,21 @@ class HeadHeightCheckDialog(object):
         extent_tb.Foreground = _color(MUTED_COLOR)
         extent_tb.VerticalAlignment = System.Windows.VerticalAlignment.Center
 
+        count_tb = WC.TextBlock()
+        try:
+            floor_count = _count_floors_in_scope(box, self._struct_links)
+            count_tb.Text = u" · {} floor(s)".format(floor_count)
+            count_tb.Foreground = _color(
+                AMBER_COLOR if floor_count > SLOW_FLOOR_COUNT_WARNING else MUTED_COLOR)
+        except Exception:
+            count_tb.Text = u""
+        count_tb.FontSize = 12.5
+        count_tb.VerticalAlignment = System.Windows.VerticalAlignment.Center
+
         row.Children.Add(icon_tb)
         row.Children.Add(name_tb)
         row.Children.Add(extent_tb)
+        row.Children.Add(count_tb)
         border.Child = row
 
         row_data = {u"box": box, u"border": border, u"icon_tb": icon_tb}
@@ -2034,9 +2332,11 @@ class HeadHeightCheckDialog(object):
         candidates = [(z[u"space"], z[u"height_mm"]) for z in self._zones if z[u"on"]]
         default_mm = self._read_clearance_mm()
         conflicts = []
+        space_col_cache = {}
         for f in footprints:
             _, conflict = resolve_height(
-                f[u"loops"], candidates, default_mm, f[u"face"], f[u"link_transform"])
+                f[u"loops"], candidates, default_mm, f[u"face"], f[u"link_transform"],
+                space_col_cache=space_col_cache)
             if conflict:
                 conflicts.append(f[u"label"])
         self._conflicts_preview = conflicts
