@@ -1346,11 +1346,35 @@ def get_or_create_workset(name):
     return DB.Workset.Create(doc, name).Id
 
 
-def cleanup_previous_shapes():
+def _scope_box_world_outline(scope_box):
+    """Axis-aligned world-space bounding Outline of a scope box, accounting for
+    a rotated scope box (its bbox carries a Transform)."""
+    bbox = scope_box.get_BoundingBox(None)
+    if bbox is None:
+        return None
+    ct = bbox.Transform
+    mn, mx = bbox.Min, bbox.Max
+    corners = [ct.OfPoint(DB.XYZ(x, y, z))
+               for x in (mn.X, mx.X) for y in (mn.Y, mx.Y) for z in (mn.Z, mx.Z)]
+    return DB.Outline(
+        DB.XYZ(min(c.X for c in corners), min(c.Y for c in corners), min(c.Z for c in corners)),
+        DB.XYZ(max(c.X for c in corners), max(c.Y for c in corners), max(c.Z for c in corners)))
+
+
+def cleanup_previous_shapes(scope_box=None):
+    """Delete previously-generated clearance DirectShapes. If `scope_box` is
+    given, delete ONLY those whose bounding box intersects that scope box —
+    so re-running on one scope box leaves clearance masses generated for other
+    areas untouched. With no scope box, every clearance shape is removed."""
+    collector = (DB.FilteredElementCollector(doc)
+                 .OfClass(DB.DirectShape)
+                 .WhereElementIsNotElementType())
+    if scope_box is not None:
+        outline = _scope_box_world_outline(scope_box)
+        if outline is not None:
+            collector = collector.WherePasses(DB.BoundingBoxIntersectsFilter(outline))
     to_delete = []
-    for ds in (DB.FilteredElementCollector(doc)
-               .OfClass(DB.DirectShape)
-               .WhereElementIsNotElementType()):
+    for ds in collector:
         try:
             if ds.Name == SHAPE_NAME:
                 to_delete.append(ds.Id)
@@ -1663,10 +1687,11 @@ def _analyze_zones(scope_box, footprints):
     return sorted(zones, key=lambda z: z[u"name"])
 
 
-def run(footprints, struct_links, candidate_spaces, default_mm, clear_previous):
+def run(footprints, struct_links, candidate_spaces, default_mm, clear_previous, scope_box=None):
     """Execute the head-height check against the already-extracted `footprints`
     (filtered here to the currently-selected structural links). Returns a
-    summary dict for the results panel."""
+    summary dict for the results panel. `scope_box` (when clearing previous
+    results) confines the delete to clearance masses inside that scope box."""
     summary = {u"floors": 0, u"created": 0, u"conflicts": [], u"view_existed": False,
                u"zone_usage": {}}
     selected_link_names = set(
@@ -1680,7 +1705,7 @@ def run(footprints, struct_links, candidate_spaces, default_mm, clear_previous):
         t1.Start()
         ws_id = get_or_create_workset(WORKSET)
         if clear_previous:
-            cleanup_previous_shapes()
+            cleanup_previous_shapes(scope_box)
         t1.Commit()
 
         t2 = DB.Transaction(doc, u"EasyBIM: Generate clearance volumes")
@@ -1864,17 +1889,6 @@ XAML = u"""
       </Grid>
     </Border>
 
-    <!-- BANNER -->
-    <Border x:Name="BannerBorder" Grid.Row="1"
-            Background="#ecf8fc" BorderBrush="#bbe5f0" BorderThickness="0,0,0,1" Padding="20,10">
-      <StackPanel Orientation="Horizontal">
-        <TextBlock Text="i" FontSize="13" FontWeight="Bold" Foreground="#44b8d3"
-                   Margin="0,0,9,0" VerticalAlignment="Center" FontFamily="Segoe UI"/>
-        <TextBlock x:Name="BannerText" FontSize="12.5" Foreground="#1e6e87"
-                   TextWrapping="Wrap" VerticalAlignment="Center"/>
-      </StackPanel>
-    </Border>
-
     <!-- BODY -->
     <ScrollViewer Grid.Row="2" VerticalScrollBarVisibility="Auto" HorizontalScrollBarVisibility="Disabled">
       <Grid Margin="20,14,20,10">
@@ -1922,7 +1936,10 @@ XAML = u"""
           </Border>
           <Border x:Name="LinksCard" Background="White" BorderBrush="#e8eaff" BorderThickness="1"
                   CornerRadius="8" Margin="0,0,0,16">
-            <StackPanel x:Name="LinksListPanel"/>
+            <ScrollViewer MaxHeight="150" VerticalScrollBarVisibility="Auto"
+                          HorizontalScrollBarVisibility="Disabled">
+              <StackPanel x:Name="LinksListPanel"/>
+            </ScrollViewer>
           </Border>
 
           <!-- scope box -->
@@ -1958,7 +1975,7 @@ XAML = u"""
           </Grid>
 
           <!-- special zones -->
-          <Grid Margin="0,0,0,8">
+          <Grid x:Name="ZonesHeaderGrid" Margin="0,0,0,8">
             <Grid.ColumnDefinitions>
               <ColumnDefinition Width="*"/>
               <ColumnDefinition Width="Auto"/>
@@ -2026,24 +2043,7 @@ XAML = u"""
           <TextBlock Text="OUTPUT" FontFamily="Consolas" FontSize="10" Foreground="#9aa0ac" Margin="0,0,0,8"/>
           <Border Background="White" BorderBrush="#e8eaff" BorderThickness="1" CornerRadius="8">
             <StackPanel>
-              <Border BorderBrush="#f0f1ff" BorderThickness="0,0,0,1" Padding="14,11">
-                <Grid>
-                  <Grid.ColumnDefinitions><ColumnDefinition Width="34"/><ColumnDefinition Width="*"/></Grid.ColumnDefinitions>
-                  <Border Grid.Column="0" Width="30" Height="30" CornerRadius="8" Background="#e8eaff" HorizontalAlignment="Left">
-                    <TextBlock Text="&#x25A2;" FontSize="14" Foreground="#1e248c" HorizontalAlignment="Center" VerticalAlignment="Center"/>
-                  </Border>
-                  <StackPanel Grid.Column="1" Margin="11,0,0,0" VerticalAlignment="Center">
-                    <TextBlock Text="Geometry" FontSize="11" Foreground="#9aa0ac"/>
-                    <StackPanel Orientation="Horizontal">
-                      <TextBlock Text="DirectShape · Floors category" FontFamily="Consolas" FontSize="13" Foreground="#1f2937" FontWeight="SemiBold" Margin="0,0,8,0"/>
-                      <Border Background="#ecf8fc" BorderBrush="#b8e8f2" BorderThickness="1" CornerRadius="10" Padding="7,1">
-                        <TextBlock Text="HeadHeightCheck_Clearance" FontFamily="Consolas" FontSize="10" Foreground="#44b8d3" FontWeight="SemiBold"/>
-                      </Border>
-                    </StackPanel>
-                  </StackPanel>
-                </Grid>
-              </Border>
-              <Border BorderBrush="#f0f1ff" BorderThickness="0,0,0,1" Padding="14,11">
+              <Border Padding="14,11">
                 <Grid>
                   <Grid.ColumnDefinitions><ColumnDefinition Width="34"/><ColumnDefinition Width="*"/></Grid.ColumnDefinitions>
                   <Border Grid.Column="0" Width="30" Height="30" CornerRadius="8" Background="#e8eaff" HorizontalAlignment="Left">
@@ -2057,18 +2057,6 @@ XAML = u"""
                         <TextBlock Text="auto-create" FontSize="10" Foreground="#44b8d3" FontWeight="SemiBold"/>
                       </Border>
                     </StackPanel>
-                  </StackPanel>
-                </Grid>
-              </Border>
-              <Border Padding="14,11">
-                <Grid>
-                  <Grid.ColumnDefinitions><ColumnDefinition Width="34"/><ColumnDefinition Width="*"/></Grid.ColumnDefinitions>
-                  <Border Grid.Column="0" Width="30" Height="30" CornerRadius="8" Background="#e8eaff" HorizontalAlignment="Left">
-                    <TextBlock Text="&#x2191;" FontSize="14" Foreground="#1e248c" HorizontalAlignment="Center" VerticalAlignment="Center"/>
-                  </Border>
-                  <StackPanel Grid.Column="1" Margin="11,0,0,0" VerticalAlignment="Center">
-                    <TextBlock Text="Extrusion" FontSize="11" Foreground="#9aa0ac"/>
-                    <TextBlock Text="Normal to top face · follows slope" FontFamily="Consolas" FontSize="13" Foreground="#1f2937" FontWeight="SemiBold"/>
                   </StackPanel>
                 </Grid>
               </Border>
@@ -2186,8 +2174,13 @@ SEL_BG      = WM.Color.FromArgb(0x16, 0x44, 0xb8, 0xd3)
 # Above this many structural floors in a scope box, the per-floor geometry
 # analysis (_gather_floor_footprints) starts taking long enough to be worth
 # flagging in the scope-box list before the user selects it — not a hard
-# limit, just an early heads-up (not yet benchmarked against a hard number).
-SLOW_FLOOR_COUNT_WARNING = 60
+# limit, just an early heads-up. Originally guessed at 60 before the
+# vertical-extrusion/2D-zone-logic/capped-triangulation robustness work;
+# real-world testing since then ran 97 floors smoothly, so this has been
+# raised. Still just a rough heads-up, not benchmarked against a hard number
+# — the real cost driver is how many floors need the triangulated fallback
+# (warped/imported geometry), not raw floor count.
+SLOW_FLOOR_COUNT_WARNING = 300
 
 
 def _color(c):
@@ -2234,11 +2227,6 @@ class HeadHeightCheckDialog(object):
         clearance_box.Text = str(DEFAULT_CLEARANCE)
         clearance_box.TextChanged += self._on_clearance_changed
 
-        w.FindName(u"BannerText").Text = (
-            u"Generate clearance volumes above every structural floor in the scope box "
-            u"— measured up from the walking surface — so MEP routing can be "
-            u"clash-checked in Navisworks.")
-
         self._populate_links()
         self._populate_scope_boxes()
         self._on_clearance_changed(clearance_box, None)
@@ -2249,6 +2237,10 @@ class HeadHeightCheckDialog(object):
         # no progress feedback or chance to pick a smaller scope box first —
         # can freeze Revit long enough to look like a crash on a big project.
         # Let the user's own click into _select_scope kick it off instead.
+        # _rebuild_zone_rows() itself is cheap (pure UI, no geometry) and, with
+        # no scope selected yet, collapses the special-zones block entirely
+        # instead of leaving an empty header row that pads out the layout.
+        self._rebuild_zone_rows()
         self._update_footer_summary()
         self._update_run_enabled()
         return window
@@ -2313,10 +2305,13 @@ class HeadHeightCheckDialog(object):
         name_tb.FontWeight = System.Windows.FontWeights.SemiBold
         name_tb.Foreground = _color(BODY_COLOR) if loaded else _color(MUTED_COLOR)
         disc_tb = WC.TextBlock()
-        disc_tb.Text = info[u"disc"]
-        disc_tb.FontSize = 11.5
-        disc_tb.Foreground = _color(MUTED_COLOR)
-        disc_tb.Margin = System.Windows.Thickness(0, 1, 0, 0)
+        if info[u"disc"] != u"Discipline not detected from name":
+            disc_tb.Text = info[u"disc"]
+            disc_tb.FontSize = 11.5
+            disc_tb.Foreground = _color(MUTED_COLOR)
+            disc_tb.Margin = System.Windows.Thickness(0, 1, 0, 0)
+        else:
+            disc_tb.Visibility = System.Windows.Visibility.Collapsed
         texts.Children.Add(name_tb)
         texts.Children.Add(disc_tb)
 
@@ -2422,8 +2417,10 @@ class HeadHeightCheckDialog(object):
             border.BorderBrush = _color(LINE_COLOR)
             border.BorderThickness = System.Windows.Thickness(0, 0, 0, 1)
 
-        row = WC.StackPanel()
-        row.Orientation = WC.Orientation.Horizontal
+        row = WC.StackPanel()   # vertical: top line (icon/name/extent/count) + optional warning line
+
+        top_row = WC.StackPanel()
+        top_row.Orientation = WC.Orientation.Horizontal
 
         icon_tb = WC.TextBlock()
         icon_tb.Text = u"○"
@@ -2448,6 +2445,7 @@ class HeadHeightCheckDialog(object):
         extent_tb.VerticalAlignment = System.Windows.VerticalAlignment.Center
 
         count_tb = WC.TextBlock()
+        floor_count = None
         try:
             floor_count = _count_floors_in_scope(box, self._struct_links)
             count_tb.Text = u" · {} floor(s)".format(floor_count)
@@ -2458,10 +2456,21 @@ class HeadHeightCheckDialog(object):
         count_tb.FontSize = 12.5
         count_tb.VerticalAlignment = System.Windows.VerticalAlignment.Center
 
-        row.Children.Add(icon_tb)
-        row.Children.Add(name_tb)
-        row.Children.Add(extent_tb)
-        row.Children.Add(count_tb)
+        top_row.Children.Add(icon_tb)
+        top_row.Children.Add(name_tb)
+        top_row.Children.Add(extent_tb)
+        top_row.Children.Add(count_tb)
+        row.Children.Add(top_row)
+
+        if floor_count is not None and floor_count > SLOW_FLOOR_COUNT_WARNING:
+            warn_tb = WC.TextBlock()
+            warn_tb.Text = u"Large scope — the plugin may run slowly or behave unreliably."
+            warn_tb.FontSize = 11.5
+            warn_tb.Foreground = _color(AMBER_COLOR)
+            warn_tb.TextWrapping = System.Windows.TextWrapping.Wrap
+            warn_tb.Margin = System.Windows.Thickness(24, 2, 0, 0)
+            row.Children.Add(warn_tb)
+
         border.Child = row
 
         row_data = {u"box": box, u"border": border, u"icon_tb": icon_tb}
@@ -2520,6 +2529,18 @@ class HeadHeightCheckDialog(object):
         panel.Children.Clear()
         card = w.FindName(u"ZonesCard")
         no_zones_card = w.FindName(u"NoZonesCard")
+        header_grid = w.FindName(u"ZonesHeaderGrid")
+
+        if not self._sel_scope_name:
+            # No scope box picked yet — nothing meaningful to show here, so
+            # collapse the whole block rather than leaving an empty header
+            # row that just adds a gap before the next section.
+            header_grid.Visibility = System.Windows.Visibility.Collapsed
+            card.Visibility = System.Windows.Visibility.Collapsed
+            no_zones_card.Visibility = System.Windows.Visibility.Collapsed
+            self._rebuild_conflicts_preview_ui()
+            return
+        header_grid.Visibility = System.Windows.Visibility.Visible
 
         scope_suffix = u" IN {}".format(self._sel_scope_name.upper()) if self._sel_scope_name else u""
         w.FindName(u"ZonesLabel").Text = u"SPECIAL ZONES · FROM MEP SPACES{}".format(scope_suffix)
@@ -2760,9 +2781,11 @@ class HeadHeightCheckDialog(object):
         candidate_spaces = [(z[u"space"], z[u"height_mm"]) for z in self._zones if z[u"on"]]
         clear_previous = bool(w.FindName(u"ClearToggle").IsChecked)
         default_mm = self._read_clearance_mm()
+        scope_box = self._scope_box_by_name(self._sel_scope_name)
 
         try:
-            summary = run(footprints, self._struct_links, candidate_spaces, default_mm, clear_previous)
+            summary = run(footprints, self._struct_links, candidate_spaces, default_mm,
+                          clear_previous, scope_box)
             self._result_summary = summary
             self._show_results(summary, default_mm)
             self.cancelled = False
@@ -2787,7 +2810,6 @@ class HeadHeightCheckDialog(object):
 
         w.FindName(u"ConfigPanel").Visibility = col
         w.FindName(u"ResultsPanel").Visibility = vis
-        w.FindName(u"BannerBorder").Visibility = col
 
         w.FindName(u"ResSummaryTB").Text = u"{} clearance volumes on “{}” · scope {}".format(
             summary[u"created"], WORKSET, self._sel_scope_name)
@@ -2918,7 +2940,6 @@ class HeadHeightCheckDialog(object):
         col = System.Windows.Visibility.Collapsed
         w.FindName(u"ConfigPanel").Visibility = vis
         w.FindName(u"ResultsPanel").Visibility = col
-        w.FindName(u"BannerBorder").Visibility = vis
         w.FindName(u"RunBtn").Visibility = vis
         w.FindName(u"CancelBtn").Visibility = vis
         w.FindName(u"AgainBtn").Visibility = col
