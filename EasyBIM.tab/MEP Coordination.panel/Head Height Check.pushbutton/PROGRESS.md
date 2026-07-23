@@ -1,8 +1,478 @@
 # Head Height Check — running notes
 
-Branch: `feature/head-height-check`. Last commit: `8bec8da` (see git log for
-full history — the notes below cover work done *since* that commit, not yet
-committed).
+## RESOLVED (2026-07-23) — user-confirmed working; scaffolding removed
+
+The zone/ramp/flat-floor system is confirmed correct in the real project:
+ramps come out uniform full-height 2450, flat slabs the zone crosses get a
+clean straight split at the outline, other levels unaffected. Final design:
+vertical (+Z) extrusion for plumb head height; 2D point-in-polygon zone
+decisions with a distance-based edge tolerance (ZONE_EDGE_TOL_FT) + an
+elevation gate (ZONE_ELEV_TOL_FT); warped faces built by coarse-capped
+triangulation and split per-triangle; clean flat faces split by one boolean
+against a tall non-coincident zone column (2D per-triangle fallback). All
+the temporary `_trace` scaffolding, the prototype probe, and the dead
+boolean-clip/containment/area-check helpers have been removed. `_analyze_zones`
+(preview badges only) still uses the older shadow-column logic — cosmetic.
+
+The dated running log below is kept for history; it can be deleted once this
+is merged.
+
+---
+
+Branch: `feature/head-height-check`. Committed through `ddb02e9` (see git log
+for full history) — the notes below cover work done *since* that commit,
+not yet committed.
+
+## CLEAN SPLIT FOR FLAT PARTIAL FLOORS (2026-07-21) — pending test
+
+Boolean-free logic fixed the ramp (all faces 100% in → uniform 2450), but
+FLAT floors that genuinely straddle the zone (trace: 47-57% in — the path
+crosses a slab) went through the per-triangle 2D split → many prisms +
+jagged, triangle-stepped edge not matching the zone outline. Invisible on a
+faceted ramp, ugly on a flat slab.
+
+Fix: for a genuinely-partial CLEAN planar face, cut it with ONE Revit boolean
+against a tall zone column (`_column_from_zone_polys` + `_boolean_clip_prism`)
+→ straight edge following the outline, few pieces. This is reliable HERE
+because the tall column shares no coincident face with the prism (coincident
+faces were the cause of the earlier intermittent boolean failures, and a
+zone crossing the middle of a slab has none). Warped faces (ramps) keep the
+per-triangle 2D split. If the boolean can't run, it falls back to the
+per-triangle method. So: ramp = uniform (2D), flat partial = clean straight
+cut (boolean), and nothing depends on booleans succeeding.
+
+**Next: user re-runs; expect flat floors that the zone crosses to be split
+by a clean straight line along the zone outline (not faceted), ramp still
+uniform 2450.**
+
+## BOOLEAN-FREE ZONE LOGIC (2026-07-21) — the architectural fix
+
+Root cause of the whole zone saga finally isolated from the trace: the
+distance-tolerance logic was correct, but Revit's BooleanOperationsUtils
+(intersect/difference) FAILS INTERMITTENTLY on the real imported geometry —
+consecutive ramp faces gave "outside area = 0.001" (boolean ok → full 2450)
+vs "outside area = whole face" (boolean threw → wrongly partial). Every zone
+symptom across this whole thread traces to answering a 2D question with
+fragile 3D boolean solid ops.
+
+Rewrote the zone logic to use PURE 2D point-in-polygon math — no boolean
+solids anywhere in the zone path:
+- New 2D helpers: `_space_plan_polygon` (zone outline → rings of (x,y)),
+  `_point_in_ring`/`_point_in_polygon`, `_point_seg_dist2`, `_point_in_zone`
+  (inside OR within ZONE_EDGE_TOL_FT of an edge = the distance tolerance),
+  `_face_plan_samples` (triangle centroids + plan areas, coarse-capped mesh),
+  `_zone_cached`, `_build_face_prisms_classified`.
+- `resolve_height` now: elevation-gate the candidate spaces (unchanged
+  concept), sample the face's triangle centroids, classify each in/out via
+  `_point_in_zone`, area-weight → in-fraction. ≥99% → full zone height; ≤1%
+  → default; between → genuine partial. Different-height zones overlapping
+  the same face → conflict. Returns assignments carrying `zone_polys` +
+  `keep_inside` (not clip/exclude solids).
+- `create_clearance_shape`: whole → clean `_build_clearance_prism`; partial →
+  `_build_face_prisms_classified` keeps only triangles whose centroid is on
+  the wanted side (2D test), extruded vertically. No booleans.
+
+Now-dead (kept, harmless, to be cleaned up): `_apply_clip`,
+`_apply_clip_by_containment`, `_point_inside_solid`, `_piece_centroid`,
+`_check_clip_area`, `_zone_plan_column`, `_grow_zone_plan_prism`,
+`_plan_area_prism`. `_analyze_zones` (preview badges only) still uses the old
+shadow-column/boolean logic — cosmetic, doesn't affect built geometry.
+
+**Next: user re-runs. Expect uniform 2450 on the ramp (edge strips within
+250 mm tolerance absorbed), no intermittent boolean failures, other levels
+unaffected. Genuine half-in/half-out floors split (faceted) at the outline.**
+
+## DISTANCE-BASED EDGE TOLERANCE (2026-07-21) — superseded by boolean-free logic
+
+The plan-ratio fix revealed the ramp is genuinely ~96% inside the zone: the
+zone outline is drawn ~7-30 cm INSIDE the ramp edges, so a thin strip along
+each edge fell outside → 2200 slivers on every face. A %-of-area threshold
+is the wrong tool (10% of a big floor is a big real chunk; 10% of a tiny
+floor is nothing). Agreed with the user on a DISTANCE-based tolerance
+instead.
+
+Implemented: `ZONE_EDGE_TOL_FT` (~250 mm). New `_grow_zone_plan_prism`
+offsets the zone outline outward by the tolerance (via
+`CurveLoop.CreateViaOffset`, sign chosen by whichever enlarges the outline,
+falls back to un-grown if offset fails). In `resolve_height`, the full-vs-
+partial decision is now: grow the zone by the tolerance; if the floor
+footprint lies entirely within the grown outline (area outside ≤ 0.01 sqft)
+→ whole floor gets the zone height (uniform, no sliver); otherwise → genuine
+partial, split precisely at the REAL outline. Distance-based, so it behaves
+the same for tiny/huge and flat/sloped floors. Grown prism cached per space
+alongside the plan prism + Z band (`space_col_cache` entry is now a 3-tuple).
+`FULL_OVERLAP_RATIO` no longer drives resolve_height (still used by the
+`_analyze_zones` preview badges).
+
+Still per-FACE (not yet the per-floor merge discussed) — the tolerance alone
+should make the ramp uniform 2450 (each face pokes out only ~7 cm << 250 mm
+→ treated as fully in). Fragmentation (many touching same-height masses) can
+be cleaned up with per-floor merge as a follow-up if the count bothers the
+user.
+
+**Next: user re-runs; expect ramp uniform 2450 (edge strips absorbed by the
+250 mm tolerance), genuine half-in/half-out floors still split precisely.**
+
+## PLAN-RATIO + ELEVATION-GATE (2026-07-21) — the actual model for zones
+
+Still partial 2450/2200 after the stacked-mass fix. Trace showed the ramp
+faces DO sit inside the zone's height band (surfaces at Z≈−14..−6, band
+[−19.4,−5.6]); they were only scored "partial" (0.89–0.97) because the
+full/partial RATIO was measured on the tall clearance COLUMN, which pokes
+above the zone ceiling — a measurement artifact. User rejected pure
+plan-based (would bleed a zone onto other levels when the scope box spans
+all basement levels).
+
+Final model for zone membership (replaces the 3D shadow-column overlap in
+resolve_height):
+- ELEVATION GATE: the floor's own top-surface Z must lie within the zone
+  Space's height band ± ZONE_ELEV_TOL_FT (4 ft). Keeps a zone on one level
+  off floors stacked on other levels (tol << storey). This is what answers
+  the "all basement floors in one scope box" concern.
+- PLAN OVERLAP: footprint under the zone plan outline.
+- RATIO measured in PLAN ONLY (`_plan_area_prism` flattens loops to z=0 and
+  extrudes a unit prism; volume ratio == plan-area fraction, elevation
+  factored out). So a face fully under the outline and within the band →
+  ratio ~1.0 → `_plain(zone_height)` full uniform height, no clip, no
+  slivers. Partial only when the footprint genuinely straddles the outline
+  in plan.
+- Clip still plan-based full-height (`_zone_plan_column`) for the genuinely
+  partial case.
+New helpers: `_loops_z_range`, `_plan_area_prism`. `space_col_cache` now
+caches (plan prism, Z band) per space. `_analyze_zones` (the preview
+full/partial badge table) still uses the older shadow-column logic — cosmetic
+only, doesn't affect built geometry; can be aligned later if the preview
+badges look off.
+
+**Next: user re-runs; expect ramp uniform full-height 2450 (within band +
+under outline), other basement levels unaffected.**
+
+## STACKED-MASS FIX (2026-07-21) — real cause of "partial 2450 / partial 2200"
+
+After the clip-height fix the ramp was STILL partly 2450 / partly 2200.
+Trace showed every ramp face at ratio 0.89–0.97 (partial, because the face
+column pokes just above the zone's Z ceiling — a Z effect, not a plan one),
+and EACH face built BOTH a 2450 shape AND a 2200 shape (both ds=True). Root
+cause in `create_clearance_shape`: when the exclude (2200 "outside zone")
+side legitimately comes out EMPTY — face fully inside the zone — the old
+code treated empty the same as "clip failed" and fell back to building the
+FULL un-clipped 2200 prism. So a fully-in-zone face got its 2450 mass PLUS a
+spurious full 2200 mass stacked under it.
+
+Fix: an empty clip/exclude result is a valid "nothing on this side" → return
+None, build nothing, no fallback. The un-clipped fallback now fires ONLY
+when clipping produced geometry that Revit then rejected (a real failure),
+never on a legitimately-empty result. So a face fully in the zone → only
+2450; fully out → only 2200; genuinely straddling the plan edge →
+complementary 2450-inside + 2200-outside. No more stacking.
+
+**Next: user re-runs; expect the ramp within the zone to be uniform 2450
+with no 2200 stacked on it.**
+
+## CLIP-HEIGHT FIX (2026-07-21) — the real cause of "short ramp masses"
+
+Vertical extrusion alone did NOT fix the short ramp masses. Real cause: the
+partial-overlap CLIP intersected the clearance prism with the zone's
+Z-BOUNDED shadow column (`_space_shadow_column`, spanning only the Space's
+own modelled height band, e.g. [-18.4,-5.6]). So the clip chopped the
+clearance off at the zone's ceiling → masses only as tall as the ZONE, not
+the full required clearance above the floor. Flat floors looked right only
+because they were FULL overlap → `_plain(2450)` with NO clip → full prism;
+the ramp faces are PARTIAL → clipped → short. That asymmetry was the tell.
+
+Fix: the clip/exclude solid is now a TALL PLAN column of the zone outline
+(`_zone_plan_column`, ± ZONE_CLIP_HALF_FT = 500 ft about the Space), so it
+trims a clearance prism only in PLAN, never in height. The Z-bounded
+`_space_shadow_column` is still used for overlap DETECTION (deciding whether
+a floor is in the zone at all — preserves the multi-level safety), but no
+longer shapes the built geometry. `resolve_height`'s overlap bucket now
+stores the Space elements (not their Z-bounded columns) and builds the clip
+column from their plan outlines.
+
+Consequence to verify with the user: a floor face detected as overlapping
+the zone now gets the FULL 2450 clearance across the whole part of it inside
+the zone's plan outline — including where a ramp rises. This is uniform
+in-zone height (what the section review asked for), but it effectively means
+the in-zone clearance is plan-shaped + full-height rather than clipped to
+the zone's 3D volume — i.e. it softens the earlier strict-3D choice. Flag
+for user confirmation on next visual check.
+
+Also: `expected_ratio` now passed as None for partial assignments (the
+Z-volume ratio no longer matches the plan-only clip), which disables the
+advisory `*** CLIP AREA MISMATCH ***` warnings that were firing spuriously.
+Area-based self-check to be reinstated on a volume basis later if wanted.
+
+## VERTICAL-EXTRUSION FIX (2026-07-21) — pending test
+
+Section through the zone showed the flat-floor clearance as a correct
+uniform slab, but the ramp clearance came out SHORTER and stepped. Cause:
+clearance was extruded along the face NORMAL, so on a slope it gave only
+~height·cos(slope) of vertical clearance, and each coarse facet's different
+normal produced steps. Head height is a vertical/plumb measure. Fixed by
+extruding all clearance volumes straight UP (+Z) by the clearance height in
+every tier (`_build_clearance_prism` raw + projected, `_mesh_to_prisms`
+facets, with winding oriented up). Bottom still follows the ramp (slope
+preserved); top is exactly `height` plumb above every point → uniform
+vertical clearance, no facet steps. Flat floors unchanged (normal already
++Z). `host_normal` kept as a param but no longer drives direction.
+
+KNOWN FOLLOW-UP: `_check_clip_area`'s area bookkeeping assumes perpendicular
+extrusion (Volume/height == face area). With vertical extrusion on slopes
+that no longer holds, so the advisory `*** CLIP AREA MISMATCH ***` warning
+may fire spuriously on ramp faces. Advisory only — does not affect built
+geometry. Quiet/rebase it on base-vs-clipped volume ratio in a later pass.
+
+**Next: user re-runs; verify ramp clearance masses are now full 2450 height
+(uniform vertical) and unstepped.**
+
+## CURVED-RAMP FIX (2026-07-21) — pending test
+
+After the plane-projection rewrite, result was "much better, nearly right,"
+with two remaining defects on a curved ramp (floor 2323339):
+- no mass where the ramp turns;
+- default 2200 (not the zone's 2450) where the ramp meets the flat floor.
+
+Diagnosis (from run trace + warnings): BOTH are the SAME face. That floor
+has 9 top faces; 8 are ramp treads at Z≈−14..−16 that correctly get 2450
+(partial, ratio ~0.96). The 9th is a single WARPED surface spanning Z≈−16
+up to +8 (the curved turn + rise to the flat floor). It (a) tessellated to
+39,644 triangles at finest LOD → over the 5000 cap → skipped (no mass), and
+(b) its overlap shadow column was built flat at one elevation (Z≈[−1,8]),
+which missed the zone band [−18.4,−5.6] → overlap 0 → default 2200. A flat,
+fixed-height column can't represent a face that climbs 24 ft.
+
+Fix (both parts implemented, user confirmed faceted ramps are acceptable):
+1. Build: new `_choose_build_mesh` sweeps triangulation LOD coarse→fine and
+   takes the coarsest mesh under the cap; `_mesh_to_prisms` extrudes it.
+   `_build_clearance_prism` tier 3 now uses these, so a warped face builds
+   as a few hundred large facets (buildable, follows the curve) instead of
+   ~40k tiny prisms. Over-cap even at coarsest → flagged & skipped.
+   (`_face_triangulated_solids` refactored away into these two.)
+2. Overlap: `_footprint_shadow_columns` tier 2 now spans the loops' full
+   Z extent (zmin−margin .. zmax+reach) instead of a fixed height at one
+   elevation — so a warped ramp face is tested against the zone at every
+   elevation it passes through. Flat faces (zmin≈zmax) are unchanged.
+
+Under the user's chosen strict-3D-volume semantics, the ABOVE-zone part of
+that face correctly stays 2200; the in-zone part now gets 2450, and the
+turn now builds a (faceted) mass. Diagnostic trace (`resolve_height` DECISION
+lines, per-face build outcome, `_solids_z_range`) still in place for this
+test; `_trace`/probe scaffolding still to be stripped in final cleanup once
+confirmed.
+
+**Next: user re-runs Run check on the ramp scope box + zone; verify the turn
+now has a (faceted) mass and the in-zone ramp gets 2450.**
+
+## ARCHITECTURAL PIVOT (2026-07-21) — stop band-aiding the top-face B-rep
+
+User (now on Opus) flagged the real problem: the run finished but the
+clearance masses came out as **triangles that don't follow the zone
+outline**, while the source structural floors have regular forms. And more
+broadly: we keep band-aiding the same class of failure.
+
+Diagnosis of the triangle look:
+- In `create_clearance_shape`, any floor that partially overlaps a zone is
+  ALWAYS triangulated, then clipped by keeping whole triangles whose
+  centroid is inside the zone (`_apply_clip_by_containment`). So the zone
+  edge can only follow triangle edges, never the real zone polygon — hence
+  "triangles that don't match the outline." (We chose this to escape the
+  earlier silent-gap boolean bug; now seeing its downside.)
+- Floors that arrive split into many top faces (real ones seen with 249,
+  245, 9 faces) also build as many separate fragments.
+
+Root cause of the whole band-aid cycle: the algorithm is built on the
+floor's exact **top-face B-rep** (find top faces → take exact edge loops →
+extrude). Elegant for clean native floors; fragile for this project's
+imported/IFC-derived FamilyInstance floors (split faces, non-planar,
+degenerate). Every failure — ramp gap, 39k-triangle hang, crashes,
+zero-face skips, jagged clip — traces to leaning on that fragile geometry
+and falling back to triangulation.
+
+Decisions taken with the user:
+- **Preserve slope** (ramps must keep their sloped clearance surface — so a
+  flat-footprint-straight-up approach is out; we keep per-face sloped
+  extrusion but make it robust).
+- **Prototype first** before rewriting the engine.
+
+Working hypothesis for the redesign: clean extrusion fails (→ triangulation)
+because imported top-face edge loops are *slightly non-planar*. Fix =
+**fit a plane to the top face, project its edge loops onto that plane, and
+extrude the projected loops along the plane normal** → one clean SLOPED
+prism per face, slope preserved, no triangles, clean edges for zone
+clipping (which then uses a clean boolean between two single solids instead
+of triangle-centroid classification — the old boolean fragility came from
+cutting thousands of tiny triangles, not from boolean itself).
+
+Prototype added (read-only, behind `_PROTOTYPE_PROBE = True`, does NOT
+change what the tool builds):
+- `_face_best_fit_plane(face, link_transform)` — area-weighted plane fit.
+- `_project_loops_to_plane(loops, origin, normal)` — tessellate + project
+  loops onto the plane, rebuild as polyline CurveLoops.
+- `_try_extrude_loops(...)` — attempt an extrusion, report ok/error.
+- `_prototype_probe_floor(...)` — per floor, compares CURRENT raw-edge-loop
+  extrusion vs. PROPOSED plane-projected extrusion, counts triangles the
+  current fallback would build.
+- Wired into `_gather_floor_footprints` (runs on scope-box selection):
+  per-floor lines for floors that fail raw extrusion or exceed 500
+  triangles, plus a `PROBE SUMMARY` block at the end reporting, across all
+  floors: raw-OK vs projected-OK face counts, faces RESCUED by projection,
+  faces STILL BROKEN under both, and total fallback triangles.
+
+**PROBE RESULT (validated the redesign):** across 94 floors / 608 top faces:
+- raw edge-loop extrusion clean: 522/608 (86 → triangulation)
+- plane-projected extrusion clean: 583/608 (only 25 fail)
+- 63 faces RESCUED by projection, 23 STILL BROKEN
+- total triangles the current fallback would build: **756,526**
+
+The 23 still-broken faces are scattered small faces on just two big
+multi-face floors (5569638: 9 of 249; 4944911: 13 of 245) — non-critical.
+The decisive win: the two catastrophic floors 2323339 (356,919 tris) and
+2329124 (331,125 tris) — ~690k of the 756k total, and almost certainly the
+Run-time crash source — are fully rescued by projection into clean prisms.
+Firrst errors were "Non-planar CurveLoop" / "extrudeProjCurveLoops failed",
+exactly the slightly-non-planar-loop hypothesis. Preview completed cleanly
+(no crash; bbox-cap shadow-column fix held).
+
+## THE REWRITE (agreed direction, implementation pending)
+
+1. `create_clearance_shape` base geom: raw-loop extrusion → on failure,
+   plane-fit + project → one clean sloped prism. Triangulation demoted to a
+   rare HARD-CAPPED last resort (only the ~25 residual faces; cap piece
+   count so it can never explode/crash).
+2. Zone clip: clean boolean (intersect/difference) between the clean floor
+   prism and the zone column — replaces triangle-centroid classification,
+   fixes the jagged "doesn't match zone outline" masses.
+3. resolve_height / _analyze_zones overlap test: use the same
+   plane-projected footprint for consistency.
+4. Residual still-broken faces: flag (not silently skip), optional capped
+   triangulation.
+
+Probe scaffolding (`_PROTOTYPE_PROBE`, `_prototype_probe_floor`,
+`_try_extrude_loops`) to be removed once the rewrite lands; the real helpers
+`_face_best_fit_plane` / `_project_loops_to_plane` get promoted into the
+production path.
+
+## REWRITE IMPLEMENTED (2026-07-21, pending user test)
+
+All three changes landed:
+1. New `_build_clearance_prism(face, loops, host_normal, link_transform,
+   height_mm, label)` — tiered base geometry: raw edge-loop extrusion →
+   plane-fit+project (slope preserved) → HARD-CAPPED triangulation
+   (`TRIANGULATION_LAST_RESORT_CAP = 5000`; over the cap the face is flagged
+   & skipped, never explodes). `create_clearance_shape` now calls it and
+   returns None cleanly on total failure (no more uncaught `raise`).
+2. Zone clip: clean single-prism cases (raw/projected — the vast majority)
+   use an exact boolean (`_apply_clip`), so the zone edge follows the real
+   polygon. Only the rare triangulated last-resort still uses centroid
+   containment. Removed the old "always triangulate for clip" block that
+   caused the jagged triangle masses.
+3. `_footprint_shadow_columns` (overlap test) got a middle tier: flatten
+   loops to a horizontal plane + extrude vertically → one clean plan-
+   footprint column instead of per-triangle prisms. Consistent with the
+   build path and removes the per-triangle blowup from the preview too.
+
+`_PROTOTYPE_PROBE` set False (validated; code kept for reference). `_trace`
+scaffolding still in place to validate this run; to be stripped in final
+cleanup once confirmed.
+
+Expected outcome on the problem scope box: the 2323339 / 2329124 floors
+(formerly 350k+ triangles each) build as clean sloped prisms; zone-clipped
+masses follow the zone outline (no triangle edges); the ~23 residual faces
+on floors 5569638 / 4944911 fall to capped triangulation or a flag.
+
+**Next step: user re-runs "Run check" with the zone on the problem scope
+box and inspects the resulting masses (shape quality + zone-edge match) and
+whether it completes without hang/crash.**
+
+## NEW — silent Revit crash after the bbox-cap fix (2026-07-21, unresolved)
+
+After the bbox-cap fix below (`SHADOW_COLUMN_TRIANGLE_CAP`), user re-tested
+with a special zone in scope. This time: **Revit disappeared silently — no
+crash dialog, no error message, no hang warning, it just vanished.** This
+is meaningfully different from every previous incident in this thread (all
+of which were slow-but-alive or unresponsive-but-present) — a message-less
+disappearance points to a genuine native crash (likely deep in Revit's
+geometry kernel) bypassing all catchable .NET/Python exception handling,
+not a Python-level bug we could have caught with a try/except.
+
+Confirmed via follow-up: this happened while only the scope box was
+selected — the user had not clicked into the zones table or Run at all.
+So the relevant code path is `_gather_floor_footprints` →
+`_analyze_zones` → `resolve_height` (via `_refresh_conflicts_preview`) —
+NOT `create_clearance_shape`/`run()` (those only execute after "Run
+check", never reached here).
+
+Since a silent crash leaves no exception to log, re-added the same
+file-based `_trace`/`_trace_reset` mechanism (removed during the earlier
+cleanup) — a crash can't corrupt lines already flushed to disk, so it's
+the only forensic record available. Instrumented: `_gather_floor_footprints`
+(per-floor extract_top_faces), `_analyze_zones` (zone-space count,
+broad-phase filter result, per-floor shadow-column piece counts, per-1000
+boolean-intersect progress), `resolve_height` (footprint_cols piece count,
+per-space intersect start), and `_apply_clip_by_containment` (per-1000
+progress) — the last one isn't reachable from this specific report (that's
+Run-only) but is left in place since it has the same risk profile and will
+matter for the next Run-time test.
+
+**Reproduced with tracing in place — got much further this time, then
+stopped.** `trace.log` shows `_gather_floor_footprints START`, then dozens
+of floors processed cleanly (including Floor 5569638 with 249 faces and
+Floor 4944911 with 245 faces — both completed fine; `extract_top_faces`
+itself doesn't do the expensive triangulation/extrusion work, just reads
+existing Faces), through the three known zero-face floors (2332979,
+2333886, 2334641 — each completed including their diagnostic), then several
+more real floors — the trace stops cold right after `"extract_top_faces:
+Floor 2611993 done, 1 face(s)"`, with no further lines at all (no next
+floor's start line, no per-link "collected" line, nothing).
+
+Since `extract_top_faces` itself only inspects existing geometry (fast),
+and the crash happens in the gap immediately after it returns, the blind
+spot was in the UNTRACED code between floors: `face_boundary_loops_in_host_
+space` (per face) and the per-link `collect_structural_floors` boundary
+(moving to the next linked model). Added tracing to close both gaps:
+`Link '{name}': collecting...` / `... N floor(s) collected` around each
+link's collection, and `Floor {id}: extracting boundary loops for N
+face(s)...` / `...boundary loops done` around the per-face loop-extraction
+step, plus a final `_gather_floor_footprints DONE` marker.
+
+**Not yet reproduced with this finer tracing — waiting on the user to
+retry the same scope box once more.**
+
+## Previous — second triangle-explosion hang, this time in the zone-overlap path (2026-07-21)
+
+After committing `ddb02e9`, user started testing with a special zone (MEP
+Space clearance override) actually in play, per the planned next step. New
+report: **stuck again while selecting the scope box** (before clicking Run
+— so this is the preview/analysis path, which had fully completed
+successfully in the earlier trace when there were 0 zones in scope).
+
+Diagnosis (no new trace needed — same mechanism, different consumer):
+with a real zone now present, `_analyze_zones` and `resolve_height` no
+longer take their early-return/empty-zone shortcuts, so they now actually
+build a "shadow column" for every relevant floor via
+`_footprint_shadow_columns` → `_vertical_column_solids_from_face`. That
+function has the EXACT same per-triangle-prism pattern that caused the
+Run-time hang (confirmed: Floor 2335381's face triangulates into ~40,000
+pieces) — except here, all those pieces then feed into a
+`BooleanOperationsUtils.ExecuteBooleanOperation` loop against every zone
+space's column downstream, in both `_analyze_zones` and `resolve_height`.
+Unlike the DirectShape create/delete hang, this has no document I/O, but
+tens of thousands of geometry-kernel Boolean calls have their own real
+per-call overhead — slow enough to look identical to the earlier hang.
+
+**Fixed** (without needing to reproduce/re-trace, since the mechanism was
+already fully understood from the Run-time fix): added
+`SHADOW_COLUMN_TRIANGLE_CAP = 500` and `_vertical_column_bbox_solid(...)` —
+when a face's triangulation exceeds the cap, `_vertical_column_solids_from_
+face` now returns a single conservative rectangular column built from the
+mesh's own X/Y bounding box instead of one prism per triangle. This is fine
+for an "is there roughly an overlap" test (which never needed exact-shape
+precision, unlike the real clearance geometry in `create_clearance_shape` —
+that path still uses the precise `_face_triangulated_solids`/bisection
+validation, untouched here). Turns the ~40,000-piece case back into 1 piece
+for this specific overlap-test code path.
+
+**Not yet tested — awaiting user retry with the same zone/scope box.**
 
 ## What the tool does
 
