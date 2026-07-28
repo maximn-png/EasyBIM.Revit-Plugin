@@ -429,17 +429,52 @@ def extract_top_faces(floor, link_transform):
 
 
 def _transform_curve_loop(curve_loop, transform):
-    """CurveLoop itself has no CreateTransformed — transform each Curve and
-    rebuild the loop."""
-    new_loop = DB.CurveLoop()
+    """Transform each curve of a loop and rebuild it (CurveLoop has no
+    CreateTransformed). Real, imported/edited floor sketches sometimes have
+    loops that are numerically discontinuous — Revit's own CurveLoop tolerates
+    it, but a fresh Append() rejects it with "This curve will make the loop
+    discontinuous". So: try the exact rebuild first; on ANY failure, fall back
+    to a tessellated polyline, which is continuous by construction (each
+    segment starts where the previous ended, gaps bridged by a straight line).
+    Returns None if even that can't be built."""
+    try:
+        new_loop = DB.CurveLoop()
+        for curve in curve_loop:
+            new_loop.Append(curve.CreateTransformed(transform))
+        return new_loop
+    except Exception:
+        pass
+    pts = []
     for curve in curve_loop:
-        new_loop.Append(curve.CreateTransformed(transform))
-    return new_loop
+        try:
+            for p in curve.Tessellate():
+                pts.append(transform.OfPoint(p))
+        except Exception:
+            pass
+    poly = DB.CurveLoop()
+    appended = False
+    n = len(pts)
+    for i in range(n):
+        a = pts[i]
+        b = pts[(i + 1) % n]
+        if a.DistanceTo(b) < 1e-7:
+            continue
+        try:
+            poly.Append(DB.Line.CreateBound(a, b))
+            appended = True
+        except Exception:
+            return None
+    return poly if appended else None
 
 
 def face_boundary_loops_in_host_space(face, link_transform):
     loops = list(face.GetEdgesAsCurveLoops())
-    return [_transform_curve_loop(cl, link_transform) for cl in loops]
+    out = []
+    for cl in loops:
+        tl = _transform_curve_loop(cl, link_transform)
+        if tl is not None:
+            out.append(tl)
+    return out
 
 
 def _mesh_to_prisms(mesh, link_transform, height_ft):
@@ -588,18 +623,57 @@ def _space_boundary_loops(space):
     except Exception:
         return loops
     for loop in segments:
-        cl = DB.CurveLoop()
+        curves = []
         for seg in loop:
             try:
-                cl.Append(seg.GetCurve())
+                curves.append(seg.GetCurve())
             except Exception:
                 pass
+        cl = _curves_to_loop(curves)
+        if cl is not None:
+            loops.append(cl)
+    return loops
+
+
+def _curves_to_loop(curves):
+    """Build a closed CurveLoop from a list of curves, tolerating numerically
+    discontinuous boundaries (common on imported/edited geometry). Tries a
+    direct Append first; on failure falls back to a tessellated polyline that
+    is continuous by construction. Returns None if unusable."""
+    if not curves:
+        return None
+    try:
+        cl = DB.CurveLoop()
+        for c in curves:
+            cl.Append(c)
+        if not cl.IsOpen():
+            return cl
+    except Exception:
+        pass
+    pts = []
+    for c in curves:
         try:
-            if not cl.IsOpen():
-                loops.append(cl)
+            for p in c.Tessellate():
+                if not pts or pts[-1].DistanceTo(p) > 1e-7:
+                    pts.append(p)
         except Exception:
             pass
-    return loops
+    if len(pts) < 3:
+        return None
+    poly = DB.CurveLoop()
+    appended = False
+    n = len(pts)
+    for i in range(n):
+        a = pts[i]
+        b = pts[(i + 1) % n]
+        if a.DistanceTo(b) < 1e-7:
+            continue
+        try:
+            poly.Append(DB.Line.CreateBound(a, b))
+            appended = True
+        except Exception:
+            return None
+    return poly if appended else None
 
 
 def _vertical_column_solid(loops, margin_ft=COLUMN_MARGIN_FT, height_ft=COLUMN_HEIGHT_FT):
@@ -1568,41 +1642,64 @@ def _gather_floor_footprints(scope_box, struct_links):
     zones-table preview and the actual Run (there filtered to selected links)."""
     scope_bbox = scope_box.get_BoundingBox(None)
     out = []
+    if scope_bbox is None:
+        # Some scope boxes report no bounding box — without it the floor
+        # collector can't run. Return empty rather than throwing (which would
+        # abort scope-box selection entirely and make the box look
+        # unselectable).
+        logger.warning(u"Scope box '{}' has no bounding box — no floors gathered.".format(
+            getattr(scope_box, u"Name", u"?")))
+        return out
     for link_info in struct_links:
         if not link_info[u"loaded"] or link_info[u"doc"] is None:
             continue
         link_doc = link_info[u"doc"]
         link_transform = link_info[u"instance"].GetTotalTransform()
-        collected = collect_structural_floors(link_doc, link_transform, scope_bbox)
+        try:
+            collected = collect_structural_floors(link_doc, link_transform, scope_bbox)
+        except Exception as ex:
+            logger.warning(u"Link '{}': could not collect floors — {} — skipped.".format(
+                link_info[u"name"], ex))
+            continue
         for floor in collected:
-            label = _floor_label(floor)
-            faces = extract_top_faces(floor, link_transform)
-            if not faces:
-                try:
-                    fbbox = floor.get_BoundingBox(None)
-                    bbox_txt = (u"link-local bbox X=[{:.2f}, {:.2f}] Y=[{:.2f}, {:.2f}] Z=[{:.2f}, {:.2f}]".format(
-                        fbbox.Min.X, fbbox.Max.X, fbbox.Min.Y, fbbox.Max.Y, fbbox.Min.Z, fbbox.Max.Z)
-                        if fbbox is not None else u"bbox unavailable")
-                except Exception:
-                    bbox_txt = u"bbox unavailable"
-                diag = _floor_geometry_diagnostic(floor, link_transform)
-                logger.warning(u"Floor {} ({}): no upward-facing face found — {} — {} — skipped.".format(
-                    floor.Id.IntegerValue, label, bbox_txt, diag))
-                continue
-            for face, normal in faces:
-                loops = face_boundary_loops_in_host_space(face, link_transform)
-                if not loops:
-                    logger.warning(u"Floor {} ({}): face found but boundary loops empty — skipped.".format(
-                        floor.Id.IntegerValue, label))
+            # Isolate each floor: one floor with problematic geometry must not
+            # abort the whole scope box (which would make it unselectable).
+            try:
+                label = _floor_label(floor)
+                faces = extract_top_faces(floor, link_transform)
+                if not faces:
+                    try:
+                        fbbox = floor.get_BoundingBox(None)
+                        bbox_txt = (u"link-local bbox X=[{:.2f}, {:.2f}] Y=[{:.2f}, {:.2f}] Z=[{:.2f}, {:.2f}]".format(
+                            fbbox.Min.X, fbbox.Max.X, fbbox.Min.Y, fbbox.Max.Y, fbbox.Min.Z, fbbox.Max.Z)
+                            if fbbox is not None else u"bbox unavailable")
+                    except Exception:
+                        bbox_txt = u"bbox unavailable"
+                    diag = _floor_geometry_diagnostic(floor, link_transform)
+                    logger.warning(u"Floor {} ({}): no upward-facing face found — {} — {} — skipped.".format(
+                        floor.Id.IntegerValue, label, bbox_txt, diag))
                     continue
-                out.append({
-                    u"link_name": link_info[u"name"],
-                    u"label": label,
-                    u"loops": loops,
-                    u"normal": normal,
-                    u"face": face,
-                    u"link_transform": link_transform,
-                })
+                for face, normal in faces:
+                    loops = face_boundary_loops_in_host_space(face, link_transform)
+                    if not loops:
+                        logger.warning(u"Floor {} ({}): face found but boundary loops empty — skipped.".format(
+                            floor.Id.IntegerValue, label))
+                        continue
+                    out.append({
+                        u"link_name": link_info[u"name"],
+                        u"label": label,
+                        u"loops": loops,
+                        u"normal": normal,
+                        u"face": face,
+                        u"link_transform": link_transform,
+                    })
+            except Exception as fex:
+                try:
+                    fid = floor.Id.IntegerValue
+                except Exception:
+                    fid = u"?"
+                logger.warning(u"Floor {}: skipped ({}).".format(fid, fex))
+                continue
     return out
 
 
@@ -1656,8 +1753,11 @@ def _analyze_zones(scope_box, footprints):
 
     floor_cols = []
     for f in relevant_footprints:
-        cols = _footprint_shadow_columns(f[u"loops"], f[u"face"], f[u"link_transform"], margin_ft, reach_ft)
-        floor_cols.extend(cols)
+        try:
+            cols = _footprint_shadow_columns(f[u"loops"], f[u"face"], f[u"link_transform"], margin_ft, reach_ft)
+            floor_cols.extend(cols)
+        except Exception:
+            continue
 
     zones = []
     for sp, height_mm in zone_spaces:
@@ -1715,33 +1815,40 @@ def run(footprints, struct_links, candidate_spaces, default_mm, clear_previous, 
         space_col_cache = {}
         for f in relevant:
             processed_floor_labels.add(f[u"label"])
-            assignments, conflict = resolve_height(
-                f[u"loops"], candidate_spaces, default_mm, f[u"face"], f[u"link_transform"],
-                space_col_cache=space_col_cache, label=f[u"label"])
-            if conflict:
-                summary[u"conflicts"].append(f[u"label"])
+            # Isolate each floor so one problematic floor can't abort (and roll
+            # back) the WHOLE run — resolve_height/create_clearance_shape both
+            # touch geometry that can throw on real imported floors.
+            try:
+                assignments, conflict = resolve_height(
+                    f[u"loops"], candidate_spaces, default_mm, f[u"face"], f[u"link_transform"],
+                    space_col_cache=space_col_cache, label=f[u"label"])
+                if conflict:
+                    summary[u"conflicts"].append(f[u"label"])
+                    continue
+                any_created = False
+                for assignment in assignments:
+                    height_mm = assignment[u"height_mm"]
+                    is_partial = assignment[u"is_partial"]
+                    try:
+                        ds = create_clearance_shape(
+                            f[u"face"], f[u"loops"], f[u"normal"], height_mm, ws_id, f[u"link_transform"],
+                            zone_polys=assignment.get(u"zone_polys"),
+                            keep_inside=assignment.get(u"keep_inside"), label=f[u"label"])
+                    except Exception as ex:
+                        logger.warning(u"Shape creation failed for {}: {}".format(f[u"label"], ex))
+                        continue
+                    if ds is None:
+                        continue
+                    any_created = True
+                    summary[u"created"] += 1
+                    bucket = zone_usage.setdefault(height_mm, {u"count": 0, u"partial": False})
+                    bucket[u"count"] += 1
+                    bucket[u"partial"] = bucket[u"partial"] or is_partial
+                if not any_created and assignments:
+                    _log_no_coverage_gap(f)
+            except Exception as fex:
+                logger.warning(u"Floor {} skipped during run: {}".format(f[u"label"], fex))
                 continue
-            any_created = False
-            for assignment in assignments:
-                height_mm = assignment[u"height_mm"]
-                is_partial = assignment[u"is_partial"]
-                try:
-                    ds = create_clearance_shape(
-                        f[u"face"], f[u"loops"], f[u"normal"], height_mm, ws_id, f[u"link_transform"],
-                        zone_polys=assignment.get(u"zone_polys"),
-                        keep_inside=assignment.get(u"keep_inside"), label=f[u"label"])
-                except Exception as ex:
-                    logger.warning(u"Shape creation failed for {}: {}".format(f[u"label"], ex))
-                    continue
-                if ds is None:
-                    continue
-                any_created = True
-                summary[u"created"] += 1
-                bucket = zone_usage.setdefault(height_mm, {u"count": 0, u"partial": False})
-                bucket[u"count"] += 1
-                bucket[u"partial"] = bucket[u"partial"] or is_partial
-            if not any_created and assignments:
-                _log_no_coverage_gap(f)
         summary[u"floors"] = len(processed_floor_labels)
         t2.Commit()
 
@@ -2501,8 +2608,19 @@ class HeadHeightCheckDialog(object):
 
     def _select_scope(self, name):
         self._sel_scope_name = name
-        self._refresh_scope_analysis()
+        # Paint the selection highlight FIRST so the click always registers,
+        # then run the (heavier, geometry-touching) analysis. Previously the
+        # analysis ran first with no error handling, so if it threw for a
+        # particular scope box the whole click aborted and the row silently
+        # never highlighted — which looked like "this scope box won't select".
         self._update_scope_selection_ui()
+        try:
+            self._refresh_scope_analysis()
+        except Exception as ex:
+            self._zones = []
+            self._conflicts_preview = []
+            logger.warning(u"Scope box '{}': analysis failed, selected with no zones — {}\n{}".format(
+                name, ex, traceback.format_exc()))
         self._rebuild_zone_rows()
         self._update_footer_summary()
         self._update_run_enabled()
