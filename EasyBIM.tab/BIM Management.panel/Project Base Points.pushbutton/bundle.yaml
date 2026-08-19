@@ -1,0 +1,11 @@
+title: |-
+  Project Base
+  Points
+tooltip: >-
+  Audits the host model's and every linked model's Project Base Point against
+  Architecture reference models. Flags coordinate/angle mismatches and links
+  not in shared coordinates. Exports HTML/print-ready HTML/Excel; the Excel
+  is an ACC (Autodesk Construction Cloud) issue import.
+author: EasyBIM
+highlight: new
+min_revit_ver: 2023

@@ -1,0 +1,11 @@
+# pyRevit pushbutton manifest.
+# Place this file's folder as:
+#   EasyBIM.extension/EasyBIM.tab/BIM Management.panel/ProjectBasePoints.pushbutton/
+# alongside script.py, icon.png (32px, the ProjectBasePoint glyph), and the lib/ modules below.
+title: Project Base Points
+tooltip: >
+  Audits the host model's and every linked model's Project Base Point against
+  Architecture reference models. Flags coordinate/angle mismatches and links not in
+  shared coordinates. Exports HTML/PDF/Excel; the Excel is an ACC (Forma) issue import.
+tooltip_image: icon.png
+context: zero-doc
