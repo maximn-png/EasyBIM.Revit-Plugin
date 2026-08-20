@@ -50,9 +50,25 @@ def _reinsert_binding(doc, defn, binding):
 from Autodesk.Revit.UI import TaskDialog
 from System.Collections.Generic import List as CList
 from pyrevit import revit
+from easybim.dekel_shared_params import ensure_dekel_params
 
 doc   = revit.doc
 uidoc = revit.uidoc
+
+# batch mode (pyrevit run): doc is None, open first model from __models__
+if doc is None:
+    try:
+        from Autodesk.Revit.DB import OpenOptions, ModelPathUtils
+        _batch_models = __models__  # injected by pyrevit run
+        if _batch_models:
+            _mp  = ModelPathUtils.ConvertUserVisiblePathToModelPath(_batch_models[0])
+            _uid = revit.HOST_APP.uiapp.OpenAndActivateDocument(_mp, OpenOptions(), False)
+            doc   = _uid.Document
+            uidoc = _uid
+            print(u"[batch] opened: {}".format(doc.Title))
+    except Exception as _e:
+        print(u"[batch] could not open model: {}".format(_e))
+
 NS    = "http://schemas.openxmlformats.org/spreadsheetml/2006/main"
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -84,6 +100,12 @@ PARAM_TR_DESC4  = u"תיאור סעיף דקל שנאי 4"
 PARAM_TR_PRICE4 = u"מחיר דקל שנאי 4"
 PARAM_TR_TOTAL  = u"סה\"כ לשנאי"
 
+# סלוט 3 — נקודות תקשורת לתחנות עבודה
+PARAM_CODE3  = u"מספר סעיף דקל 3"
+PARAM_DESC3  = u"תיאור סעיף דקל 3"
+PARAM_PRICE3 = u"מחיר דקל 3"
+PARAM_QTY3   = u"כמות 3"
+
 PARAM_DEFS = [
     # גנרטורים — 2 סלוטים + סה"כ
     (PARAM_CODE,  u"TEXT"), (PARAM_DESC,  u"TEXT"), (PARAM_PRICE,  u"TEXT"),
@@ -95,6 +117,9 @@ PARAM_DEFS = [
     (PARAM_TR_CODE3, u"TEXT"), (PARAM_TR_DESC3, u"TEXT"), (PARAM_TR_PRICE3, u"TEXT"),
     (PARAM_TR_CODE4, u"TEXT"), (PARAM_TR_DESC4, u"TEXT"), (PARAM_TR_PRICE4, u"TEXT"),
     (PARAM_TR_TOTAL, u"TEXT"),
+    # סלוט 3 — תקשורת
+    (PARAM_CODE3, u"TEXT"), (PARAM_DESC3, u"TEXT"),
+    (PARAM_PRICE3, u"TEXT"), (PARAM_QTY3, u"TEXT"),
 ]
 
 # ── ברירות מחדל לגנרטורים ────────────────────────────────────────────────────
@@ -105,6 +130,18 @@ FIRE_PANEL_DESC = u"פנל התראות בהתאם לדרישות כיבוי א�
 TR_SLOT2_CODE = u"08.093.0200"   # קופסת פיקוד לשנאי
 TR_SLOT3_CODE = u"08.093.0130"   # תוספת אוורור מאולץ
 TR_SLOT4_CODE = u"08.093.0080"   # תוספת הגנות DGPT
+
+# ── נקודת תקשורת (סלוט 3 לתחנות with Comm) ─────────────────────────────────
+# קוד קבוע — נקודת תקשורת אחודה מושלמת CAT-6A.
+# המחיר/תיאור fallback משמשים כשקובץ הדקל שנטען לא כולל את סעיף 08.019.
+COMM_CODE  = u"08.019.0720"
+COMM_DESC  = u"נקודת תקשורת אחודה מושלמת CAT-6A"
+COMM_PRICE = 371.0
+
+# ── טיפוסים שיש להתעלם מהם (לא נכללים בכתב הכמויות) ─────────────────────────
+# פתחים (Round/Square Opening) הם חורי מעבר — לא מתומחרים כסעיף חשמל נפרד.
+# אלמנט שבשם המשפחה/הטיפוס שלו מופיעה אחת המילים — ידולג בשקט (לא נספר ככשל).
+IGNORE_FIXTURE_KEYWORDS = (u"opening",)
 
 # ── קודי שנאים יבשים בלבד (לסינון) ─────────────────────────────────────────
 DRY_TR_CODES = frozenset([
@@ -167,11 +204,12 @@ FIXTURE_MAP = {
     u"DBA Mounted Socket - x3":(u"08.072.0025",u'שקע עה"ט x3',u"08.019.0310",u"נקודה 2.5mm²"),
     u"DBA Mounted Socket - x4":(u"08.072.0026",u'שקע עה"ט x4',u"08.019.0310",u"נקודה 2.5mm²"),
     u"DBA Mounted Socket - AC":(u"08.019.0100",u"נקודה מזגן",None,u""),
-    u"DBA Recessed Socket - x1":(u"08.072.0090",u'שקע תה"ט x1',u"08.019.0310",u"נקודה 2.5mm²"),
-    u"DBA Recessed Socket - x2":(u"08.072.0090",u'שקע תה"ט x2',u"08.019.0310",u"נקודה 2.5mm²"),
-    u"DBA Recessed Socket - x3":(u"08.072.0090",u'שקע תה"ט x3',u"08.019.0310",u"נקודה 2.5mm²"),
-    u"DBA Recessed Socket - x4":(u"08.072.0090",u'שקע תה"ט x4',u"08.019.0310",u"נקודה 2.5mm²"),
+    u"DBA Recessed Socket - x1":(u"08.072.0010",u'שקע תה"ט x1',u"08.019.0310",u"נקודה 2.5mm²"),
+    u"DBA Recessed Socket - x2":(u"08.072.0020",u'שקע תה"ט x2',u"08.019.0310",u"נקודה 2.5mm²"),
+    u"DBA Recessed Socket - x3":(None,u'שקע תה"ט x3 — דורש החלטה',None,u""),
+    u"DBA Recessed Socket - x4":(None,u'שקע תה"ט x4 — דורש החלטה',None,u""),
     u"DBA Recessed Socket - AC":(u"08.019.0100",u"נקודה מזגן",None,u""),
+    u"DBA Recessed Socket - Venta":(u"08.072.0010",u'שקע תה"ט רגיל',u"08.019.0310",u"נקודה 2.5mm²"),
     u"DBA Recessed 3P Socket - AC":(u"08.019.0167",u"נקודה מזגן 3P",None,u""),
     u"DBA Mounted 3P Socket":(u"08.019.0430",u"נקודה תלת-פאזי",None,u""),
     u"DBA Recessed 3P Socket":(u"08.019.0430",u"נקודה תלת-פאזי",None,u""),
@@ -208,8 +246,43 @@ FIXTURE_MAP = {
     u"DBA Square Opening":(None,u"פתח מרובע — ללא סעיף",None,u""),
     u"DBA Mounted Elec Workstation":(None,u"תחנת עבודה — תמחור מיוחד",None,u""),
     u"DBA Recessed Elec WorkStation":(None,u"תחנת עבודה — תמחור מיוחד",None,u""),
-    u"DBA Mounted Elec Workstation with UPS":(None,u"תחנת עבודה + UPS",None,u""),
-    u"DBA Recessed Elec WorkStation with UPS":(None,u"תחנת עבודה + UPS",None,u""),
+    u"DBA Mounted Elec Workstation - D11": (u"08.072.0300",u"רב בתי תקע D11",None,u""),
+    u"DBA Mounted Elec Workstation - D14": (u"08.072.0310",u"רב בתי תקע D14",None,u""),
+    u"DBA Mounted Elec Workstation - D17": (u"08.072.0320",u"רב בתי תקע D17",None,u""),
+    u"DBA Mounted Elec Workstation - D18": (u"08.072.0330",u"רב בתי תקע D18",None,u""),
+    u"DBA Mounted Elec Workstation - D20": (u"08.072.0340",u"רב בתי תקע D20",None,u""),
+    u"DBA Recessed Elec WorkStation - D11":(u"08.072.0300",u"רב בתי תקע D11",None,u""),
+    u"DBA Recessed Elec WorkStation - D14":(u"08.072.0310",u"רב בתי תקע D14",None,u""),
+    u"DBA Recessed Elec WorkStation - D17":(u"08.072.0320",u"רב בתי תקע D17",None,u""),
+    u"DBA Recessed Elec WorkStation - D18":(u"08.072.0330",u"רב בתי תקע D18",None,u""),
+    u"DBA Recessed Elec WorkStation - D20":(u"08.072.0340",u"רב בתי תקע D20",None,u""),
+    # with Comm — same hardware codes as base type; comm accessory billed separately
+    u"DBA Mounted Elec Workstation - D14 with Comm":  (u"08.072.0310",u"רב בתי תקע D14",u"08.019.0310",u"נקודה 2.5mm²"),
+    u"DBA Mounted Elec Workstation - D17 with Comm":  (u"08.072.0320",u"רב בתי תקע D17",u"08.019.0310",u"נקודה 2.5mm²"),
+    u"DBA Mounted Elec Workstation - D18 with Comm":  (u"08.072.0330",u"רב בתי תקע D18",u"08.019.0310",u"נקודה 2.5mm²"),
+    u"DBA Mounted Elec Workstation - D20 with Comm":  (u"08.072.0340",u"רב בתי תקע D20",u"08.019.0310",u"נקודה 2.5mm²"),
+    u"DBA Recessed Elec WorkStation - D14 with Comm": (u"08.072.0310",u"רב בתי תקע D14",u"08.019.0310",u"נקודה 2.5mm²"),
+    u"DBA Recessed Elec WorkStation - D17 with Comm": (u"08.072.0320",u"רב בתי תקע D17",u"08.019.0310",u"נקודה 2.5mm²"),
+    u"DBA Recessed Elec WorkStation - D18 with Comm": (u"08.072.0330",u"רב בתי תקע D18",u"08.019.0310",u"נקודה 2.5mm²"),
+    u"DBA Recessed Elec WorkStation - D20 with Comm": (u"08.072.0340",u"רב בתי תקע D20",u"08.019.0310",u"נקודה 2.5mm²"),
+    u"DBA Mounted Elec Workstation with UPS":(None,u"תחנת עבודה + UPS — דורש החלטה",None,u""),
+    u"DBA Recessed Elec WorkStation with UPS":(None,u"תחנת עבודה + UPS — דורש החלטה",None,u""),
+    # שקעים מוגני מים (על הטיח) — לפי כמות בתי תקע
+    u"DBA Waterproof Mounted Socket - x1":(u"08.072.0030",u"שקע מוגן מים 16A",u"08.019.0310",u"נקודה 2.5mm²"),
+    u"DBA Waterproof Mounted Socket - x2":(u"08.072.0031",u"שקע מוגן מים כפול 16A",u"08.019.0310",u"נקודה 2.5mm²"),
+    u"DBA Waterproof Mounted Socket - x3":(u"08.072.0032",u"3 שקעים מוגני מים 16A",u"08.019.0310",u"נקודה 2.5mm²"),
+    # שקעים מוגני מים (תה"ט) — קוד גנרי זהה, אין סעיף מוגן-מים תה"ט נפרד בקטלוג
+    u"DBA Waterproof Recessed Socket - x1":(u"08.072.0030",u"שקע מוגן מים 16A",u"08.019.0310",u"נקודה 2.5mm²"),
+    u"DBA Waterproof Recessed Socket - x2":(u"08.072.0031",u"שקע מוגן מים כפול 16A",u"08.019.0310",u"נקודה 2.5mm²"),
+    # מכשירי חימום בחדר רטוב — נקודת חיבור מכשיר מוגנת מים (מ"ז בתיבה אטומה)
+    u"DBA Waterproof Mounted Socket - Mirror Heater":(u"08.019.0410",u"נקודת מכשיר מוגנת מים 16A",None,u""),
+    u"DBA Waterproof Mounted Socket - Towel Warmer":(u"08.019.0410",u"נקודת מכשיר מוגנת מים 16A",None,u""),
+    u"DBA Waterproof Recessed Socket - Mirror Heater":(u"08.019.0410",u"נקודת מכשיר מוגנת מים 16A",None,u""),
+    u"DBA Waterproof Recessed Socket - Towel Warmer":(u"08.019.0410",u"נקודת מכשיר מוגנת מים 16A",None,u""),
+    # שקע עם מפסק מובנה — שקע דגם בריטי עם מפסק מואר
+    # שקע עם מתג — סעיף מאוחד: שקע תה"ט (0010) + מ"ז דו-קוטבי (0150) = ₪66
+    u"DBA Recessed Switched Socket - Remote Switch":(u"08.072.0010+08.073.0150",u'שקע תה"ט + מ"ז דו-קוטבי 16A',u"08.019.0310",u"נקודה 2.5mm²"),
+    u"DBA Recessed Switched Socket - With Switch":(u"08.072.0010+08.073.0150",u'שקע תה"ט + מ"ז דו-קוטבי 16A',u"08.019.0310",u"נקודה 2.5mm²"),
 }
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -251,89 +324,36 @@ def match_generator(typ, kva_map):
     desc = u"גנרטור דיזל {} kVA STANDBY ({} kW)".format(closest, kw)
     return code, desc, price, note, closest
 
-# ──────────────────────────────────────────────────────────────────────────────
-# SHARED PARAMETERS
-# ──────────────────────────────────────────────────────────────────────────────
-def get_existing():
-    s = set()
-    it = doc.ParameterBindings.ForwardIterator()
-    while it.MoveNext():
-        s.add(it.Key.Name)
-    return s
+# ────────────────────────────────────────────────────────────────────
+# SHARED PARAMETERS — דרך המודול המשותף (GUID קבועים + מיזוג קטגוריות)
+# ────────────────────────────────────────────────────────────────────
+# כלי ה-Power עובד על ציוד חשמלי (שנאים/גנרטורים) + אביזרים
+POWER_CATEGORIES = [
+    BuiltInCategory.OST_ElectricalEquipment,
+    BuiltInCategory.OST_ElectricalFixtures,
+]
 
-
-def create_params(missing):
-    spf = os.path.join(
-        str(System.Environment.GetFolderPath(System.Environment.SpecialFolder.ApplicationData)),
-        "DekelPower_tmp.txt")
-    hdr = (u"# Revit Shared Parameters\n*META\tVERSION\tMINVERSION\nMETA\t2\t1\n"
-           u"*GROUP\tID\tNAME\nGROUP\t1\tDekel\n"
-           u"*PARAM\tGUID\tNAME\tDATATYPE\tDATACATEGORY\tGROUP\tVISIBLE\tDESCRIPTION\tUSERMODIFIABLE\tHIDEWHENNOVALUEISSHOWN\n")
-    lines = u"".join(
-        u"PARAM\t{}\t{}\t{}\t\t1\t1\t\t1\t0\n".format(str(System.Guid.NewGuid()), n, t)
-        for n, t in missing)
-    with codecs.open(spf, "w", encoding="utf-16") as f:
-        f.write(hdr + lines)
-    old = doc.Application.SharedParametersFilename
-    doc.Application.SharedParametersFilename = spf
-    try:
-        sp  = doc.Application.OpenSharedParameterFile()
-        grp = sp.Groups.get_Item("Dekel")
-        cats = CategorySet()
-        for bic in [BuiltInCategory.OST_ElectricalEquipment, BuiltInCategory.OST_ElectricalFixtures]:
-            cats.Insert(doc.Settings.Categories.get_Item(bic))
-        for n, _ in missing:
-            d = grp.Definitions.get_Item(n)
-            if d:
-                _insert_binding(doc, d, InstanceBinding(cats))
-                print(u"  נוצר: {}".format(n))
-    finally:
-        doc.Application.SharedParametersFilename = old or ""
-        try: os.remove(spf)
-        except: pass
-
-
-def ensure_cats():
-    tgt = [doc.Settings.Categories.get_Item(b)
-           for b in [BuiltInCategory.OST_ElectricalEquipment, BuiltInCategory.OST_ElectricalFixtures]]
-    pnames = set(n for n, _ in PARAM_DEFS)
-    defs = []
-    it = doc.ParameterBindings.ForwardIterator()
-    while it.MoveNext():
-        if it.Key.Name in pnames:
-            defs.append(it.Key)
-    for d in defs:
-        b = doc.ParameterBindings.get_Item(d)
-        if not b:
-            continue
-        cats = b.Categories
-        for cat in tgt:
-            cats.Insert(cat)
-        _reinsert_binding(doc, d, InstanceBinding(cats))
-
-
-missing = [(n, t) for n, t in PARAM_DEFS if n not in get_existing()]
-if missing:
-    t0 = Transaction(doc, u"Dekel Power - Params")
-    t0.Start()
-    try:
-        create_params(missing)
-        t0.Commit()
-    except Exception as e:
-        t0.RollBack()
-        TaskDialog.Show("Dekel", u"{}".format(e))
-        import sys; sys.exit()
-else:
-    print(u"פרמטרים קיימים.")
-
-tb = Transaction(doc, u"Dekel Power - Bind")
-tb.Start()
+t_params = Transaction(doc, u"Dekel Power - Ensure Shared Parameters")
+t_params.Start()
 try:
-    ensure_cats()
-    tb.Commit()
+    rep = ensure_dekel_params(doc, PARAM_DEFS, POWER_CATEGORIES)
+    t_params.Commit()
+    if rep["created"]:
+        print(u"נוצרו {} פרמטרים".format(len(rep["created"])))
+    if rep["extended"]:
+        print(u"קושרו לקטגוריות החשמל {} פרמטרים קיימים".format(len(rep["extended"])))
+    if rep["ok"]:
+        print(u"{} פרמטרים כבר היו מקושרים כראוי".format(len(rep["ok"])))
+    if rep["failed"]:
+        print(u"  [אזהרה] לא ניתן לטפל ב-{} פרמטרים: {}".format(
+            len(rep["failed"]), u", ".join(rep["failed"])))
+        TaskDialog.Show("Dekel", u"חלק מהפרמטרים לא נוצרו/קושרו:\n{}".format(
+            u", ".join(rep["failed"])))
 except Exception as e:
-    tb.RollBack()
-    print(u"אזהרה: {}".format(e))
+    try: t_params.RollBack()
+    except Exception: pass
+    TaskDialog.Show("Dekel", u"שגיאה ביצירת/קישור פרמטרים:\n{}".format(e))
+    import sys; sys.exit()
 
 # ──────────────────────────────────────────────────────────────────────────────
 # EXCEL READ
@@ -387,18 +407,24 @@ def read_xlsx(path, catalog):
 
 # ──────────────────────────────────────────────────────────────────────────────
 # FILE SELECTION — multi-select OpenFileDialog
+#    אם הכפתור המאוחד (Run All) כבר בחר קבצים — נשתמש בהם ולא נפתח דיאלוג.
 # ──────────────────────────────────────────────────────────────────────────────
-dlg = OpenFileDialog()
-dlg.Title       = u"בחר קבצי טבלאות דקל (ניתן לבחור מספר קבצים)"
-dlg.Filter      = "Excel Files (*.xlsx)|*.xlsx"
-dlg.Multiselect = True
+_preselected = os.environ.get("DEKEL_XLSX_PATHS", "")
+if _preselected:
+    selected_paths = [p for p in _preselected.split(";") if p]
+    print(u"קבצים (מ-Run All): {}".format(len(selected_paths)))
+else:
+    dlg = OpenFileDialog()
+    dlg.Title       = u"בחר קבצי טבלאות דקל (ניתן לבחור מספר קבצים)"
+    dlg.Filter      = "Excel Files (*.xlsx)|*.xlsx"
+    dlg.Multiselect = True
 
-if dlg.ShowDialog() != DialogResult.OK or not dlg.FileNames:
-    TaskDialog.Show("Dekel", u"לא נבחר קובץ.")
-    import sys; sys.exit()
+    if dlg.ShowDialog() != DialogResult.OK or not dlg.FileNames:
+        TaskDialog.Show("Dekel", u"לא נבחר קובץ.")
+        import sys; sys.exit()
 
-selected_paths = list(dlg.FileNames)
-print(u"קבצים שנבחרו: {}".format(len(selected_paths)))
+    selected_paths = list(dlg.FileNames)
+    print(u"קבצים שנבחרו: {}".format(len(selected_paths)))
 
 catalog = {}
 for path in selected_paths:
@@ -554,23 +580,48 @@ def match_equip(elem):
     return None, None, None, u""
 
 
+def _price_of(code):
+    # תומך בקוד מאוחד בפורמט "A+B" — מסכם את מחירי כל הסעיפים.
+    # לקוד יחיד מחזיר את המחיר מהקטלוג (התנהגות רגילה).
+    if not code:
+        return None
+    total = 0.0
+    found = False
+    for part in code.split(u"+"):
+        pr = catalog.get(part.strip(), {}).get(u"price")
+        if pr is not None:
+            total += pr
+            found = True
+    return total if found else None
+
+
+def _title_of(code, label):
+    # לקוד מאוחד — משתמשים בתווית מהמיפוי (אין כותרת מאוחדת בקטלוג).
+    # לקוד יחיד — כותרת הקטלוג, ואם אין אז התווית.
+    if not code:
+        return label
+    if u"+" in code:
+        return label
+    return (catalog.get(code, {}).get(u"title", label) or label)[:60]
+
+
 def match_fix(elem):
     fam, typ = get_ft(elem)
     c1, c2 = get_prefilled(elem)
     if c1 or c2:
-        p1 = catalog.get(c1, {}).get(u"price") if c1 else None
-        t1 = catalog.get(c1, {}).get(u"title", u"")[:60] if c1 else u""
-        p2 = catalog.get(c2, {}).get(u"price") if c2 else None
-        t2 = catalog.get(c2, {}).get(u"title", u"")[:60] if c2 else u""
+        p1 = _price_of(c1)
+        t1 = _title_of(c1, u"") if c1 else u""
+        p2 = _price_of(c2)
+        t2 = _title_of(c2, u"") if c2 else u""
         return c1, t1, p1, c2, t2, p2
     for key in [u"{} - {}".format(fam, typ), u"{} / {}".format(fam, typ),
                 u"{} {}".format(fam, typ), fam]:
         if key in FIXTURE_MAP:
             fc1, l1, fc2, l2 = FIXTURE_MAP[key]
-            p1 = catalog.get(fc1, {}).get(u"price") if fc1 else None
-            t1 = catalog.get(fc1, {}).get(u"title", l1)[:60] if fc1 else l1
-            p2 = catalog.get(fc2, {}).get(u"price") if fc2 else None
-            t2 = catalog.get(fc2, {}).get(u"title", l2)[:60] if fc2 else l2
+            p1 = _price_of(fc1)
+            t1 = _title_of(fc1, l1)
+            p2 = _price_of(fc2)
+            t2 = _title_of(fc2, l2)
             return fc1, t1, p1, fc2, t2, p2
     return None, None, None, None, None, None
 
@@ -579,6 +630,10 @@ def match_fix(elem):
 # ──────────────────────────────────────────────────────────────────────────────
 equipment = list(FilteredElementCollector(doc)
     .OfCategory(BuiltInCategory.OST_ElectricalEquipment)
+    .WhereElementIsNotElementType().ToElements())
+
+fixtures = list(FilteredElementCollector(doc)
+    .OfCategory(BuiltInCategory.OST_ElectricalFixtures)
     .WhereElementIsNotElementType().ToElements())
 
 
@@ -591,8 +646,8 @@ generators       = [e for e in equipment if u"Generator"   in _fam(e)]
 dry_transformers = [e for e in equipment
                     if u"Transformer" in _fam(e) and u"Dry" in _fam(e)]
 
-print(u"ציוד סה\"כ: {} | גנרטורים: {} | שנאים יבשים: {}".format(
-    len(equipment), len(generators), len(dry_transformers)))
+print(u"ציוד סה\"כ: {} | גנרטורים: {} | שנאים יבשים: {} | שקעים/אביזרים: {}".format(
+    len(equipment), len(generators), len(dry_transformers), len(fixtures)))
 
 skipped_details = []
 failed_details  = []
@@ -685,6 +740,187 @@ t_tr.Commit()
 print(u"שנאים יבשים: {}\u2713  {}\u26a0  {}\u2717".format(tr_ok, tr_sk, tr_fl))
 
 # ──────────────────────────────────────────────────────────────────────────────
+# COMM CONFIGURATION UI
+# For each unique comm type found in the model (case-insensitive "comm" in type
+# name), use pyrevit forms to ask the engineer for a per-type point count, then
+# ask once whether to include comm points in the BoQ.
+# Results consumed by t_fix loop below.
+# ──────────────────────────────────────────────────────────────────────────────
+from pyrevit import forms as _pf
+
+_comm_types = {}  # {type_name: instance_count}
+for _ce in fixtures:
+    _, _ctyp = get_ft(_ce)
+    if u"comm" in _ctyp.lower():
+        _comm_types[_ctyp] = _comm_types.get(_ctyp, 0) + 1
+
+comm_count_by_type = {}  # {type_name: n_comm_points_per_unit}
+include_comm = False
+
+if _comm_types:
+    print(u"נמצאו {} טיפוסי תחנה עם תקשורת".format(len(_comm_types)))
+    for _typ_name in sorted(_comm_types.keys()):
+        _cnt = _comm_types[_typ_name]
+        _result = _pf.ask_for_string(
+            default=u"1",
+            prompt=u'כמה נקודות תקשורת לסוג "{}"? ({} מופעים)'.format(_typ_name, _cnt),
+            title=u"נקודות תקשורת"
+        )
+        if _result is None:
+            break
+        try:
+            _n = int(_result.strip())
+        except (ValueError, AttributeError):
+            _n = 1
+        if _n > 0:
+            comm_count_by_type[_typ_name] = _n
+
+    if comm_count_by_type:
+        _incl = _pf.alert(
+            u"כלול נקודות תקשורת בכתב הכמויות?",
+            title=u"נקודות תקשורת",
+            options=[u"כן", u"לא"]
+        )
+        include_comm = (_incl == u"כן")
+
+# ── קוד נקודת תקשורת ────────────────────────────────────────────────────────
+# אם 08.019.0720 קיים בקטלוג — משתמשים בו אוטומטית (המשתמש לא נשאל דבר).
+# רק אם הוא לא נמצא (למשל דקל עדכנו את הקוד) — נפתחת חלונית לבחירת קוד חלופי.
+_comm_catalog_code = COMM_CODE
+_comm_info  = catalog.get(COMM_CODE, {})
+_comm_price = _comm_info.get(u"price")
+_comm_title = (_comm_info.get(u"title") or u"")[:60]
+
+if _comm_price is None and include_comm:
+    # ברירת המחדל לא נמצאה בקטלוג — מבקשים קוד חלופי מהמשתמש
+    print(u"[!] קוד התקשורת {} לא נמצא בקטלוג שנטען.".format(COMM_CODE))
+    while True:
+        _code_in = _pf.ask_for_string(
+            default=COMM_CODE,
+            prompt=(u'קוד התקשורת {} לא נמצא בקטלוג שנטען.\n'
+                    u'ייתכן שדקל עדכנו את הקוד.\n\n'
+                    u'הזיני קוד דקל חלופי לנקודת תקשורת:').format(COMM_CODE),
+            title=u"קוד תקשורת לא נמצא"
+        )
+        if not _code_in:
+            break  # ביטול — נשאר עם ברירת המחדל + fallback
+        _code_in = _code_in.strip()
+        if not re.match(r"\d{2}\.\d{3}\.\d{4}", _code_in):
+            _pf.alert(u"פורמט קוד לא תקין. דוגמה: 08.019.0720",
+                      title=u"קוד לא תקין")
+            continue
+        _alt = catalog.get(_code_in, {})
+        if _alt.get(u"price") is not None:
+            _comm_catalog_code = _code_in
+            _comm_info  = _alt
+            _comm_price = _alt.get(u"price")
+            _comm_title = (_alt.get(u"title") or u"")[:60]
+            print(u"תקשורת: קוד חלופי נבחר — {}".format(_code_in))
+            break
+        else:
+            _retry = _pf.alert(
+                u"גם הקוד {} לא נמצא בקטלוג שנטען.".format(_code_in),
+                title=u"קוד לא נמצא",
+                options=[u"נסי שוב", u"ביטול"]
+            )
+            if _retry != u"נסי שוב":
+                break
+
+# fallback סופי אם עדיין אין מחיר (המשתמש ביטל או לא נמצא קוד תקף)
+if _comm_price is None:
+    _comm_price = COMM_PRICE
+    _comm_title = _comm_title or COMM_DESC
+
+if include_comm:
+    _src = u"מהקטלוג" if _comm_info.get(u"price") is not None else u"גיבוי"
+    print(u"תקשורת: {} טיפוסים מוגדרים, יכללו בטבלה (קוד: {}, מחיר {} — {})".format(
+        len(comm_count_by_type), _comm_catalog_code,
+        format_price(_comm_price) if _comm_price else u"—", _src))
+elif _comm_types:
+    print(u"תקשורת: לא נכלל בטבלת הכמויות")
+
+# ──────────────────────────────────────────────────────────────────────────────
+# UPDATE — שקעים/אביזרים חשמליים (OST_ElectricalFixtures)
+# Slot 1+2: match_fix() — קוד ראשי + נקודת חשמל
+# Slot 3:   נקודת תקשורת (רק לטיפוסי with Comm שסומנו include_comm)
+# פתחים (IGNORE_FIXTURE_KEYWORDS) מדולגים בשקט ומנוקים משדות דקל קיימים.
+# ──────────────────────────────────────────────────────────────────────────────
+fix_ok = fix_sk = fix_fl = 0
+fix_ignored = 0
+fix_skipped = []
+fix_failed  = []
+
+t_fix = Transaction(doc, u"Dekel Power - Update Electrical Fixtures")
+t_fix.Start()
+for elem in fixtures:
+    eid = str(elem.Id.IntegerValue)
+    fam, typ = get_ft(elem)
+    # התעלמות מטיפוסים שלא נכללים בכתב הכמויות (פתחים וכו') —
+    # מנקים אקטיבית את שדות הדקל כדי למחוק ערכים שנתקעו מהרצות קודמות,
+    # כך שהאלמנט ייעלם מהטבלה (המסננת לפי PARAM_CODE שאינו ריק).
+    _name_l = (u"{} {}".format(fam, typ)).lower()
+    if any(_kw in _name_l for _kw in IGNORE_FIXTURE_KEYWORDS):
+        for _p in (PARAM_CODE, PARAM_DESC, PARAM_PRICE,
+                   PARAM_CODE2, PARAM_DESC2, PARAM_PRICE2, PARAM_TOTAL,
+                   PARAM_CODE3, PARAM_DESC3, PARAM_PRICE3, PARAM_QTY3):
+            setp(elem, _p, u"")
+        fix_ignored += 1
+        continue
+    try:
+        c1, t1, p1, c2, t2, p2 = match_fix(elem)
+        if not c1 and not c2:
+            fix_sk += 1
+            fix_skipped.append((eid, u"{} / {}".format(fam, typ), u"לא נמצא מיפוי"))
+            continue
+
+        ok1 = setp(elem, PARAM_CODE,  c1 or u"")
+        setp(elem, PARAM_DESC,  t1 or u"")
+        setp(elem, PARAM_PRICE, format_price(p1) if p1 else u"")
+
+        # For comm types: auto-fill Slot 2 with electrical point if not already set
+        if u"comm" in typ.lower() and not c2:
+            c2 = u"08.019.0310"
+            t2 = u"נקודה 2.5mm²"
+            p2 = catalog.get(c2, {}).get(u"price")
+
+        setp(elem, PARAM_CODE2,  c2 or u"")
+        setp(elem, PARAM_DESC2,  t2 or u"")
+        setp(elem, PARAM_PRICE2, format_price(p2) if p2 else u"")
+
+        total_fix = (p1 or 0.0) + (p2 or 0.0)
+
+        # Slot 3: comm points
+        if include_comm and typ in comm_count_by_type:
+            _cn  = comm_count_by_type[typ]
+            _cpt = (_comm_price * _cn) if _comm_price is not None else None
+            setp(elem, PARAM_CODE3,  _comm_catalog_code)
+            setp(elem, PARAM_DESC3,  _comm_title)
+            setp(elem, PARAM_PRICE3, format_price(_cpt) if _cpt else u"")
+            setp(elem, PARAM_QTY3,   u"{}".format(_cn))
+            if _cpt:
+                total_fix += _cpt
+        elif u"comm" in typ.lower():
+            setp(elem, PARAM_CODE3,  u"")
+            setp(elem, PARAM_DESC3,  u"")
+            setp(elem, PARAM_PRICE3, u"")
+            setp(elem, PARAM_QTY3,   u"")
+
+        setp(elem, PARAM_TOTAL, format_price(total_fix) if total_fix else u"")
+
+        if ok1:
+            fix_ok += 1
+        else:
+            fix_fl += 1
+            fix_failed.append((eid, u"{} / {}".format(fam, typ), u"כשל כתיבה"))
+    except Exception as e:
+        fix_fl += 1
+        fix_failed.append((eid, u"{} / {}".format(fam, typ), u"{}".format(e)))
+t_fix.Commit()
+print(u"שקעים/אביזרים: {}✓  {}⚠  {}✗".format(fix_ok, fix_sk, fix_fl))
+if fix_ignored:
+    print(u"התעלמנו: {} פתחים/אלמנטים שלא נכללים בכתב הכמויות".format(fix_ignored))
+
+# ──────────────────────────────────────────────────────────────────────────────
 # SCHEDULES
 # Creates: Dekel_Generators, Dekel_Transformers
 # Does NOT create: Dekel_ElectricalEquipment (removed per requirement 4)
@@ -692,14 +928,17 @@ print(u"שנאים יבשים: {}\u2713  {}\u26a0  {}\u2717".format(tr_ok, tr_sk
 # ──────────────────────────────────────────────────────────────────────────────
 from Autodesk.Revit.DB import ViewSchedule, ScheduleFilter, ScheduleFilterType
 
-SCHED_NAME_GEN   = u"Dekel_Generators"
-SCHED_NAME_TRANS = u"Dekel_Transformers"
+SCHED_NAME_GEN    = u"Dekel_Generators"
+SCHED_NAME_TRANS  = u"Dekel_Transformers"
+SCHED_NAME_FIX    = u"Dekel_Fixtures"
+SCHED_NAME_POINTS = u"Dekel_Points"
 
 # Legacy names to remove if present
 LEGACY_SCHEDS = [
     u"Dekel_ElectricalEquipment",
     u"Dekel_DryTransformers",
     u"Dekel_OilTransformers",
+    u"Dekel_ElectricalFixtures",
 ]
 
 
@@ -725,6 +964,76 @@ def _finalize_sched(sd, price_param_names):
     # "Display of a grand total row is not enabled" when accessing grand total
     # properties. Do not enable ShowGrandTotal or touch any grand total APIs.
     pass
+
+
+def create_fixtures_schedule():
+    """Dekel_Fixtures schedule — all processed electrical fixtures."""
+    _delete_schedule(SCHED_NAME_FIX)
+    cat_id = doc.Settings.Categories.get_Item(BuiltInCategory.OST_ElectricalFixtures).Id
+    sched  = ViewSchedule.CreateSchedule(doc, cat_id)
+    sched.Name = SCHED_NAME_FIX
+    sd = sched.Definition
+    sd.IsItemized = True
+
+    for col in [u"Family and Type", u"Level",
+                PARAM_CODE, PARAM_DESC, PARAM_PRICE,
+                PARAM_TOTAL]:
+        _add_field(sd, col)
+
+    try:
+        for i in range(sd.GetFieldCount()):
+            f = sd.GetField(i)
+            if f.GetName() == PARAM_CODE:
+                sd.AddFilter(ScheduleFilter(f.FieldId, ScheduleFilterType.IsNotEmpty))
+                break
+    except Exception: pass
+
+    _finalize_sched(sd, {PARAM_PRICE, PARAM_TOTAL})
+    print(u"טבלה נוצרה: {}".format(SCHED_NAME_FIX))
+    return sched
+
+
+def create_points_schedule():
+    """Dekel_Points — electrical and comm connection points only.
+    Columns: Family/Type | Level | elec-point code/desc/price | comm code/desc/count/price.
+    Filter: PARAM_CODE2 is not empty (element has an electrical connection point).
+    Sorted by PARAM_CODE2 so identical point types group together visually.
+    Only created and opened when fix_ok > 0 (electrical points were actually written).
+    """
+    _delete_schedule(SCHED_NAME_POINTS)
+    cat_id = doc.Settings.Categories.get_Item(BuiltInCategory.OST_ElectricalFixtures).Id
+    sched = ViewSchedule.CreateSchedule(doc, cat_id)
+    sched.Name = SCHED_NAME_POINTS
+    sd = sched.Definition
+    sd.IsItemized = True
+
+    for col in [u"Family and Type", u"Level",
+                PARAM_CODE2, PARAM_DESC2, PARAM_PRICE2,
+                PARAM_CODE3, PARAM_DESC3, PARAM_PRICE3, PARAM_QTY3]:
+        _add_field(sd, col)
+
+    # Filter: only rows with an electrical connection point (Slot 2 not empty)
+    try:
+        for i in range(sd.GetFieldCount()):
+            f = sd.GetField(i)
+            if f.GetName() == PARAM_CODE2:
+                sd.AddFilter(ScheduleFilter(f.FieldId, ScheduleFilterType.IsNotEmpty))
+                break
+    except Exception: pass
+
+    # Sort by PARAM_CODE2 so same point codes group visually
+    try:
+        from Autodesk.Revit.DB import ScheduleSortGroupField, ScheduleSortOrder
+        for i in range(sd.GetFieldCount()):
+            f = sd.GetField(i)
+            if f.GetName() == PARAM_CODE2:
+                sd.AddSortGroupField(ScheduleSortGroupField(f.FieldId, ScheduleSortOrder.Ascending))
+                break
+    except Exception: pass
+
+    _finalize_sched(sd, {PARAM_PRICE2, PARAM_PRICE3})
+    print(u"טבלה נוצרה: {}".format(SCHED_NAME_POINTS))
+    return sched
 
 
 def create_generator_schedule():
@@ -807,6 +1116,8 @@ def create_transformer_schedule():
     print(u"טבלה נוצרה: {}".format(SCHED_NAME_TRANS))
 
 
+fix_sched = None
+points_sched = None
 try:
     t_sched = Transaction(doc, u"Dekel Power - Create Schedules")
     t_sched.Start()
@@ -815,6 +1126,10 @@ try:
         _delete_schedule(_ls)
     create_generator_schedule()
     create_transformer_schedule()
+    fix_sched = create_fixtures_schedule()
+    # Dekel_Points — only when electrical points were actually written
+    if fix_ok > 0:
+        points_sched = create_points_schedule()
     t_sched.Commit()
 except Exception as e:
     try: t_sched.RollBack()
@@ -896,8 +1211,8 @@ def show_details():
     lh2.BackColor = BG2; lh2.Location = Point(18,12); lh2.Size = Size(400,24)
     hdr2.Controls.Add(lh2)
     sep_line(frm2, 51, 680, 0)
-    _all_sk = skipped_details + tr_skipped
-    _all_fl = failed_details  + tr_failed
+    _all_sk = skipped_details + tr_skipped + fix_skipped
+    _all_fl = failed_details  + tr_failed  + fix_failed
     lbl2 = Label(); lbl2.Text = u"\u05d3\u05d5\u05dc\u05d2\u05d5: {}  |  \u05e0\u05db\u05e9\u05dc\u05d5: {}".format(
         len(_all_sk), len(_all_fl))
     lbl2.Font = Font(u"Segoe UI",12,FontStyle.Bold); lbl2.ForeColor = TDK
@@ -932,15 +1247,15 @@ def show_details():
     frm2.ShowDialog()
 
 
-_any_issues   = any([skipped_details, failed_details, tr_skipped, tr_failed])
-total_issues  = eq_sk + eq_fl + tr_sk + tr_fl
+_any_issues   = any([skipped_details, failed_details, tr_skipped, tr_failed, fix_skipped, fix_failed])
+total_issues  = eq_sk + eq_fl + tr_sk + tr_fl + fix_sk + fix_fl
 
 frm = Form(); frm.Text = u"Dekel Power Tool \u2014 \u05e1\u05d9\u05db\u05d5\u05dd"
 frm.RightToLeft = WinRTL.Yes; frm.RightToLeftLayout = True
 frm.StartPosition = FormStartPosition.CenterScreen
 frm.FormBorderStyle = FormBorderStyle.FixedSingle
 frm.MaximizeBox = False; frm.MinimizeBox = False
-frm.ClientSize = Size(490, 420); frm.BackColor = BG
+frm.ClientSize = Size(490, 600); frm.BackColor = BG
 stripe(frm, 490)
 hdr = Panel(); hdr.Location = Point(0,3); hdr.Size = Size(490,48); hdr.BackColor = BG2
 frm.Controls.Add(hdr)
@@ -985,30 +1300,53 @@ badge(frm, 22+304, 238, tr_fl, u"\u05e0\u05db\u05e9\u05dc\u05d5",
 
 sep_line(frm, 308)
 
+lfix = Label()
+lfix.Text = u"שקעים ונקודות במודל: {}".format(len(fixtures))
+lfix.Font = Font(u"Segoe UI",9); lfix.ForeColor = TLT
+lfix.Location = Point(22,316); lfix.Size = Size(446,18); frm.Controls.Add(lfix)
+badge(frm, 22,     334, fix_ok, u"שקעים עודכנו", CSUC, CSUCBG)
+badge(frm, 22+152, 334, fix_sk, u"דולגו",
+      CWRN if fix_sk else TLT, CWRNBG if fix_sk else BG2)
+badge(frm, 22+304, 334, fix_fl, u"נכשלו",
+      CERR if fix_fl else TLT, CERRBG if fix_fl else BG2)
+
+lcomm = Label()
+if comm_count_by_type:
+    lcomm.Text = u"נקודות תקשורת: {} טיפוסים מוגדרים{}".format(
+        len(comm_count_by_type),
+        u" — נכללו בטבלה" if include_comm else u" — לא נכללו")
+else:
+    lcomm.Text = u"נקודות תקשורת: לא נמצאו במודל"
+lcomm.Font = Font(u"Segoe UI",9)
+lcomm.ForeColor = CSUC if (comm_count_by_type and include_comm) else TLT
+lcomm.Location = Point(22,382); lcomm.Size = Size(446,18); frm.Controls.Add(lcomm)
+
+sep_line(frm, 408)
+
 lbq = Label()
-lbq.Text = (u"\u05de\u05d1\u05d8 '\u05d4\u05e0\u05d7\u05d9\u05d5\u05ea \u05db\u05ea\u05d1 \u05db\u05de\u05d5\u05d9\u05d5\u05ea' \u2014 \u2713 \u05e0\u05d5\u05e6\u05e8"
+lbq.Text = (u"מבט 'הנחיות כתב כמויות' — ✓ נוצר"
             if bq_view is not None else
-            u"\u05de\u05d1\u05d8 '\u05d4\u05e0\u05d7\u05d9\u05d5\u05ea \u05db\u05ea\u05d1 \u05db\u05de\u05d5\u05d9\u05d5\u05ea' \u2014 \u05e9\u05d2\u05d9\u05d0\u05d4")
+            u"מבט 'הנחיות כתב כמויות' — שגיאה")
 lbq.Font = Font(u"Segoe UI",9)
 lbq.ForeColor = CSUC if bq_view is not None else CERR
-lbq.Location = Point(22,316); lbq.Size = Size(446,18); frm.Controls.Add(lbq)
+lbq.Location = Point(22,416); lbq.Size = Size(446,18); frm.Controls.Add(lbq)
 
-sep_line(frm, 340)
+sep_line(frm, 438)
 
 if _any_issues:
-    bd = mkbtn(u"\u05d4\u05e6\u05d2 \u05e4\u05e8\u05d8\u05d9\u05dd ({})".format(total_issues),
-               22, 354, 210, 40, pri=True)
+    bd = mkbtn(u"הצג פרטים ({})".format(total_issues),
+               22, 452, 210, 40, pri=True)
     def on_d(s, e):
         show_details()
         if _zoom[0]: frm.Close()
     bd.Click += on_d; frm.Controls.Add(bd)
 
-bc_close = mkbtn(u"\u05e1\u05d2\u05d5\u05e8", 320, 354, 148, 40)
+bc_close = mkbtn(u"סגור", 320, 452, 148, 40)
 bc_close.Click += lambda s, e: frm.Close(); frm.Controls.Add(bc_close)
 
 lver = Label(); lver.Text = u"Yamit Bettman  |  EasyBIM  |  v4.0"
 lver.Font = Font(u"Segoe UI",8); lver.ForeColor = TLT
-lver.Location = Point(22,390); lver.Size = Size(446,16); frm.Controls.Add(lver)
+lver.Location = Point(22,500); lver.Size = Size(446,16); frm.Controls.Add(lver)
 frm.ShowDialog()
 
 # פתח מבט הנחיות אחרי סגירת הדיאלוג
@@ -1016,6 +1354,15 @@ if bq_view is not None:
     try: uidoc.ActiveView = bq_view
     except Exception: pass
 
+# פתח טבלת שקעים/אביזרים
+if fix_sched is not None:
+    try: uidoc.ActiveView = fix_sched
+    except Exception: pass
+
+# פתח טבלת נקודות חשמל ותקשורת (נפתחת אחרונה — תהיה הטאב הפעיל)
+if points_sched is not None:
+    try: uidoc.ActiveView = points_sched
+    except Exception: pass
 if _zoom[0]:
     try:
         eid = ElementId(int(_zoom[0]))
