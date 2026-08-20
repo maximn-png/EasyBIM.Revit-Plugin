@@ -69,13 +69,163 @@ DESCRIPTION_MAP = {
     u"פלסטיק":      (u"08.023.0280", u"x1.304"),
     u"אלומניום":    (None,           u"BUSBAR"),
     u"אלומיניום":   (None,           u"BUSBAR"),
-    u"חסין אש":     (None,           u"לא נמדד"),
+    # אין בדקל סעיף לתעלה חסינת אש. הקוד הבסיסי (08.023.0040, ברירת מחדל
+    # כשאין Width/Height בפועל) נבחר בהתאם למידות התעלה מטבלת sheet_plain
+    # (ראה TRAY_CATALOG/DESCRIPTION_CATALOG_KEY למעלה), כפול מקדם
+    # אקסטרפולציה — ראה FIRE_RESISTANT_FACTOR למטה.
+    u"חסין אש":     (u"08.023.0040", u"x3.0 (אמדן)"),
 }
 # דפוס Description של פס צבירה עם אמפר, למשל: '1000A - פ"צ'
 BUSBAR_DESC_PATTERN = re.compile(r"^(\d+)\s*A?\s*[-–]\s*פ", re.UNICODE)
 PLASTIC_FACTOR = 1.304
 
+# מקדם אקסטרפולציה למחיר תעלה חסינת אש (לא קיים סעיף מקביל בדקל).
+# מבוסס על היחס העקבי (~2.95x) בדקל עצמו בין תעלת רשת ברזל לתעלת רשת
+# פלב"מ (נירוסטה) באותם רוחבים — 08.023.0100/0170, 0110/0172, 0120/0174,
+# 0130/0176 — כפרוקסי ליחס מחיר "חומר/עיטוף משודרג" מול תעלה בסיסית.
+# תואם גם לטווח כללי (150%-300% תוספת) של מיגון אש פסיבי לתעלות כבלים.
+# *** זהו אמדן בלבד — יש לאמת מול הצעת מחיר ממתקין מיגון אש בפועל. ***
+FIRE_RESISTANT_FACTOR = 3.0
+FIRE_RESISTANT_CODE   = u"אמדן-חסין אש"
+FIRE_RESISTANT_DESC   = (
+    u"תעלת כבלים חסינת אש — מחיר משוער (אקסטרפולציה x{:.1f} על בסיס "
+    u"תעלת פח דקל במידת התעלה בפועל), אינו סעיף דקל רשמי — טרם אומת מול ספק מיגון אש"
+).format(FIRE_RESISTANT_FACTOR)
+
 # BUSBAR_MAP ייבנה דינמית מתוך קובץ האקסל — ראה build_busbar_map
+
+# ============================================================================
+# התאמה לפי מידות (Width/Height בפועל של כל תעלה) — לא רק לפי חומר
+# ============================================================================
+# כל שורה: (רוחב מ"מ, עומק/גובה מ"מ, קוד דקל). נבנה פעם אחת מסריקת פרקי
+# 08.023 (תעלות) ו-08.024 (סולמות) בקובץ דקל, ומכוסה בו — הקודים עצמם
+# (מספור הסעיפים) יציבים בין גרסאות מחירון; המחירים בפועל מגיעים מ-dekel_data
+# בזמן ריצה, לא מכאן. כשלרוחב/עומק נתון יש כמה עוביים באקסל, נבחר עובי 1 מ"מ
+# (תואם לברירת המחדל הקודמת); אחרת העובי היחיד הקיים לאותו רוחב/עומק.
+TRAY_CATALOG = {
+    u"sheet_plain": [
+        (60,  40,  u"08.023.0010"),
+        (60,  60,  u"08.023.0012"),
+        (100, 60,  u"08.023.0015"),
+        (100, 100, u"08.023.0020"),
+        (120, 60,  u"08.023.0025"),
+        (200, 100, u"08.023.0030"),
+        (300, 100, u"08.023.0040"),
+        (400, 100, u"08.023.0050"),
+        (500, 100, u"08.023.0054"),
+        (600, 100, u"08.023.0056"),
+    ],
+    u"sheet_perforated": [
+        (100, 60,  u"08.023.0600"),
+        (100, 85,  u"08.023.0635"),
+        (100, 100, u"08.023.0655"),
+        (100, 110, u"08.023.1120"),
+        (200, 60,  u"08.023.0610"),
+        (200, 85,  u"08.023.0638"),
+        (200, 100, u"08.023.0660"),
+        (200, 110, u"08.023.1130"),
+        (300, 60,  u"08.023.0615"),
+        (300, 85,  u"08.023.0640"),
+        (300, 100, u"08.023.0665"),
+        (300, 110, u"08.023.1140"),
+        (400, 60,  u"08.023.0620"),
+        (400, 85,  u"08.023.0642"),
+        (400, 100, u"08.023.0670"),
+        (400, 110, u"08.023.1150"),
+        (500, 60,  u"08.023.0625"),
+        (500, 85,  u"08.023.0644"),
+        (500, 100, u"08.023.0675"),
+        (500, 110, u"08.023.1160"),
+        (600, 60,  u"08.023.0630"),
+        (600, 85,  u"08.023.0646"),
+        (600, 100, u"08.023.0680"),
+        (600, 110, u"08.023.1170"),
+    ],
+    u"mesh_steel": [
+        (100, 85, u"08.023.0100"),
+        (200, 85, u"08.023.0110"),
+        (300, 85, u"08.023.0120"),
+        (400, 85, u"08.023.0130"),
+        (500, 85, u"08.023.0140"),
+        (600, 85, u"08.023.0150"),
+    ],
+    u"plastic": [
+        (15,  15,  u"08.023.0190"),
+        (17,  17,  u"08.023.0200"),
+        (25,  60,  u"08.023.0220"),
+        (30,  17,  u"08.023.0202"),
+        (30,  25,  u"08.023.0205"),
+        (40,  25,  u"08.023.0210"),
+        (40,  42,  u"08.023.0215"),
+        (42,  60,  u"08.023.0230"),
+        (60,  60,  u"08.023.0240"),
+        (60,  70,  u"08.023.0250"),
+        (100, 60,  u"08.023.0265"),
+        (120, 60,  u"08.023.0270"),
+        (200, 100, u"08.023.0280"),
+    ],
+    u"ladder_steel": [
+        (100, 60,  u"08.024.0008"),
+        (100, 70,  u"08.024.0040"),
+        (200, 60,  u"08.024.0010"),
+        (200, 70,  u"08.024.0050"),
+        (200, 100, u"08.024.0100"),
+        (300, 60,  u"08.024.0013"),
+        (300, 70,  u"08.024.0060"),
+        (300, 100, u"08.024.0110"),
+        (400, 60,  u"08.024.0016"),
+        (400, 70,  u"08.024.0070"),
+        (400, 100, u"08.024.0120"),
+        (500, 60,  u"08.024.0020"),
+        (500, 70,  u"08.024.0080"),
+        (500, 100, u"08.024.0125"),
+        (600, 60,  u"08.024.0030"),
+        (600, 70,  u"08.024.0090"),
+        (600, 100, u"08.024.0130"),
+    ],
+}
+
+# Description → מפתח בטבלה. "חסין אש" משתמש בטבלת הפח הרגיל (התעלה מתחת
+# למיגון האש היא תעלת פח), עם מקדם ה-אקסטרפולציה שמופעל בנפרד למטה.
+DESCRIPTION_CATALOG_KEY = {
+    u"פח":       u"sheet_plain",
+    u"פח מחורץ": u"sheet_perforated",
+    u"רשת":      u"mesh_steel",
+    u"סולם":     u"ladder_steel",
+    u"פלסטיק":   u"plastic",
+    u"חסין אש":  u"sheet_plain",
+}
+
+_DIM_TOLERANCE_MM = 2.0
+
+def get_mm_param(elem, name):
+    """קריאת פרמטר מידה (Width/Height) בפועל והמרה ממ' רגל למ"מ."""
+    p = elem.LookupParameter(name)
+    if not p:
+        return None
+    try:
+        v = p.AsDouble()
+    except Exception:
+        return None
+    if v is None:
+        return None
+    return v * 304.8
+
+def pick_code_by_dimensions(catalog_key, width_mm, depth_mm):
+    """מוצא בטבלה את הקוד הקרוב ביותר לרוחב/עומק בפועל.
+    מחזיר (code, is_exact) — is_exact=False כשנבחרה המידה הקרובה ביותר
+    ולא התאמה מדויקת (למ"מ) לרוחב ולעומק גם יחד."""
+    rows = TRAY_CATALOG.get(catalog_key)
+    if not rows or width_mm is None:
+        return None, False
+    if depth_mm is None:
+        best = min(rows, key=lambda r: abs(r[0] - width_mm))
+        exact = abs(best[0] - width_mm) <= _DIM_TOLERANCE_MM
+    else:
+        best = min(rows, key=lambda r: (abs(r[0] - width_mm), abs(r[1] - depth_mm)))
+        exact = (abs(best[0] - width_mm) <= _DIM_TOLERANCE_MM
+                  and abs(best[1] - depth_mm) <= _DIM_TOLERANCE_MM)
+    return best[2], exact
 
 PARAM_CODE  = u"מספר סעיף דקל"
 PARAM_DESC  = u"תיאור סעיף דקל"
@@ -473,6 +623,9 @@ if not BUSBAR_MAP:
 # ============================================================================
 # 3. עדכון תעלות
 # ============================================================================
+print(u"  [!] מחיר תעלות 'חסין אש' הוא אמדן (x{:.1f} על בסיס תעלת פח) — "
+      u"אין סעיף מקביל בדקל. יש לאמת מול ספק מיגון אש.".format(FIRE_RESISTANT_FACTOR))
+
 trays = list(
     FilteredElementCollector(doc)
     .OfCategory(BuiltInCategory.OST_CableTray)
@@ -486,6 +639,7 @@ if not trays:
     import sys; sys.exit()
 
 updated = skipped = failed = 0
+dim_exact_count = dim_approx_count = dim_fallback_count = 0
 grand_total = 0.0
 skipped_details = []   # [(element_id, description, reason), ...]
 failed_details  = []   # [(element_id, description, reason), ...]
@@ -524,6 +678,21 @@ for tray in trays:
 
         code, note = mapping
         addon_code = None
+
+        # --- התאמה לפי מידות בפועל (Width/Height), במקום קוד קבוע לפי חומר ---
+        catalog_key = DESCRIPTION_CATALOG_KEY.get(desc)
+        if catalog_key:
+            width_mm = get_mm_param(tray, "Width")
+            depth_mm = get_mm_param(tray, "Height")
+            dim_code, dim_exact = pick_code_by_dimensions(catalog_key, width_mm, depth_mm)
+            if dim_code:
+                code = dim_code
+                if dim_exact:
+                    dim_exact_count += 1
+                else:
+                    dim_approx_count += 1
+            else:
+                dim_fallback_count += 1
 
         # --- פסי צבירה: חלץ אמפר מ-MARK או מ-Description ---
         if note in (u"BUSBAR", u"BUSBAR_FROM_DESC"):
@@ -572,6 +741,11 @@ for tray in trays:
         title = dekel_data[code]["title"]
         if desc == u"פלסטיק" and price:
             price = round(float(price) * PLASTIC_FACTOR, 2)
+        elif desc == u"חסין אש" and price:
+            # אין סעיף דקל לתעלה חסינת אש — מחיר משוער, ראה FIRE_RESISTANT_FACTOR
+            price = round(float(price) * FIRE_RESISTANT_FACTOR, 2)
+            code  = FIRE_RESISTANT_CODE
+            title = FIRE_RESISTANT_DESC
 
         # מחיר תוספת (פסי צבירה בלבד)
         addon_price = 0.0
@@ -653,6 +827,10 @@ for tray in trays:
         failed_details.append((str(tray.Id.IntegerValue), u"---", u"שגיאה: {}".format(e)))
 
 t.Commit()
+
+print(u"התאמה לפי מידות: {} מדויקות, {} מקורבות (מידה קרובה ביותר בדקל), "
+      u"{} ללא Width/Height בפועל (ברירת מחדל)".format(
+          dim_exact_count, dim_approx_count, dim_fallback_count))
 
 # ============================================================================
 # 3b. עדכון Fittings של פסי צבירה (ברכים אופקיות / אנכיות)
@@ -1287,8 +1465,32 @@ except Exception as e:
     except Exception: pass
     print(u"שגיאה ביצירת טבלאות: {}".format(e))
 
+# ──────────────────────────────────────────────────────────────────────────────
+# DRAFTING VIEW — הנחיות כתב כמויות (מבט משותף לכל כלי הדקל, ראה
+# lib/easybim/dekel_bq_notes.py — כל כלי בונה מחדש את אותו מבט מאותה רשימת
+# הערות, כדי שההרצה של כלי אחד לא תמחק את ההנחיות של כלי אחר)
+# ──────────────────────────────────────────────────────────────────────────────
+from easybim.dekel_bq_notes import create_bq_drafting_view, BQ_VIEW_NAME
+
+bq_view = None
+try:
+    t_bq = Transaction(doc, u"Dekel Cable Trays - BQ Notes View")
+    t_bq.Start()
+    bq_view = create_bq_drafting_view(doc)
+    t_bq.Commit()
+    print(u"מבט הנחיות נוצר: {}".format(BQ_VIEW_NAME))
+except Exception as e:
+    try: t_bq.RollBack()
+    except Exception: pass
+    print(u"[!] שגיאה ביצירת מבט הנחיות: {}".format(e))
+
 show_summary_dialog(len(trays) + len(fittings), updated, skipped, failed,
                     skipped_details, failed_details, grand_total)
+
+# פתח מבט הנחיות אחרי סגירת הדיאלוג
+if bq_view is not None:
+    try: uidoc.ActiveView = bq_view
+    except Exception: pass
 
 # ============================================================================
 # 6. הצגת אלמנט במודל — אם המשתמש בחר שורה מהטבלה
