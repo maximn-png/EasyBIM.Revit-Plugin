@@ -407,24 +407,18 @@ def read_xlsx(path, catalog):
 
 # ──────────────────────────────────────────────────────────────────────────────
 # FILE SELECTION — multi-select OpenFileDialog
-#    אם הכפתור המאוחד (Run All) כבר בחר קבצים — נשתמש בהם ולא נפתח דיאלוג.
 # ──────────────────────────────────────────────────────────────────────────────
-_preselected = os.environ.get("DEKEL_XLSX_PATHS", "")
-if _preselected:
-    selected_paths = [p for p in _preselected.split(";") if p]
-    print(u"קבצים (מ-Run All): {}".format(len(selected_paths)))
-else:
-    dlg = OpenFileDialog()
-    dlg.Title       = u"בחר קבצי טבלאות דקל (ניתן לבחור מספר קבצים)"
-    dlg.Filter      = "Excel Files (*.xlsx)|*.xlsx"
-    dlg.Multiselect = True
+dlg = OpenFileDialog()
+dlg.Title       = u"בחר קבצי טבלאות דקל (ניתן לבחור מספר קבצים)"
+dlg.Filter      = "Excel Files (*.xlsx)|*.xlsx"
+dlg.Multiselect = True
 
-    if dlg.ShowDialog() != DialogResult.OK or not dlg.FileNames:
-        TaskDialog.Show("Dekel", u"לא נבחר קובץ.")
-        import sys; sys.exit()
+if dlg.ShowDialog() != DialogResult.OK or not dlg.FileNames:
+    TaskDialog.Show("Dekel", u"לא נבחר קובץ.")
+    import sys; sys.exit()
 
-    selected_paths = list(dlg.FileNames)
-    print(u"קבצים שנבחרו: {}".format(len(selected_paths)))
+selected_paths = list(dlg.FileNames)
+print(u"קבצים שנבחרו: {}".format(len(selected_paths)))
 
 catalog = {}
 for path in selected_paths:
