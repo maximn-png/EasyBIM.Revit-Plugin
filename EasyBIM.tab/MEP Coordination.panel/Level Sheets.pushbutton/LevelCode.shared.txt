@@ -1,0 +1,8 @@
+# This is a Revit shared parameter file.
+# Do not edit manually.
+*META	VERSION	MINVERSION
+META	2	1
+*GROUP	ID	NAME
+GROUP	1	EasyBIM_Coordination
+*PARAM	GUID	NAME	DATATYPE	DATACATEGORY	GROUP	VISIBLE	DESCRIPTION	USERMODIFIABLE	HIDEWHENNOVALUE
+PARAM	3f7a1c58-2d94-4e63-b0a7-8c15e9d24b31	EB_Level_Code	TEXT		1	1	EasyBIM standard level code (B01/GF00/F01/RT). Written by the Level Sheets tool and reused on later runs; drives all view and sheet naming so a level's Revit name never reaches the output.	1	0

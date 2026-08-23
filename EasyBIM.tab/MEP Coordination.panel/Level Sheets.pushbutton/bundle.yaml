@@ -1,0 +1,11 @@
+title: |-
+  Level
+  Sheets
+tooltip: >-
+  Batch-create a floor plan, ceiling plan and sheet for every selected level —
+  applies the EB_MEP_FP / EB_MEP_CP templates, renames both views to the EasyBIM
+  standard, and overlays the ceiling plan directly on the floor plan on one
+  sheet per level: model-aligned so grids coincide, RCP drawn in front.
+author: EasyBIM
+highlight: new
+min_revit_ver: 2023
