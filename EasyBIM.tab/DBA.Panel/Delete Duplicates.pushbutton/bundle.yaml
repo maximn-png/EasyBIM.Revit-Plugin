@@ -1,0 +1,4 @@
+title: "Delete\nDuplicates"
+tooltip: Find and delete elements Revit flags as "identical instances in the same place". Choose Current Selection, Active View, or Entire Model.
+author: EasyBIM Team
+min_revit_ver: 2023
