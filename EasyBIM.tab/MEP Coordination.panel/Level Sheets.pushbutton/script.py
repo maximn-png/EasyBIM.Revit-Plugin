@@ -75,6 +75,12 @@ SHEET_SUFFIX = u"-MEP"
 FP_VIEWPORT_TYPE = u"Scale"
 CP_VIEWPORT_TYPE = u"None"
 
+# Sheet classification field, already bound to sheets in the project (title
+# block / project parameter, not created by this tool). Fixed literal value
+# for every sheet Level Sheets creates.
+VIEW_ID_PARAM = u"View ID"
+VIEW_ID_VALUE = u"04_MEP"
+
 SHARED_PARAM_FILE = os.path.join(os.path.dirname(__file__),
                                  u"LevelCode.shared.txt")
 SHARED_PARAM_GROUP_NAME = u"EasyBIM_Coordination"
@@ -1049,6 +1055,15 @@ def _build_sheet(level, code, number, title_block, fp, cp, sheet_numbers,
     sheet = DB.ViewSheet.Create(doc, title_block.Id)
     sheet.SheetNumber = unique_sheet_number(_txt(number), sheet_numbers)
     sheet.Name = code + SHEET_SUFFIX
+
+    view_id_p = sheet.LookupParameter(VIEW_ID_PARAM)
+    if view_id_p is not None and not view_id_p.IsReadOnly:
+        view_id_p.Set(VIEW_ID_VALUE)
+        _diag(u"  sheet {} '{}': {} = '{}'".format(
+            sheet.SheetNumber, sheet.Name, VIEW_ID_PARAM, VIEW_ID_VALUE))
+    else:
+        warns.append(u"could not write {}".format(VIEW_ID_PARAM))
+
     doc.Regenerate()
 
     warns.extend(place_overlaid(
