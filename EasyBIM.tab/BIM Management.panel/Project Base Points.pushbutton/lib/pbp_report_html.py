@@ -50,11 +50,12 @@ def _esc(s):
     return (s or "").replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
 
 
-def _chart_groups(rows):
+def _chart_groups(rows, heb_override=None):
     # Grouped by HEBREW LABEL, not raw code -- HEB_OPTIONS is a small, fixed
     # taxonomy several discipline codes deliberately share (e.g. "ST"
     # Structural and "C" Geotechnical both read "קונסטרוקציה"), so grouping
     # by code produced two bars with identical-looking text.
+    heb_override = heb_override or {}
     groups = {}
     order = []
     codes_by_group = {}
@@ -62,7 +63,7 @@ def _chart_groups(rows):
         if r["kind"] == "HOST" or r["status"] == "Reference" or not r.get("included", True):
             continue
         code = r["disc"] or "?"
-        d = auto_heb(code)
+        d = heb_override.get(code) or auto_heb(code)
         if d not in groups:
             groups[d] = {"ok": 0, "notok": 0, "unshared": 0, "other": 0, "total": 0}
             order.append(d)
@@ -82,8 +83,8 @@ def _chart_groups(rows):
     return order, groups, codes_by_group
 
 
-def _chart_html(rows):
-    order, groups, codes_by_group = _chart_groups(rows)
+def _chart_html(rows, heb_override=None):
+    order, groups, codes_by_group = _chart_groups(rows, heb_override)
     if not order:
         return ""
     bars = []
@@ -251,7 +252,7 @@ function filterTable(){
 """
 
 
-def _build_html(host_info, rows, tol_mm, tol_deg, interactive, generated_label, show_chart=True):
+def _build_html(host_info, rows, tol_mm, tol_deg, interactive, generated_label, show_chart=True, heb_override=None):
     links = [r for r in rows if r["kind"] != "HOST"]
     ars = [r for r in links if r["status"] == "Reference"]
     unloaded = sum(1 for r in links if not r["placed"])
@@ -314,20 +315,20 @@ def _build_html(host_info, rows, tol_mm, tol_deg, interactive, generated_label, 
 </body></html>""".format(
         title=_esc(host_info["title"]), path=_esc(host_info.get("path", "")), gen=_esc(generated_label),
         tolmm=tol_mm, toldeg=tol_deg, units=_esc(host_info.get("units", "")), css=_CSS,
-        stats=stats, chart=_chart_html(rows) if show_chart else u"", ar_table=_ar_table_html(rows),
+        stats=stats, chart=_chart_html(rows, heb_override) if show_chart else u"", ar_table=_ar_table_html(rows),
         head=head_cells, filters=filter_row, rows=body_rows, script=script_tag, print_banner=print_banner,
     )
 
 
-def write_html(host_info, rows, tol_mm, tol_deg, generated_label, out_path, show_chart=True):
+def write_html(host_info, rows, tol_mm, tol_deg, generated_label, out_path, show_chart=True, heb_override=None):
     html = _build_html(host_info, rows, tol_mm, tol_deg, interactive=True, generated_label=generated_label,
-                        show_chart=show_chart)
+                        show_chart=show_chart, heb_override=heb_override)
     with codecs.open(out_path, "w", "utf-8") as f:
         f.write(html)
     return out_path
 
 
-def write_pdf(host_info, rows, tol_mm, tol_deg, generated_label, out_path, show_chart=True):
+def write_pdf(host_info, rows, tol_mm, tol_deg, generated_label, out_path, show_chart=True, heb_override=None):
     """Writes a print-ready static HTML file at `out_path` (a .html path —
     see module docstring on why this isn't a real .pdf) with an on-screen
     banner telling the user to pick Landscape in their own print dialog.
@@ -335,7 +336,7 @@ def write_pdf(host_info, rows, tol_mm, tol_deg, generated_label, out_path, show_
     rotated page in Chrome's print-to-PDF. The caller opens it and the user
     prints/saves as PDF from there."""
     html = _build_html(host_info, rows, tol_mm, tol_deg, interactive=False, generated_label=generated_label,
-                        show_chart=show_chart)
+                        show_chart=show_chart, heb_override=heb_override)
     with codecs.open(out_path, "w", "utf-8") as f:
         f.write(html)
     return out_path
