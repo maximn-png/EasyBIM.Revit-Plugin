@@ -69,6 +69,12 @@ FP_PREFIX    = u"CD_Floor Plan_"
 CP_PREFIX    = u"CD_Ceiling Plan_"
 SHEET_SUFFIX = u"-MEP"
 
+# Viewport types, by type name within the Viewport system family. The floor plan
+# carries the title with the scale; the ceiling plan sits on top of it, so a
+# second title would just print over the first.
+FP_VIEWPORT_TYPE = u"Scale"
+CP_VIEWPORT_TYPE = u"None"
+
 SHARED_PARAM_FILE = os.path.join(os.path.dirname(__file__),
                                  u"LevelCode.shared.txt")
 SHARED_PARAM_GROUP_NAME = u"EasyBIM_Coordination"
@@ -704,6 +710,36 @@ def resolve_scope_box(level_code, preferred_id=None):
     return None
 
 
+def _set_viewport_type(vp, type_name):
+    """Switch a viewport to the named Viewport type. Returns a status string.
+
+    Matched case-insensitively against the types Revit says are valid for this
+    viewport. Never raises: a missing type name is worth reporting, not worth
+    losing a sheet over, so the viewport keeps whatever type it was created with.
+    """
+    wanted = type_name.strip().lower()
+    found = {}
+    try:
+        for type_id in vp.GetValidTypes():
+            element_type = doc.GetElement(type_id)
+            if element_type is None:
+                continue
+            name = _elem_name(element_type)
+            if name and name != u"?":
+                found[name.strip().lower()] = type_id
+    except Exception as ex:
+        return u"could not list viewport types ({})".format(ex)
+
+    if wanted not in found:
+        return u"viewport type '{}' not in this project (available: {})".format(
+            type_name, u", ".join(sorted(found.keys())) or u"none")
+    try:
+        vp.ChangeTypeId(found[wanted])
+    except Exception as ex:
+        return u"could not apply viewport type '{}' ({})".format(type_name, ex)
+    return u"'{}'".format(type_name)
+
+
 def place_overlaid(sheet, cp_view, fp_view, level_code, preferred_box_id=None):
     """Crop both views to one padded rectangle, then overlay them centre-to-centre.
 
@@ -764,6 +800,18 @@ def place_overlaid(sheet, cp_view, fp_view, level_code, preferred_box_id=None):
     # 3) FP first (back), RCP last (front).
     vp_fp = DB.Viewport.Create(doc, sheet.Id, fp_view.Id, DB.XYZ.Zero)
     vp_cp = DB.Viewport.Create(doc, sheet.Id, cp_view.Id, DB.XYZ.Zero)
+
+    # 3b) Viewport types. Only the floor plan carries a title: the RCP sits
+    #     directly on top of it, so a second title would print over the first.
+    #     Set before anything measures the viewports, since a title line is part
+    #     of what Revit draws.
+    vp_type_status = {
+        u"FP ": _set_viewport_type(vp_fp, FP_VIEWPORT_TYPE),
+        u"RCP": _set_viewport_type(vp_cp, CP_VIEWPORT_TYPE),
+    }
+    for _tag, _status in sorted(vp_type_status.items()):
+        if not _status.startswith(u"'"):
+            warns.append(u"{} viewport type: {}".format(_tag.strip(), _status))
     doc.Regenerate()
 
     # 4) Centre both on one point, then check nothing overhangs the crop. If
@@ -917,6 +965,8 @@ def place_overlaid(sheet, cp_view, fp_view, level_code, preferred_box_id=None):
                 - (o_cp.MaximumPoint.X - o_cp.MinimumPoint.X),
                 (o_fp.MaximumPoint.Y - o_fp.MinimumPoint.Y)
                 - (o_cp.MaximumPoint.Y - o_cp.MinimumPoint.Y)))
+        _diag(u"    viewport types: FP {}  RCP {}".format(
+            vp_type_status.get(u"FP ", u"?"), vp_type_status.get(u"RCP", u"?")))
         _diag(u"    z-order: FP created first (back), RCP last (front)")
 
     return warns
