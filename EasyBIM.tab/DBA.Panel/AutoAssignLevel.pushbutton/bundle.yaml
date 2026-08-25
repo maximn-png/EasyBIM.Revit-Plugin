@@ -1,0 +1,4 @@
+title: "Auto Assign\nLevel"
+tooltip: Assign elements (selection, active view, or the whole model) to the correct floor/level without moving them. Shift-click to run instantly on the current selection.
+author: EasyBIM Team
+min_revit_ver: 2023
