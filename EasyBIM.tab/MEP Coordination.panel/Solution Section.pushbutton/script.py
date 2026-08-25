@@ -337,27 +337,6 @@ def _copy_options():
     return opts
 
 
-def _same_category(link_doc, src_id, new_id):
-    """Do the source element and a candidate copy share a category?
-
-    Used to check a positional pairing before trusting it. Cheap, and enough to
-    catch the case that matters: a dependent element (insulation, a nested
-    instance) sitting where a requested element's copy was expected.
-    """
-    try:
-        s = link_doc.GetElement(src_id)
-        n = doc.GetElement(new_id)
-        if s is None or n is None:
-            return False
-        sc = s.Category
-        nc = n.Category
-        if sc is None or nc is None:
-            return False
-        return sc.Id.IntegerValue == nc.Id.IntegerValue
-    except Exception:
-        return False
-
-
 def copy_elements_resilient(link_doc, src_ids, transform):
     """Copy src_ids into the host doc, surviving individual un-copyable elements.
 
@@ -627,21 +606,21 @@ def report_view_differences(existing_view, solution_view, link_instances):
 
     Read-only. Nothing here changes the model or either view.
     """
-    logger.warning(u"── Section comparison: '{}' vs '{}' ──".format(
+    logger.debug(u"── Section comparison: '{}' vs '{}' ──".format(
         existing_view.Name, solution_view.Name))
 
     for bip, label in VIEW_DIFF_PARAMS:
         a = _param_text(existing_view, bip)
         b = _param_text(solution_view, bip)
         if a != b:
-            logger.warning(u"  {}: existing = {} | solution = {}  <-- DIFFERS"
+            logger.debug(u"  {}: existing = {} | solution = {}  <-- DIFFERS"
                            .format(label, a, b))
         else:
-            logger.warning(u"  {}: {}".format(label, a))
+            logger.debug(u"  {}: {}".format(label, a))
 
     sa, sb = _filter_states(existing_view), _filter_states(solution_view)
     if sa is None or sb is None:
-        logger.warning(u"  View filters: could not be read")
+        logger.debug(u"  View filters: could not be read")
     else:
         diffs = []
         for nm in sorted(set(list(sa.keys()) + list(sb.keys()))):
@@ -649,25 +628,25 @@ def report_view_differences(existing_view, solution_view, link_instances):
             if va != vb:
                 diffs.append(u"{}: existing={} solution={}".format(nm, va, vb))
         if diffs:
-            logger.warning(u"  FILTER VISIBILITY DIFFERS on {} filter(s):"
+            logger.debug(u"  FILTER VISIBILITY DIFFERS on {} filter(s):"
                            .format(len(diffs)))
             for d in diffs:
-                logger.warning(u"      {}".format(d))
-            logger.warning(u"  ^^ These are the most likely cause: a filter "
+                logger.debug(u"      {}".format(d))
+            logger.debug(u"  ^^ These are the most likely cause: a filter "
                            u"switched off in one section and on in the other "
                            u"hides elements in one view only.")
         else:
-            logger.warning(u"  View filters: {} applied, visibility identical"
+            logger.debug(u"  View filters: {} applied, visibility identical"
                            .format(len(sa)))
 
     wa, wb = _hidden_worksets(existing_view), _hidden_worksets(solution_view)
     if wa is None or wb is None:
-        logger.warning(u"  Hidden worksets: could not be read")
+        logger.debug(u"  Hidden worksets: could not be read")
     elif wa != wb:
-        logger.warning(u"  Hidden worksets DIFFER: existing = {} | solution = {}"
+        logger.debug(u"  Hidden worksets DIFFER: existing = {} | solution = {}"
                        .format(wa or u"none", wb or u"none"))
     else:
-        logger.warning(u"  Hidden worksets: {}".format(wa or u"none"))
+        logger.debug(u"  Hidden worksets: {}".format(wa or u"none"))
 
     # Reported for information only. GetWorksetVisibility returns the VIEW's own
     # setting, which is stale and misleading when a template controls worksets —
@@ -675,7 +654,7 @@ def report_view_differences(existing_view, solution_view, link_instances):
     # no conclusion is drawn from it.
     sol_ws_e = _workset_visibility(existing_view, SOLUTION_WORKSET)
     sol_ws_s = _workset_visibility(solution_view, SOLUTION_WORKSET)
-    logger.warning(u"  Workset '{}' (view-level value, may be overridden by the "
+    logger.debug(u"  Workset '{}' (view-level value, may be overridden by the "
                    u"template): existing = {} | solution = {}".format(
                        SOLUTION_WORKSET, sol_ws_e, sol_ws_s))
 
@@ -685,9 +664,9 @@ def report_view_differences(existing_view, solution_view, link_instances):
             mode = unicode(s.LinkVisibilityType) if s is not None else u"default"
         except Exception as ex:
             mode = u"could not be read ({}: {})".format(type(ex).__name__, ex)
-        logger.warning(u"  Link '{}' displayed as: {}".format(li.Name, mode))
+        logger.debug(u"  Link '{}' displayed as: {}".format(li.Name, mode))
 
-    logger.warning(u"── end comparison ──")
+    logger.debug(u"── end comparison ──")
 def link_display_mode(host_view, link_instance, link_doc):
     """How host_view draws this link: (mode, linked_view).
 
@@ -880,10 +859,10 @@ def collect_mep_ids_in_volume(link_doc, host_crop_box, link_transform,
     dropped_opt = 0
     if wanted_opt is not None:
         _o = link_doc.GetElement(wanted_opt)
-        logger.warning(u"  Design option for this link: {}".format(
+        logger.debug(u"  Design option for this link: {}".format(
             _o.Name if _o is not None else wanted_opt))
     elif primary_ids:
-        logger.warning(u"  No design option set on the link; capturing the "
+        logger.debug(u"  No design option set on the link; capturing the "
                        u"primary option of each set ({} set(s)).".format(
                            len(primary_ids)))
 
@@ -1075,11 +1054,11 @@ def run(existing_section, sheet, selected_links, skip_duplicates=True,
             info[u"by_category"] = tally
             info[u"vis_mode"]    = vis_mode
             if vis_mode == u"link view":
-                logger.warning(
+                logger.debug(
                     u"'{}': capture follows the linked view the section displays "
                     u"— hidden elements excluded exactly.".format(name))
             else:
-                logger.warning(
+                logger.debug(
                     u"'{}': shown '{}'. Hidden CATEGORIES are excluded, but "
                     u"per-element hiding and view filters inside the link are "
                     u"not evaluated in this mode.".format(name, vis_mode))
@@ -1097,10 +1076,14 @@ def run(existing_section, sheet, selected_links, skip_duplicates=True,
                 if info[u"collected"] == 0:
                     info[u"error"] = u"No MEP elements found inside the section volume."
                 else:
+                    # Report what was SKIPPED, not what was collected. They differ
+                    # when a previous run created dependents (insulation) that were
+                    # never separate sources, so quoting "collected" here reads as
+                    # one or two more than the run that made the copies reported.
                     info[u"error"] = (
                         u"All {} elements were already copied for this section. "
                         u"Turn off “Skip elements already copied” to copy them "
-                        u"again.".format(info[u"collected"]))
+                        u"again.".format(info[u"skipped_dup"]))
                 continue
 
             try:
@@ -1146,7 +1129,7 @@ def run(existing_section, sheet, selected_links, skip_duplicates=True,
                     u"source, so they are unstamped and WILL be copied again on "
                     u"the next run.".format(name, count - stamped, count))
             else:
-                logger.warning(u"'{}': all {} copies stamped."
+                logger.debug(u"'{}': all {} copies stamped."
                                .format(name, count))
 
             if count == 0 and info[u"error"] is None:
