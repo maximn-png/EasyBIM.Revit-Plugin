@@ -42,10 +42,12 @@ import System.Windows.Media as WM
 import System.Windows.Input as WI
 
 from System.Windows.Markup import XamlReader
+from System.Windows.Interop import WindowInteropHelper
 from System.IO import StringReader
 from System.Xml import XmlReader as SysXmlReader
 
 from pyrevit import revit, script, forms
+from pyrevit.api import AdWindows
 
 doc = revit.doc
 logger = script.get_logger()
@@ -206,6 +208,41 @@ def _first_param(elem, bips):
     return None
 
 
+def _first_writable_param(elem, bips):
+    """First candidate that exists AND is writable; else the first that
+    merely exists (so callers can still detect/report a genuinely locked
+    parameter), else None.
+
+    A family can expose more than one plausible parameter from a
+    BuiltInParameter list (e.g. both "Elevation from Level" and
+    "Offset from Host" on the same unhosted instance) — stopping at
+    whichever one happens to exist first, regardless of whether it is
+    read-only, can silently pick the wrong one and leave the real,
+    position-driving parameter untouched. Prefer whichever is writable.
+    """
+    fallback = None
+    for bip in bips:
+        p = elem.get_Parameter(bip)
+        if p:
+            if fallback is None:
+                fallback = p
+            if not p.IsReadOnly:
+                return p
+    return fallback
+
+
+def _first_writable_named_or_param(elem, names, bips):
+    """Prefer a parameter found by its exact on-screen name (matching
+    whatever the user sees in the Properties palette, e.g. "Elevation
+    from Level"), falling back to the BuiltInParameter candidate list
+    when no named match is writable."""
+    for name in names:
+        p = elem.LookupParameter(name)
+        if p and not p.IsReadOnly:
+            return p
+    return _first_writable_param(elem, bips)
+
+
 def classify_element(elem):
     """Which offset-handling tier this element falls into.
 
@@ -273,7 +310,8 @@ def run_assignment(elements, active_levels, process_groups):
 
             target_level = find_associated_level(active_levels, z_pos)
             tier = classify_element(elem)
-            level_param = _first_param(elem, MEP_LEVEL_PARAMS if tier == TIER_MEP_CURVE else LEVEL_PARAMS)
+            level_param = _first_writable_param(
+                elem, MEP_LEVEL_PARAMS if tier == TIER_MEP_CURVE else LEVEL_PARAMS)
 
             # Hosted/face-based instances only drive physical position via
             # their host — that does not make the Level parameter itself
@@ -293,15 +331,21 @@ def run_assignment(elements, active_levels, process_groups):
             if tier == TIER_MEP_CURVE:
                 # Ducts/pipes/cable trays/conduits: recalculate the offset
                 # so the absolute Z height is preserved under the new
-                # reference level.
-                offset_param = _first_param(elem, MEP_OFFSET_PARAMS)
+                # reference level. Prefer the exact on-screen "Offset"
+                # field over guessing a BuiltInParameter, since a curve
+                # can expose more than one offset-shaped parameter.
+                offset_param = _first_writable_named_or_param(elem, [u"Offset"], MEP_OFFSET_PARAMS)
                 if offset_param and not offset_param.IsReadOnly:
                     offset_param.Set(z_pos - target_level.Elevation)
             elif tier == TIER_FREESTANDING:
                 # Freestanding furniture/equipment/generic models: same
-                # offset recalculation, using whichever elevation-style
-                # parameter the family exposes.
-                offset_param = _first_param(elem, FREESTANDING_OFFSET_PARAMS)
+                # offset recalculation. Prefer the exact on-screen
+                # "Elevation from Level" field — an unhosted instance can
+                # still carry an unrelated, separately-existing "Offset
+                # from Host" parameter, and picking that one instead would
+                # leave the real Z-driving parameter untouched.
+                offset_param = _first_writable_named_or_param(
+                    elem, [u"Elevation from Level"], FREESTANDING_OFFSET_PARAMS)
                 if offset_param and not offset_param.IsReadOnly:
                     offset_param.Set(z_pos - target_level.Elevation)
             # TIER_HOSTED: level only — never touch offset, so the element
@@ -1369,6 +1413,15 @@ class AutoAssignLevelDialog(object):
         from System.Windows.Threading import Dispatcher, DispatcherFrame
         window = self._build()
         frame = DispatcherFrame()
+
+        # Keep the wizard above Revit's main window and always on top —
+        # otherwise it's easy to lose the dialog behind Revit, leaving the
+        # model apparently "stuck" with no visible reason why.
+        try:
+            WindowInteropHelper(window).Owner = AdWindows.ComponentManager.ApplicationWindow
+        except Exception:
+            pass
+        window.Topmost = True
 
         def on_closed(s, e):
             frame.Continue = False
