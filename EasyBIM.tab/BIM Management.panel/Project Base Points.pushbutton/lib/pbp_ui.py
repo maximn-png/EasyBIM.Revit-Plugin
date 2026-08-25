@@ -55,6 +55,7 @@ import System.Windows
 import System.Windows.Controls as WC
 import System.Windows.Media as WM
 import System.Data as SD
+import System.ComponentModel
 from System.Collections.Generic import List as NetList
 
 from System.Windows.Markup import XamlReader
@@ -67,7 +68,7 @@ from pyrevit import script
 import pbp_prefs
 import pbp_report_html
 import pbp_report_xlsx
-from pbp_disc_map import DISC_CODES, HUB_ROLES, HEB_OPTIONS, AR_CODES, auto_role, auto_heb, guess_role
+from pbp_disc_map import DISC_CODES, HUB_ROLES, HEB_OPTIONS, AR_CODES, DISC_MAP, auto_role, auto_heb, guess_role
 from pbp_match import auto_match_references, resolve_rows, disc_of, key_of, ar_option_labels, is_ar
 from pbp_status import ISSUE_STATUSES
 
@@ -323,32 +324,23 @@ _STATUS_CELL_XAML = u"""
   </Border>
 </DataTemplate>
 """
-_HEB_CELL_XAML = u"""
-<DataTemplate xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
-              xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml">
-  <ComboBox ItemsSource="{DynamicResource HebOptionsResource}"
-            SelectedItem="{Binding Discipline, Mode=TwoWay, UpdateSourceTrigger=PropertyChanged}"
-            FlowDirection="RightToLeft" FontSize="11" BorderThickness="0.5"/>
-</DataTemplate>
-"""
-# Plain CheckBoxes bound directly, NOT DataGridCheckBoxColumn -- the latter
+# Plain CheckBox bound directly, NOT DataGridCheckBoxColumn -- the latter
 # needs the cell "current"/selected before a click registers, a well-known
 # WPF quirk that made the include toggle feel unreliable. A CheckBox in a
 # TemplateColumn is always live and toggles on a single click.
-_SELECT_CELL_XAML = u"""
-<DataTemplate xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
-              xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml">
-  <CheckBox IsChecked="{Binding Selected, Mode=TwoWay, UpdateSourceTrigger=PropertyChanged}"
-            HorizontalAlignment="Center" VerticalAlignment="Center"
-            ToolTip="Select for bulk include/exclude"/>
-</DataTemplate>
-"""
+# Background="Transparent" + Stretch is deliberate, not decorative: a WPF
+# element with NO Background is only hit-test-visible over its rendered
+# content (here, the ~13px glyph), so a checkbox merely Center-aligned in a
+# 46px cell left most of the cell dead to clicks. Transparent gives it a
+# real (if invisible) fill, so the whole cell becomes clickable.
 _INCLUDE_CELL_XAML = u"""
 <DataTemplate xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
               xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml">
   <CheckBox IsChecked="{Binding Included, Mode=TwoWay, UpdateSourceTrigger=PropertyChanged}"
             IsEnabled="{Binding CanExclude}"
-            HorizontalAlignment="Center" VerticalAlignment="Center"
+            Background="Transparent"
+            HorizontalAlignment="Stretch" VerticalAlignment="Stretch"
+            HorizontalContentAlignment="Center" VerticalContentAlignment="Center"
             ToolTip="Included in the chart, report and issue export"/>
 </DataTemplate>
 """
@@ -357,6 +349,20 @@ _INCLUDE_CELL_XAML = u"""
 def _parse_fragment(xaml):
     ctx = SysXmlReader.Create(StringReader(xaml))
     return XamlReader.Load(ctx)
+
+
+def _stretch_cell_style():
+    """DataGridCell's own default content alignment left the templated,
+    Stretch-aligned checkbox squeezed back down to its glyph size -- this
+    makes the CELL itself hand its full area to the checkbox, so the
+    Background="Transparent" hit-test fix on the checkbox actually reaches
+    the whole 46-48px column, not just the cell's default content box."""
+    style = System.Windows.Style(clr.GetClrType(WC.DataGridCell))
+    style.Setters.Add(System.Windows.Setter(WC.Control.HorizontalContentAlignmentProperty,
+                                             System.Windows.HorizontalAlignment.Stretch))
+    style.Setters.Add(System.Windows.Setter(WC.Control.VerticalContentAlignmentProperty,
+                                             System.Windows.VerticalAlignment.Stretch))
+    return style
 
 
 def _hbox(gap=8):
@@ -457,6 +463,9 @@ class ProjectBasePointsDialog(object):
         self.stage = "setup"
         self._written_files = []
         self._last_issue_count = 0
+        self._preview_selected_ids = set()
+        self._preview_bulk_field = None
+        self._preview_bulk_value = u""
 
     # ---- misc helpers ----
     def _default_folder(self):
@@ -470,6 +479,15 @@ class ProjectBasePointsDialog(object):
     # hand edits) is translated to/from a NAME-based key first. ----
     def _row_key(self, row):
         return row["link"] + (u"#" + row["inst"] if row.get("inst") else u"")
+
+    def _heb_for(self, code):
+        """Hebrew discipline label for a code, preferring a hand-set override
+        (self.acc["heb"], keyed by code -- shared with the Issues screen's
+        per-discipline table so a fix made from either place shows on both)
+        over DISC_MAP's built-in guess. Codes DISC_MAP has never heard of
+        (e.g. a project-specific "PW") would otherwise all collapse into the
+        generic "כללי" fallback with no way to tell them apart."""
+        return self.acc["heb"].get(code, auto_heb(code))
 
     def _row_by_key(self):
         return dict((self._row_key(r), r) for r in self.raw_rows)
@@ -585,7 +603,6 @@ class ProjectBasePointsDialog(object):
         w = _parse_fragment(XAML)
         self._window = w
         w.Resources["DiscCodesResource"] = NetList[System.String](self._all_disc_codes())
-        w.Resources["HebOptionsResource"] = NetList[System.String](HEB_OPTIONS)
 
         self._ref_table = SD.DataTable("RefOptions")
         self._ref_table.Columns.Add("Id", int)
@@ -871,21 +888,28 @@ class ProjectBasePointsDialog(object):
             warn.Margin = System.Windows.Thickness(12)
             ar_panel.Children.Add(warn)
         else:
+            col_stars = (2, 1, 1, 1, 1, 1.3)
             hdr = WC.Grid()
-            for w_ in (2, 1, 1, 1, 1):
+            for w_ in col_stars:
                 cd = WC.ColumnDefinition()
                 cd.Width = System.Windows.GridLength(w_, System.Windows.GridUnitType.Star)
                 hdr.ColumnDefinitions.Add(cd)
-            for i, htext in enumerate(["Model", "Building", "Shared site", "Elev (m)", "Angle (deg)"]):
+            headers = ["Model", "Building", "Shared site", "Elev (m)", "Angle (deg)", "Survey elev (m)"]
+            for i, htext in enumerate(headers):
                 t = _tb(htext.upper(), size=9.5, color="#8b93a7", bold=True)
                 t.Margin = System.Windows.Thickness(10, 7, 10, 7)
+                if i == 5:
+                    t.ToolTip = (u"This model's OWN Survey Point elevation (not the PBP position shown "
+                                 u"in Elev (m)). This tool assumes each model's Project Base Point sits "
+                                 u"at that model's internal origin -- a non-zero value here means that "
+                                 u"assumption may not hold for this model, and its numbers above may be wrong.")
                 WC.Grid.SetColumn(t, i)
                 hdr.Children.Add(t)
             hdr.Background = WM.BrushConverter().ConvertFromString("#f4f6fd")
             ar_panel.Children.Add(hdr)
             for r in ars:
                 gr = WC.Grid()
-                for w_ in (2, 1, 1, 1, 1):
+                for w_ in col_stars:
                     cd = WC.ColumnDefinition()
                     cd.Width = System.Windows.GridLength(w_, System.Windows.GridUnitType.Star)
                     gr.ColumnDefinitions.Add(cd)
@@ -897,6 +921,32 @@ class ProjectBasePointsDialog(object):
                     t.Margin = System.Windows.Thickness(10, 6, 10, 6)
                     WC.Grid.SetColumn(t, i)
                     gr.Children.Add(t)
+
+                # Flag a non-zero Survey Point elevation -- the tell-tale sign
+                # that THIS model's Project Base Point may not sit at its own
+                # internal origin (0,0,0), the assumption every Elev (m)/
+                # N-S/E-W value in this tool relies on (see pbp_collect.py
+                # module docstring). A user hit exactly this: the reported
+                # Elev (m) read 4.997 while the model's real elevation was
+                # 14.2, traced to this model's Survey Point elevation.
+                se = r.get("survey_elev")
+                se_cell = _hbox()
+                se_cell.Margin = System.Windows.Thickness(10, 6, 10, 6)
+                WC.Grid.SetColumn(se_cell, 5)
+                if se is None:
+                    se_cell.Children.Add(_tb(u"—", size=11.5, color="#9aa0ac"))
+                else:
+                    flagged = abs(se) > 0.0005  # ~0.5mm; "not exactly 0" past ordinary float noise
+                    se_cell.Children.Add(_tb("{:.3f}".format(se), size=11.5,
+                                              color=(RED if flagged else "#374151"), bold=flagged))
+                    if flagged:
+                        warn = _tb(u" ⚠", size=12, color=RED, bold=True)
+                        warn.ToolTip = (u"Survey Point elevation is not 0 -- this model's Project Base "
+                                        u"Point may not sit at its internal origin, which this tool "
+                                        u"assumes. The Elev (m) value for this model can be wrong; verify "
+                                        u"against Revit's own Coordinates dialog for this link.")
+                        se_cell.Children.Add(warn)
+                gr.Children.Add(se_cell)
                 ar_panel.Children.Add(gr)
         ar_card.Child = ar_panel
         p.Children.Add(ar_card)
@@ -1120,7 +1170,7 @@ class ProjectBasePointsDialog(object):
 
     # =========================================================== RESULTS
     RESULTS_COLS = [
-        (u"Sel", 48, "Select"), (u"Incl.", 46, "IncludeToggle"),
+        (u"Incl.", 46, "IncludeToggle"),
         (u"Link", 170, "LinkDisp"), (u"Disc", 62, "Disc"), (u"Bldg", 62, "Bldg"),
         (u"Shared Site", 110, "SharedSite"), (u"Workset", 90, "Workset"),
         (u"N/S (m)", 78, "NS"), (u"E/W (m)", 78, "EW"), (u"Elev (m)", 70, "Elev"), (u"Angle", 66, "Angle"),
@@ -1149,10 +1199,17 @@ class ProjectBasePointsDialog(object):
         self._chip_row = chip_row
         host.Children.Add(chip_row)
 
-        # Bulk-edit bar: appears once >=1 row is ticked in the "Sel" column,
-        # separate from each row's own "Incl." (report inclusion) toggle.
-        # Lets several selected rows' Disc / Reference (AR) / Included all be
-        # set to one value in a single action.
+        # Bulk-edit bar: appears once >=1 row is selected (click a row, Ctrl/
+        # Shift+click for more -- ordinary DataGrid multi-select), separate
+        # from each row's own "Incl." (report inclusion) toggle. Lets several
+        # selected rows' Disc / Reference (AR) / Included all be set to one
+        # value in a single action.
+        # A dedicated "Sel" tick-box column was the original design (matching
+        # the reference mockup) but repeatedly failed to register multi-picks
+        # reliably in the field; the DataGrid's own native row selection is
+        # standard, well-tested WPF behavior with no custom wiring to get
+        # wrong, so it replaces the tick-box column as the single selection
+        # mechanism -- see _on_grid_selection_changed / _restore_grid_selection.
         self._bulk_field = "disc"
         bulk_card = _card()
         bulk_card.Margin = System.Windows.Thickness(0, 0, 0, 8)
@@ -1169,7 +1226,7 @@ class ProjectBasePointsDialog(object):
 
         # DataTable backing the grid
         dt = SD.DataTable("Results")
-        for name, clr_type in [("Id", int), ("Selected", bool), ("Included", bool), ("CanExclude", bool),
+        for name, clr_type in [("Id", int), ("Included", bool), ("CanExclude", bool),
                                 ("LinkDisp", str), ("Disc", str), ("CanEditDisc", bool),
                                 ("Bldg", str), ("SharedSite", str), ("Workset", str),
                                 ("NS", str), ("EW", str), ("Elev", str), ("Angle", str),
@@ -1217,24 +1274,10 @@ class ProjectBasePointsDialog(object):
                 col = WC.DataGridTemplateColumn()
                 col.CellTemplate = _parse_fragment(_STATUS_CELL_XAML)
                 col.SortMemberPath = "Status"
-            elif binding == "Select":
-                col = WC.DataGridTemplateColumn()
-                col.CellTemplate = _parse_fragment(_SELECT_CELL_XAML)
-                select_all_cb = WC.CheckBox()
-                select_all_cb.ToolTip = u"Select/deselect all rows (ignores the current filter)"
-                select_all_cb.Click += self._on_select_all_click
-                header_stack = WC.StackPanel()
-                header_stack.Orientation = WC.Orientation.Horizontal
-                header_stack.ToolTip = u"Tick rows here to bulk-edit or bulk-include/exclude them together"
-                sel_label = _tb(u"Sel", size=9, color="#8b93a7", bold=True)
-                sel_label.VerticalAlignment = System.Windows.VerticalAlignment.Center
-                sel_label.Margin = System.Windows.Thickness(0, 0, 3, 0)
-                header_stack.Children.Add(sel_label)
-                header_stack.Children.Add(select_all_cb)
-                col.Header = header_stack
             elif binding == "IncludeToggle":
                 col = WC.DataGridTemplateColumn()
                 col.CellTemplate = _parse_fragment(_INCLUDE_CELL_XAML)
+                col.CellStyle = _stretch_cell_style()
             elif binding == "Bldg":
                 # Editable free text -- fixing the building key here drives
                 # this row's own Reference (AR) to re-match automatically
@@ -1252,14 +1295,97 @@ class ProjectBasePointsDialog(object):
                 col.Binding = System.Windows.Data.Binding(binding)
                 col.IsReadOnly = True
                 col.SortMemberPath = binding
-            if binding != "Select":
-                col.Header = header
+            col.Header = header
             col.Width = WC.DataGridLength(width)
             grid.Columns.Add(col)
+
+        # Sort is managed entirely by hand (see _on_grid_sorting/_apply_sort_
+        # state) instead of relying on the DataGrid's own DataView-backed
+        # auto-sort: that auto-sort doesn't survive _refresh_results_grid's
+        # Rows.Clear()+Add() rebuild (every checkbox/edit triggers one), so a
+        # column sort was silently lost on the next edit. self._sort_state is
+        # plain Python state, untouched by the DataTable rebuild, and gets
+        # explicitly re-applied to the view at the end of every refresh.
+        self._sort_state = []  # [(SortMemberPath, ascending), ...] primary first
+        grid.CanUserSortColumns = True
+        grid.Sorting += self._on_grid_sorting
+
+        # Selection for bulk-edit -- click a row, Ctrl/Shift+click for more,
+        # exactly like Explorer/Excel. FullRow+Extended are actually the
+        # DataGrid defaults already; set explicitly so this isn't silently
+        # broken by a future default change.
+        grid.SelectionUnit = WC.DataGridSelectionUnit.FullRow
+        grid.SelectionMode = WC.DataGridSelectionMode.Extended
+        grid.SelectionChanged += self._on_grid_selection_changed
 
         self._results_grid = grid
         WC.Grid.SetRow(grid, 3)
         host.Children.Add(grid)
+
+    def _on_grid_selection_changed(self, sender, e):
+        if self._syncing:  # a programmatic reselect from _restore_grid_selection
+            return
+        ids = set()
+        for item in self._results_grid.SelectedItems:
+            try:
+                ids.add(int(item["Id"]))
+            except Exception:
+                pass
+        ids.discard(0)  # HOST is never a bulk-edit target
+        self._selected_ids = ids
+        self._refresh_bulk_bar()
+
+    def _restore_grid_selection(self):
+        """_refresh_results_grid's Rows.Clear()+Add() creates brand new
+        DataRowView instances, so the DataGrid's own native SelectedItems
+        would otherwise go empty on every edit even though self._selected_ids
+        (plain Python state) is unaffected -- reselect the matching rows so
+        the highlighted rows and the bulk-edit set stay in sync visually."""
+        self._syncing = True
+        try:
+            grid = self._results_grid
+            grid.SelectedItems.Clear()
+            if self._selected_ids:
+                for rv in self._results_table.DefaultView:
+                    if int(rv["Id"]) in self._selected_ids:
+                        grid.SelectedItems.Add(rv)
+        finally:
+            self._syncing = False
+
+    def _on_grid_sorting(self, sender, e):
+        e.Handled = True  # replaces the DataGrid's own (non-persistent) auto-sort entirely
+        member = e.Column.SortMemberPath
+        if not member:
+            return
+        shift = bool(int(System.Windows.Input.Keyboard.Modifiers) & int(System.Windows.Input.ModifierKeys.Shift))
+        idx = next((i for i, (m, _a) in enumerate(self._sort_state) if m == member), None)
+        if idx is not None:
+            _m, asc = self._sort_state[idx]
+            entry = (member, not asc)
+            if shift:
+                self._sort_state[idx] = entry
+            else:
+                self._sort_state = [entry]
+        else:
+            entry = (member, True)
+            # Plain click on a header not yet in the chain -> that column
+            # becomes the sole (primary) sort. Shift+click -> appended as the
+            # next sort level, e.g. click "Bldg" then shift-click "Disc" for
+            # "Bldg, then Disc" -- the two-level sort the report asked for.
+            self._sort_state = [entry] if not shift else self._sort_state + [entry]
+        self._apply_sort_state()
+
+    def _apply_sort_state(self):
+        view = self._results_table.DefaultView
+        view.Sort = ", ".join(u"{} {}".format(m, "ASC" if asc else "DESC") for m, asc in self._sort_state)
+        active = dict(self._sort_state)
+        for col in self._results_grid.Columns:
+            m = col.SortMemberPath
+            if m in active:
+                col.SortDirection = (System.ComponentModel.ListSortDirection.Ascending if active[m]
+                                      else System.ComponentModel.ListSortDirection.Descending)
+            else:
+                col.SortDirection = None
 
     def _rebuild_ref_options(self, resolved):
         self._ref_table.Rows.Clear()
@@ -1286,7 +1412,7 @@ class ProjectBasePointsDialog(object):
                 can_ref = is_link and r["placed"] and r["status"] not in ("Reference",)
                 ref_id = self.refs.get(r["id"], -1) if can_ref else -1
                 dt.Rows.Add(
-                    r["id"], r["id"] in self._selected_ids, r["included"], is_link,
+                    r["id"], r["included"], is_link,
                     r["link"] + (" " + r["inst"] if r["inst"] else ""),
                     r["disc"], is_link,
                     r["key"],
@@ -1303,6 +1429,8 @@ class ProjectBasePointsDialog(object):
             self._syncing = False
         self._results_grid.ItemsSource = self._results_table.DefaultView
         self._apply_results_filter()
+        self._apply_sort_state()
+        self._restore_grid_selection()
         self._rebuild_chart(resolved)
         self._rebuild_chips(resolved)
         self._refresh_bulk_bar()
@@ -1316,20 +1444,10 @@ class ProjectBasePointsDialog(object):
         if raw is None:
             return
 
-        try:
-            if bool(row["Selected"]):
-                self._selected_ids.add(row_id)
-            else:
-                self._selected_ids.discard(row_id)
-        except Exception:
-            pass
-
         # DataTable.RowChanged doesn't say WHICH column changed, so diff each
         # editable cell against what's currently tracked -- whichever one
         # actually differs is the edit that just happened (WPF commits one
         # cell at a time, so only one of these differs on any given call).
-        # "Selected" alone is NOT substantive -- it doesn't affect status,
-        # matching, or any export, so it skips the (heavier) full rebuild.
         substantive = False
         bldg_changed = False
         try:
@@ -1404,14 +1522,12 @@ class ProjectBasePointsDialog(object):
         else:
             self._window.Dispatcher.BeginInvoke(System.Action(self._refresh_bulk_bar))
 
-    def _on_select_all_click(self, sender, args):
-        resolved = self._resolved()
-        visible_ids = [r["id"] for r in resolved if r["id"] != 0]
-        if sender.IsChecked:
-            self._selected_ids |= set(visible_ids)
-        else:
-            self._selected_ids -= set(visible_ids)
-        self._refresh_results_grid()
+    def _on_select_all_visible_click(self, sender, args):
+        # SelectAll() only selects rows currently passing the DataView's
+        # RowFilter -- unlike the old header tick-box (which force-selected
+        # every row regardless of the active "Not coordinated"/etc. filter),
+        # this matches what's actually on screen.
+        self._results_grid.SelectAll()
 
     _BULK_FIELDS = [("disc", u"Disc"), ("ref", u"Reference (AR)"), ("included", u"Included in report")]
 
@@ -1439,6 +1555,24 @@ class ProjectBasePointsDialog(object):
             self._refresh_results_grid()
         clear_btn.Click += on_clear
         row1.Children.Add(clear_btn)
+
+        # One-click shortcuts for the single most common bulk action --
+        # ticking "Included in report" -> "No" -> Apply below works too, but
+        # this skips the field/value picker entirely for the common case.
+        def make_incl_btn(label, value):
+            b = WC.Button()
+            b.Content = label
+            b.Style = self._window.FindResource("GhostBtn")
+            b.Margin = System.Windows.Thickness(10, 0, 0, 0)
+            def on_click(s, e, v=value):
+                for rid in self._selected_ids:
+                    if rid != 0:
+                        self.excluded[rid] = not v
+                self._refresh_results_grid()
+            b.Click += on_click
+            return b
+        row1.Children.Add(make_incl_btn(u"Mark selected: Not included", False))
+        row1.Children.Add(make_incl_btn(u"Mark selected: Included", True))
         bar.Children.Add(row1)
 
         row2 = _hbox()
@@ -1586,6 +1720,14 @@ class ProjectBasePointsDialog(object):
         row.Children.Add(make_chip("unshared", "Not shared"))
         row.Children.Add(make_chip("unresolved", "Unresolved"))
 
+        select_all_btn = WC.Button()
+        select_all_btn.Content = u"Select all visible"
+        select_all_btn.ToolTip = u"Select every row passing the current filter, for bulk-edit"
+        select_all_btn.Style = self._window.FindResource("GhostBtn")
+        select_all_btn.Margin = System.Windows.Thickness(14, 0, 0, 0)
+        select_all_btn.Click += self._on_select_all_visible_click
+        row.Children.Add(select_all_btn)
+
         reset_btn = WC.Button()
         reset_btn.Content = u"Reset mapping"
         reset_btn.Style = self._window.FindResource("GhostBtn")
@@ -1599,7 +1741,8 @@ class ProjectBasePointsDialog(object):
         reset_btn.Click += on_reset
         row.Children.Add(reset_btn)
 
-        hint = _tb(u"·  tick the ✓ boxes in the Sel column to bulk-edit or bulk-include/exclude several rows at once",
+        hint = _tb(u"·  click a row (Ctrl/Shift+click for more) to bulk-edit or bulk-include/exclude several rows at once"
+                   u"   ·  shift-click a 2nd column header to sort by two levels (e.g. Bldg, then Disc)",
                    size=10.5, color="#9aa0ac", wrap=True)
         hint.Margin = System.Windows.Thickness(12, 0, 0, 0)
         hint.VerticalAlignment = System.Windows.VerticalAlignment.Center
@@ -1629,7 +1772,7 @@ class ProjectBasePointsDialog(object):
             if r["kind"] == "HOST" or r["status"] == "Reference" or not r["included"]:
                 continue
             code = r["disc"] or "?"
-            d = auto_heb(code)
+            d = self._heb_for(code)
             g = groups.setdefault(d, {"ok": 0, "notok": 0, "unshared": 0, "other": 0, "total": 0})
             g["total"] += 1
             key = {"OK": "ok", "Not OK": "notok", "Not Shared": "unshared"}.get(r["status"], "other")
@@ -1681,6 +1824,48 @@ class ProjectBasePointsDialog(object):
             stk.Children.Add(gr)
         card.Child = stk
         panel.Children.Add(card)
+
+        # DISC_MAP-unknown codes (e.g. a project-specific "PW") all fall back
+        # to the same generic "כללי" bucket above with no way to tell them
+        # apart -- offer a fix right here rather than only buried in the
+        # Issues wizard's per-discipline table (self.acc["heb"] is the same
+        # dict either screen writes to, so a fix here shows there too).
+        unmapped = sorted(set(
+            r["disc"] for r in resolved
+            if r["kind"] != "HOST" and r["status"] != "Reference" and r["included"]
+            and r["disc"] and r["disc"] not in DISC_MAP
+        ))
+        if unmapped:
+            um_card = _card()
+            um_card.Margin = System.Windows.Thickness(0, 8, 0, 0)
+            um_card.Padding = System.Windows.Thickness(12, 9, 12, 9)
+            um_card.HorizontalAlignment = System.Windows.HorizontalAlignment.Left
+            um_stk = WC.StackPanel()
+            um_stk.Children.Add(_tb(
+                u"No built-in Hebrew label for: {} — set one below so the chart and issue exports "
+                u"show the real discipline instead of \"כללי\"".format(u", ".join(unmapped)),
+                size=10.5, color="#9aa0ac", wrap=True))
+            for code in unmapped:
+                urow = _hbox()
+                urow.Margin = System.Windows.Thickness(0, 6, 0, 0)
+                ctag = _tb(code, size=11.5, color=NAVY, bold=True)
+                ctag.FontFamily = WM.FontFamily("Consolas")
+                ctag.Width = 46
+                ctag.VerticalAlignment = System.Windows.VerticalAlignment.Center
+                urow.Children.Add(ctag)
+                box = WC.TextBox()
+                box.Width = 140
+                box.FlowDirection = System.Windows.FlowDirection.RightToLeft
+                box.Padding = System.Windows.Thickness(5, 3, 5, 3)
+                box.Text = self._heb_for(code)
+                def on_heb_override(s, e, c=code):
+                    self.acc["heb"][c] = s.Text.strip() or auto_heb(c)
+                    self._window.Dispatcher.BeginInvoke(System.Action(self._refresh_results_grid))
+                box.LostFocus += on_heb_override
+                urow.Children.Add(box)
+                um_stk.Children.Add(urow)
+            um_card.Child = um_stk
+            panel.Children.Add(um_card)
 
     # =========================================================== EXPORT
     def _refresh_export_panel(self):
@@ -2082,7 +2267,17 @@ class ProjectBasePointsDialog(object):
         def on_assignee_text(s, e):
             key = "companiesText" if is_company else "rolesText"
             a[key] = s.Text
-            self._refresh_footer()
+            # A full rebuild, not just _refresh_footer() -- the per-discipline
+            # Company/Role combos below and the "N parsed" status line were
+            # already built from self._assignee_list() BEFORE this edit, so
+            # without rebuilding they keep showing the stale (often empty)
+            # list until the panel happens to redraw for some other reason.
+            # Direct call, NOT Dispatcher.BeginInvoke -- the Assignee Type
+            # toggle just above (on_at) does the same full rebuild directly
+            # and is the one control in this panel never reported stale;
+            # deferring here only pushed the rebuild an event-loop tick later
+            # than the user's next glance at the Preview grid below.
+            self._refresh_issues_panel()
         abox.LostFocus += on_assignee_text
         astk.Children.Add(abox)
         alist = self._assignee_list()
@@ -2136,6 +2331,19 @@ class ProjectBasePointsDialog(object):
         # Per-discipline table
         issue_rows = self._issue_rows_current()
         discs_used = sorted(set(x["disc"] for x in issue_rows))
+        # The link file names already carry PROJECT-DISCIPLINE-FIRM-BUILDING-
+        # VERSION -- the FIRM segment (e.g. "AFC" in "UPT-ME-AFC-Base-R25.rvt")
+        # was parsed and discarded until now. Surfacing it here answers "who
+        # do I even assign this discipline to" directly from data already in
+        # the model, instead of leaving the user to guess or dig through link
+        # names by hand.
+        firms_by_disc = {}
+        for r in self._resolved():
+            if r["kind"] == "HOST":
+                continue
+            firm = (r.get("firm") or "").strip()
+            if firm:
+                firms_by_disc.setdefault(r["disc"], set()).add(firm)
         # דיספלינה only matters if some custom field is actually mapped to
         # receive it -- ACC's own standard columns never carry it, so with
         # no such field the value would be computed here and then written
@@ -2160,6 +2368,7 @@ class ProjectBasePointsDialog(object):
         head_cell(u"Company" if is_company else u"Role", 180)
         if show_heb:
             head_cell(u"דיספלינה", 130, margin=(8, 0, 0, 0))
+        head_cell(u"Firm(s) in model", 130, margin=(10, 0, 0, 0))
         head_cell(u"Issues", 70, margin=(10, 0, 0, 0))
         pd_stk.Children.Add(head)
 
@@ -2173,33 +2382,70 @@ class ProjectBasePointsDialog(object):
             dtag.FontFamily = WM.FontFamily("Consolas")
             dtag.Width = 46
             drow.Children.Add(dtag)
+            # A plain (non-editable) ComboBox + .Items.Add(...) + SelectedItem
+            # -- NOT IsEditable=True + ItemsSource + .Text. The editable
+            # variant is the one repeatedly reported as showing a BLANK
+            # dropdown list here despite the underlying data being provably
+            # correct ("N company(ies) parsed"); every OTHER working dropdown
+            # in this dialog (Disc, Reference (AR), Status, Assignee Type...)
+            # already uses this same plain non-editable pattern, so this
+            # matches what's actually proven to render its list reliably.
+            current_val = a["companies"].get(d, "") if is_company else a["roles"].get(d, guess_role(d, alist))
             role_box = WC.ComboBox()
             role_box.Width = 180
-            role_box.IsEditable = True
-            role_box.ItemsSource = NetList[System.String](alist)
-            if is_company:
-                role_box.Text = a["companies"].get(d, "")
-            else:
-                role_box.Text = a["roles"].get(d, guess_role(d, alist))
+            opts = list(alist)
+            if current_val and current_val not in opts:
+                opts.append(current_val)
+            if not is_company:
+                opts.insert(0, u"")  # explicit "no role chosen" without forcing a guess
+            for opt in opts:
+                role_box.Items.Add(opt)
+            role_box.SelectedItem = current_val
             def on_role_change(s, e, disc=d):
                 key = "companies" if is_company else "roles"
-                a[key][disc] = s.Text
-                self._refresh_footer()
-            role_box.LostFocus += on_role_change
+                a[key][disc] = s.SelectedItem or u""
+                # Full rebuild -- the Preview grid below (issue_rows / "Assigned
+                # To") was already built from the OLD a["companies"]/a["roles"]
+                # earlier in this same _refresh_issues_panel() call, so without
+                # this it keeps showing the pre-edit value (the reported "Assigned
+                # To still shows roles, not the company I just picked" bug).
+                # Direct call -- see on_assignee_text's note on why not BeginInvoke.
+                self._refresh_issues_panel()
             role_box.SelectionChanged += on_role_change
             drow.Children.Add(role_box)
             if show_heb:
+                # IsEditable + Text (not SelectedItem) -- a code with no
+                # DISC_MAP entry can carry a hand-typed free-text label (see
+                # the Results chart's "unmapped discipline" fix) that isn't
+                # one of the fixed HEB_OPTIONS. A non-editable ComboBox's
+                # SelectedItem silently shows NOTHING when the bound value
+                # isn't in its Items -- the exact reported "דיספלינה blank"
+                # bug -- even though a["heb"][d] holds the correct string.
                 heb_combo = WC.ComboBox()
                 heb_combo.Width = 130
+                heb_combo.IsEditable = True
                 heb_combo.FlowDirection = System.Windows.FlowDirection.RightToLeft
-                for opt in HEB_OPTIONS:
-                    heb_combo.Items.Add(opt)
-                heb_combo.SelectedItem = a["heb"].get(d, auto_heb(d))
+                heb_combo.ItemsSource = NetList[System.String](HEB_OPTIONS)
+                heb_combo.Text = self._heb_for(d)
                 heb_combo.Margin = System.Windows.Thickness(8, 0, 0, 0)
                 def on_heb_change(s, e, disc=d):
-                    a["heb"][disc] = s.SelectedItem
+                    a["heb"][disc] = s.Text.strip() or auto_heb(disc)
+                    # Direct call -- see on_assignee_text's note on why not BeginInvoke.
+                    self._refresh_issues_panel()
+                heb_combo.LostFocus += on_heb_change
                 heb_combo.SelectionChanged += on_heb_change
                 drow.Children.Add(heb_combo)
+            firms = sorted(firms_by_disc.get(d, []))
+            firm_tb = _tb(u", ".join(firms) if firms else u"—", size=11,
+                          color=(NAVY if firms else "#c9cedb"), bold=bool(firms))
+            firm_tb.Width = 130
+            firm_tb.Margin = System.Windows.Thickness(10, 0, 0, 0)
+            firm_tb.TextWrapping = System.Windows.TextWrapping.Wrap
+            if firms:
+                firm_tb.ToolTip = (u"Parsed from the link file name(s) for this discipline "
+                                    u"(PROJECT-DISCIPLINE-FIRM-BUILDING-VERSION) -- a hint for who to "
+                                    u"assign this discipline's issues to, not filled in automatically.")
+            drow.Children.Add(firm_tb)
             drow.Children.Add(_tb(u"{} issue(s)".format(n), size=11, color="#6b7280",
                                   margin=(10, 0, 0, 0)))
             pd_stk.Children.Add(drow)
@@ -2228,13 +2474,22 @@ class ProjectBasePointsDialog(object):
         p.Children.Add(note)
 
     def _auto_cf_role(self, fields):
-        role = {}
+        # Hebrew field names (very common for a project that isn't on the
+        # EasyBIM Hub and types/imports its own field list) never matched
+        # the English-only keyword checks below -- a field literally named
+        # "תחום" ("area/zone/domain") or "אזור" ("area/zone") read as an
+        # unrecognized free field and silently never auto-filled, which is
+        # exactly what it looks like from a "why is this column blank"
+        # report: the field is real, just never told it means "building".
         got_d = got_b = False
+        role = {}
         for f in fields:
             n = f.lower()
-            if not got_d and (u"disciplin" in n or u"trade" in n or u"דיספלינה" in f):
+            if not got_d and (u"disciplin" in n or u"trade" in n or
+                              any(h in f for h in (u"דיספלינה", u"דיסציפלינה", u"מקצוע"))):
                 role[f] = "discipline"; got_d = True; continue
-            if not got_b and re.search(r"location|building|zone|area|block", n):
+            if not got_b and (re.search(r"location|building|zone|area|block", n) or
+                              any(h in f for h in (u"תחום", u"אזור", u"מבנה", u"בניין", u"בניה"))):
                 role[f] = "building"; got_b = True; continue
             role[f] = ""
         return role
@@ -2275,19 +2530,26 @@ class ProjectBasePointsDialog(object):
         std_cols = [("Title", "Title", 160), ("Description", "Description", 260), ("Status", "Status", 80),
                     ("Assigned To", "Assigned To", 130), ("Category", "Category", 90), ("Type", "Type", 100),
                     ("Start Date", "Start Date", 96), ("Due Date", "Due Date", 96)]
+        # Exactly ONE column per configured custom field -- there used to
+        # ALSO be a hardcoded "דיספלינה"/"Building" pair shown alongside
+        # whatever real custom fields exist, so a non-hub project with its
+        # own "תחום"/"אזור" fields saw FOUR overlapping discipline/location
+        # columns, and only the hardcoded pair was actually wired to persist
+        # edits back -- editing the real field's own column silently did
+        # nothing. Now the field's own column (labeled "דיספלינה" when its
+        # role is "discipline", its own name otherwise) is the only widget,
+        # and it's the one whose edits are saved (see _on_preview_row_changed).
         fields = self._cf_fields()
 
         dt = SD.DataTable("Preview")
         dt.Columns.Add("Id", int)
-        dt.Columns.Add("Discipline", str)
-        dt.Columns.Add("Building", str)
         for f in fields:
             dt.Columns.Add(self._safe_col_name(f), str)
         for _label, key, _w in std_cols:
             dt.Columns.Add(self._safe_col_name(key), str)
 
         for x in issue_rows:
-            vals = [x["id"], x.get("discipline", ""), x.get("building", "")]
+            vals = [x["id"]]
             for f in fields:
                 role = self._cf_role_for(f)
                 if role == "discipline":
@@ -2303,6 +2565,14 @@ class ProjectBasePointsDialog(object):
         dt.RowChanged += self._on_preview_row_changed
         self._preview_table = dt
         self._preview_fields = fields
+        self._preview_bulk_fields = [(key, label) for label, key, _w in std_cols] + \
+            [(f, u"דיספלינה" if self._cf_role_for(f) == "discipline" else f) for f in fields]
+        if self._preview_bulk_field not in dict(self._preview_bulk_fields):
+            self._preview_bulk_field = self._preview_bulk_fields[0][0] if self._preview_bulk_fields else None
+        live_ids = set(x["id"] for x in issue_rows)
+        self._preview_selected_ids &= live_ids
+
+        self._build_preview_bulk_bar(parent)
 
         grid = WC.DataGrid()
         grid.AutoGenerateColumns = False
@@ -2315,24 +2585,37 @@ class ProjectBasePointsDialog(object):
         grid.GridLinesVisibility = WC.DataGridGridLinesVisibility.Horizontal
         grid.HorizontalGridLinesBrush = WM.BrushConverter().ConvertFromString("#eef0f7")
         grid.AlternatingRowBackground = WM.BrushConverter().ConvertFromString("#fafbff")
-
-        heb_col = WC.DataGridTemplateColumn()
-        heb_col.Header = u"דיספלינה"
-        heb_col.CellTemplate = _parse_fragment(_HEB_CELL_XAML)
-        heb_col.Width = WC.DataGridLength(110)
-        grid.Columns.Add(heb_col)
-
-        bcol = WC.DataGridTextColumn()
-        bcol.Header = "Building"
-        bcol.Binding = System.Windows.Data.Binding("Building")
-        bcol.Width = WC.DataGridLength(90)
-        grid.Columns.Add(bcol)
+        # Native row selection -- click a row, Ctrl/Shift+click for more --
+        # same mechanism as the Results grid (see its own notes on why a
+        # custom tick-box column was abandoned in favor of this).
+        grid.SelectionUnit = WC.DataGridSelectionUnit.FullRow
+        grid.SelectionMode = WC.DataGridSelectionMode.Extended
+        grid.SelectionChanged += self._on_preview_selection_changed
 
         for f in fields:
+            role = self._cf_role_for(f)
             col = WC.DataGridTextColumn()
-            col.Header = f
+            # A plain editable DataGridTextColumn -- NOT a ComboBox-based
+            # DataTemplate column (one WAS used for the discipline field
+            # specifically, and repeatedly rendered BLANK regardless of
+            # whether the bound value was in its item list; plain
+            # text-bound columns in this same grid never had that problem).
+            # Free text is also simply correct for a discipline label: it
+            # can legitimately be a hand-typed value not in the fixed
+            # HEB_OPTIONS list (see the Results chart's unmapped-discipline
+            # fix), so a constrained dropdown was never the right control.
+            col.Header = u"דיספלינה" if role == "discipline" else f
             col.Binding = System.Windows.Data.Binding(self._safe_col_name(f))
             col.Width = WC.DataGridLength(120)
+            if role == "discipline":
+                style = System.Windows.Style(clr.GetClrType(WC.TextBlock))
+                style.Setters.Add(System.Windows.Setter(WC.TextBlock.FlowDirectionProperty,
+                                                         System.Windows.FlowDirection.RightToLeft))
+                col.ElementStyle = style
+                estyle = System.Windows.Style(clr.GetClrType(WC.TextBox))
+                estyle.Setters.Add(System.Windows.Setter(WC.TextBox.FlowDirectionProperty,
+                                                          System.Windows.FlowDirection.RightToLeft))
+                col.EditingElementStyle = estyle
             grid.Columns.Add(col)
         for label, key, w in std_cols:
             col = WC.DataGridTextColumn()
@@ -2342,10 +2625,138 @@ class ProjectBasePointsDialog(object):
             grid.Columns.Add(col)
 
         grid.ItemsSource = dt.DefaultView
+        self._preview_grid = grid
+        self._restore_preview_selection()
         card = _card()
         card.Child = grid
         parent.Children.Add(card)
         self._preview_grid_card = card
+
+    def _on_preview_selection_changed(self, sender, e):
+        if self._syncing:  # a programmatic reselect from _restore_preview_selection
+            return
+        ids = set()
+        for item in self._preview_grid.SelectedItems:
+            try:
+                ids.add(int(item["Id"]))
+            except Exception:
+                pass
+        self._preview_selected_ids = ids
+        self._refresh_preview_bulk_bar()
+
+    def _restore_preview_selection(self):
+        """Same reason as the Results grid's _restore_grid_selection: every
+        edit rebuilds this DataTable from scratch (fresh DataRowView
+        instances), which would otherwise silently drop the native selection
+        highlight even though self._preview_selected_ids (plain Python
+        state) survives the rebuild fine."""
+        self._syncing = True
+        try:
+            grid = self._preview_grid
+            grid.SelectedItems.Clear()
+            if self._preview_selected_ids:
+                for rv in self._preview_table.DefaultView:
+                    if int(rv["Id"]) in self._preview_selected_ids:
+                        grid.SelectedItems.Add(rv)
+        finally:
+            self._syncing = False
+
+    def _build_preview_bulk_bar(self, parent):
+        # A stable, already-parented container that _refresh_preview_bulk_bar
+        # clears and refills IN PLACE (same object, same position) -- same
+        # approach as the Results grid's self._bulk_bar. Avoids ever having
+        # to remove/reinsert a child into `parent` to reposition it.
+        holder = WC.StackPanel()
+        parent.Children.Add(holder)
+        self._preview_bulk_holder = holder
+        self._refresh_preview_bulk_bar()
+
+    def _refresh_preview_bulk_bar(self):
+        bar = self._preview_bulk_holder
+        bar.Children.Clear()
+        n = len(self._preview_selected_ids)
+
+        row1 = _hbox()
+        row1.Margin = System.Windows.Thickness(0, 0, 0, 6)
+        select_all_btn = WC.Button()
+        select_all_btn.Content = u"Select all"
+        select_all_btn.ToolTip = u"Select every row in the preview, for bulk-editing any field at once"
+        select_all_btn.Style = self._window.FindResource("GhostBtn")
+        def on_select_all(s, e):
+            self._preview_grid.SelectAll()
+        select_all_btn.Click += on_select_all
+        row1.Children.Add(select_all_btn)
+        if n:
+            label = _tb(u"{} row{} selected".format(n, "" if n == 1 else "s"), size=12, color=NAVY, bold=True)
+            label.VerticalAlignment = System.Windows.VerticalAlignment.Center
+            label.Margin = System.Windows.Thickness(10, 0, 0, 0)
+            row1.Children.Add(label)
+            clear_btn = WC.Button()
+            clear_btn.Content = u"Clear selection"
+            clear_btn.Style = self._window.FindResource("GhostBtn")
+            clear_btn.Margin = System.Windows.Thickness(10, 0, 0, 0)
+            def on_clear(s, e):
+                self._preview_selected_ids.clear()
+                self._preview_grid.UnselectAll()
+                self._refresh_preview_bulk_bar()
+            clear_btn.Click += on_clear
+            row1.Children.Add(clear_btn)
+        bar.Children.Add(row1)
+
+        if n and self._preview_bulk_fields:
+            row2 = _hbox()
+            row2.Children.Add(_tb(u"Set", size=12.5, color="#374151", margin=(0, 0, 6, 0)))
+            field_combo = WC.ComboBox()
+            field_combo.Width = 150
+            for _fkey, flabel in self._preview_bulk_fields:
+                field_combo.Items.Add(flabel)
+            keys = [k for k, _l in self._preview_bulk_fields]
+            field_combo.SelectedIndex = keys.index(self._preview_bulk_field) if self._preview_bulk_field in keys else 0
+            def on_field_change(s, e):
+                self._preview_bulk_field = keys[field_combo.SelectedIndex]
+            field_combo.SelectionChanged += on_field_change
+            row2.Children.Add(field_combo)
+            row2.Children.Add(_tb(u"to", size=12.5, color="#374151", margin=(6, 0, 6, 0)))
+            value_box = WC.TextBox()
+            value_box.Width = 200
+            value_box.Text = self._preview_bulk_value
+            def on_value_change(s, e):
+                self._preview_bulk_value = s.Text
+            value_box.TextChanged += on_value_change
+            row2.Children.Add(value_box)
+            apply_btn = WC.Button()
+            apply_btn.Content = u"Apply to {}".format(n)
+            apply_btn.Style = self._window.FindResource("PrimaryBtn")
+            apply_btn.Margin = System.Windows.Thickness(8, 0, 0, 0)
+            apply_btn.Click += self._on_apply_preview_bulk_edit
+            row2.Children.Add(apply_btn)
+            bar.Children.Add(row2)
+
+    def _on_apply_preview_bulk_edit(self, sender, args):
+        try:
+            self._apply_preview_bulk_edit_impl()
+        except Exception:
+            logger.error(traceback.format_exc())
+            System.Windows.MessageBox.Show(
+                u"Bulk edit failed:\n\n" + traceback.format_exc(), u"Project Base Points",
+                System.Windows.MessageBoxButton.OK, System.Windows.MessageBoxImage.Error)
+
+    def _apply_preview_bulk_edit_impl(self):
+        field = self._preview_bulk_field
+        value = self._preview_bulk_value
+        if not field:
+            return
+        role = self._cf_role_for(field) if field in self._preview_fields else None
+        for row_id in self._preview_selected_ids:
+            if role == "discipline":
+                self.acc["rowEdit"].setdefault(row_id, {})["discipline"] = value
+            elif role == "building":
+                self.acc["rowEdit"].setdefault(row_id, {})["building"] = value
+            elif field in self._preview_fields:
+                self.acc["extra"].setdefault(row_id, {})[field] = value
+            else:
+                self.acc["rowEdit"].setdefault(row_id, {})[field] = value
+        self._refresh_issues_panel()
 
     def _safe_col_name(self, name):
         return "C_" + re.sub(r'\W+', '_', name)
@@ -2357,28 +2768,29 @@ class ProjectBasePointsDialog(object):
         row_id = int(row["Id"])
         row_edit = self.acc["rowEdit"].setdefault(row_id, {})
         extra = self.acc["extra"].setdefault(row_id, {})
-        try:
-            row_edit["discipline"] = str(row["Discipline"])
-        except Exception:
-            pass
-        try:
-            row_edit["building"] = str(row["Building"])
-        except Exception:
-            pass
+        # A configured field's OWN column is now the only discipline/building
+        # widget (see _build_preview_grid) -- route its edit to rowEdit under
+        # the ROLE's key ("discipline"/"building", what build_issue_rows and
+        # the exporter read), not into extra[f], which is only for fields
+        # with no role at all.
+        for f in self._preview_fields:
+            role = self._cf_role_for(f)
+            try:
+                val = str(row[self._safe_col_name(f)])
+            except Exception:
+                continue
+            if role == "discipline":
+                row_edit["discipline"] = val
+            elif role == "building":
+                row_edit["building"] = val
+            else:
+                extra[f] = val
         std_map = [("Title", "Title"), ("Description", "Description"), ("Status", "Status"),
                    ("Assigned To", "Assigned To"), ("Category", "Category"), ("Type", "Type"),
                    ("Start Date", "Start Date"), ("Due Date", "Due Date")]
         for label, key in std_map:
             try:
                 row_edit[key] = str(row[self._safe_col_name(key)])
-            except Exception:
-                pass
-        for f in self._preview_fields:
-            role = self._cf_role_for(f)
-            if role:
-                continue
-            try:
-                extra[f] = str(row[self._safe_col_name(f)])
             except Exception:
                 pass
         self._window.Dispatcher.BeginInvoke(System.Action(self._refresh_footer))
@@ -2421,12 +2833,12 @@ class ProjectBasePointsDialog(object):
         if self.exp["formats"].get("html"):
             out = os.path.join(folder, base + ".html")
             pbp_report_html.write_html(self.host_info, scoped, self.tol_mm, self.tol_deg, generated_label, out,
-                                        show_chart=show_chart)
+                                        show_chart=show_chart, heb_override=self.acc["heb"])
             written.append(("Interactive HTML", out))
         if self.exp["formats"].get("pdf"):
             out = os.path.join(folder, base + "_print.html")
             pbp_report_html.write_pdf(self.host_info, scoped, self.tol_mm, self.tol_deg, generated_label, out,
-                                       show_chart=show_chart)
+                                       show_chart=show_chart, heb_override=self.acc["heb"])
             written.append(("Print-ready HTML (Ctrl+P to save as PDF)", out))
 
         issue_count = 0

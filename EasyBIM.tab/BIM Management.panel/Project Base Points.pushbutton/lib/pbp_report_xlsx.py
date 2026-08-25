@@ -99,7 +99,14 @@ def build_issue_rows(rows, acc_config, tol_mm, tol_deg, today=None):
 
         role_list = [x.strip() for x in (a.get("rolesText") or "").split(",") if x.strip()]
         role = a.get("roles", {}).get(disc, guess_role(disc, role_list))
-        assigned = a.get("companies", {}).get(disc, "") if a.get("assigneeType") == "company" else role
+        # Falls back to the guessed Role rather than staying blank when no
+        # Company has been typed yet for THIS discipline in the per-discipline
+        # table (a code freshly appearing in this batch, e.g. one just added
+        # via the Results chart's "unmapped discipline" fix, easily has none
+        # set) -- a role name is a far more useful starting point in the
+        # exported "Assigned To" cell than an empty one nobody would notice
+        # to fill in before importing.
+        assigned = (a.get("companies", {}).get(disc) or role) if a.get("assigneeType") == "company" else role
 
         # Which building/zone this issue is actually about, straight from
         # the (already user-corrected) Bldg key -- so a batch of issues
@@ -121,7 +128,7 @@ def build_issue_rows(rows, acc_config, tol_mm, tol_deg, today=None):
             "Due Date": due, "Start Date": start,
             "Root Cause Category": "", "Root Cause": "",
             "discipline": a.get("heb", {}).get(disc, auto_heb(disc)),
-            "building": r.get("key", ""),
+            "building": r.get("key") or u"?",  # never a bare "" -- "?" matches the parse-miss placeholder elsewhere
             "extra": dict((a.get("extra") or {}).get(r["id"], {})),
         })
     return out
@@ -129,13 +136,23 @@ def build_issue_rows(rows, acc_config, tol_mm, tol_deg, today=None):
 
 def apply_row_edits(issue_rows, acc_config):
     """Hand-edits made in the Preview grid win over the computed value — same
-    precedence as the JS `.map(x => Object.assign(x, rowEdit[x.id] || {}))`.
-    Returns a NEW list; does not mutate `issue_rows`."""
+    precedence as the JS `.map(x => Object.assign(x, rowEdit[x.id] || {}))`,
+    EXCEPT an edit that resolved to "" is treated as "no real edit" and
+    skipped, not as "the user wants this field blank". Without this, any
+    widget that ever pushes a transient/blank value back through a TwoWay
+    binding (several were found and fixed elsewhere in the Preview grid)
+    permanently poisons that field: rowEdit is persisted, so every future
+    rebuild re-applies the stale blank override on top of an otherwise
+    correctly recomputed value, silently and indefinitely -- exactly the
+    "consistent" blank-Discipline/Assigned-To bug reported and re-reported
+    against this screen. Returns a NEW list; does not mutate `issue_rows`."""
     row_edit = acc_config.get("rowEdit") or {}
     result = []
     for x in issue_rows:
         merged = dict(x)
-        merged.update(row_edit.get(x["id"], {}) or {})
+        for k, v in (row_edit.get(x["id"], {}) or {}).items():
+            if v:
+                merged[k] = v
         result.append(merged)
     return result
 
