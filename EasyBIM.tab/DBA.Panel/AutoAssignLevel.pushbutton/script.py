@@ -47,7 +47,6 @@ from System.IO import StringReader
 from System.Xml import XmlReader as SysXmlReader
 
 from pyrevit import revit, script, forms
-from pyrevit.api import AdWindows
 
 doc = revit.doc
 logger = script.get_logger()
@@ -178,15 +177,23 @@ def group_by_category(elements):
 # ─────────────────────────────────────────────────────────────────────────────
 
 def get_element_z(elem):
+    """Returns (z, is_sloped).
+
+    z is the reference height used to pick a target level (the lower
+    endpoint for a curve-based element). is_sloped flags a LocationCurve
+    whose endpoints differ enough that a single Offset value would not
+    correctly represent both ends — writing one anyway risks physically
+    shifting whichever end isn't at the reference height.
+    """
     if hasattr(elem, "Location") and elem.Location:
         if isinstance(elem.Location, DB.LocationPoint):
-            return elem.Location.Point.Z
+            return elem.Location.Point.Z, False
         elif isinstance(elem.Location, DB.LocationCurve):
             p0 = elem.Location.Curve.GetEndPoint(0).Z
             p1 = elem.Location.Curve.GetEndPoint(1).Z
-            return min(p0, p1)
+            return min(p0, p1), abs(p0 - p1) > 0.01
     bbox = elem.get_BoundingBox(None)
-    return bbox.Min.Z if bbox else None
+    return (bbox.Min.Z, False) if bbox else (None, False)
 
 
 def find_associated_level(active_levels, z_coord):
@@ -200,17 +207,10 @@ def find_associated_level(active_levels, z_coord):
     return selected_level
 
 
-def _first_param(elem, bips):
-    for bip in bips:
-        p = elem.get_Parameter(bip)
-        if p:
-            return p
-    return None
-
-
-def _first_writable_param(elem, bips):
-    """First candidate that exists AND is writable; else the first that
-    merely exists (so callers can still detect/report a genuinely locked
+def _first_param(elem, bips, storage_type):
+    """First candidate with the expected StorageType, preferring a
+    writable one; else the first that exists with that StorageType even
+    if locked (so callers can still detect/report a genuinely locked
     parameter), else None.
 
     A family can expose more than one plausible parameter from a
@@ -218,12 +218,15 @@ def _first_writable_param(elem, bips):
     "Offset from Host" on the same unhosted instance) — stopping at
     whichever one happens to exist first, regardless of whether it is
     read-only, can silently pick the wrong one and leave the real,
-    position-driving parameter untouched. Prefer whichever is writable.
+    position-driving parameter untouched. The StorageType check also
+    guards against a same-named/same-BuiltInParameter field that isn't
+    actually the numeric/level field expected here (a mismatch would
+    otherwise throw when .Set() is called with the wrong value type).
     """
     fallback = None
     for bip in bips:
         p = elem.get_Parameter(bip)
-        if p:
+        if p and p.StorageType == storage_type:
             if fallback is None:
                 fallback = p
             if not p.IsReadOnly:
@@ -231,16 +234,18 @@ def _first_writable_param(elem, bips):
     return fallback
 
 
-def _first_writable_named_or_param(elem, names, bips):
+def _first_named_or_param(elem, names, bips, storage_type):
     """Prefer a parameter found by its exact on-screen name (matching
     whatever the user sees in the Properties palette, e.g. "Elevation
     from Level"), falling back to the BuiltInParameter candidate list
-    when no named match is writable."""
+    when no named match is writable. StorageType is checked either way,
+    since Element.LookupParameter can return an arbitrary match if more
+    than one parameter happens to share that display name."""
     for name in names:
         p = elem.LookupParameter(name)
-        if p and not p.IsReadOnly:
+        if p and p.StorageType == storage_type and not p.IsReadOnly:
             return p
-    return _first_writable_param(elem, bips)
+    return _first_param(elem, bips, storage_type)
 
 
 def classify_element(elem):
@@ -289,71 +294,97 @@ def run_assignment(elements, active_levels, process_groups):
     skipped_groups = 0
     skipped_workshare = 0
     skipped_hosted = 0
+    skipped_sloped = 0
+    skipped_errors = 0
 
     try:
         t = DB.Transaction(doc, u"Assign levels")
         t.Start()
 
         for elem in elements:
-            if elem.GroupId != DB.ElementId.InvalidElementId and not process_groups:
-                skipped_groups += 1
+            try:
+                if elem.GroupId != DB.ElementId.InvalidElementId and not process_groups:
+                    skipped_groups += 1
+                    continue
+
+                if doc.IsWorkshared and DB.WorksharingUtils.GetCheckoutStatus(
+                        doc, elem.Id) == DB.CheckoutStatus.OwnedByOtherUser:
+                    skipped_workshare += 1
+                    continue
+
+                z_pos, is_sloped = get_element_z(elem)
+                if z_pos is None:
+                    continue
+
+                target_level = find_associated_level(active_levels, z_pos)
+                tier = classify_element(elem)
+
+                # A single Offset value can't correctly represent both ends
+                # of a sloped run (e.g. a drainage pipe) — writing one
+                # anyway would use the lower endpoint's height for the
+                # whole element and risk shifting whichever end isn't
+                # there. Leave these untouched rather than guess.
+                if is_sloped and tier in (TIER_MEP_CURVE, TIER_FREESTANDING):
+                    skipped_sloped += 1
+                    continue
+
+                level_param = _first_param(
+                    elem, MEP_LEVEL_PARAMS if tier == TIER_MEP_CURVE else LEVEL_PARAMS,
+                    DB.StorageType.ElementId)
+
+                # Hosted/face-based instances only drive physical position
+                # via their host — that does not make the Level parameter
+                # itself uneditable, so they still get their level fixed
+                # (just never an offset write, below). Only elements whose
+                # level parameter is genuinely missing or locked are
+                # skipped here.
+                if level_param is None or level_param.IsReadOnly:
+                    if tier == TIER_HOSTED:
+                        skipped_hosted += 1
+                    continue
+
+                if level_param.AsElementId() == target_level.Id:
+                    continue
+
+                level_param.Set(target_level.Id)
+
+                if tier == TIER_MEP_CURVE:
+                    # Ducts/pipes/cable trays/conduits: recalculate the
+                    # offset so the absolute Z height is preserved under
+                    # the new reference level. Prefer the exact on-screen
+                    # "Offset" field over guessing a BuiltInParameter,
+                    # since a curve can expose more than one offset-shaped
+                    # parameter.
+                    offset_param = _first_named_or_param(
+                        elem, [u"Offset"], MEP_OFFSET_PARAMS, DB.StorageType.Double)
+                    if offset_param and not offset_param.IsReadOnly:
+                        offset_param.Set(z_pos - target_level.Elevation)
+                elif tier == TIER_FREESTANDING:
+                    # Freestanding furniture/equipment/generic models: same
+                    # offset recalculation. Prefer the exact on-screen
+                    # "Elevation from Level" field — an unhosted instance
+                    # can still carry an unrelated, separately-existing
+                    # "Offset from Host" parameter, and picking that one
+                    # instead would leave the real Z-driving parameter
+                    # untouched.
+                    offset_param = _first_named_or_param(
+                        elem, [u"Elevation from Level"], FREESTANDING_OFFSET_PARAMS,
+                        DB.StorageType.Double)
+                    if offset_param and not offset_param.IsReadOnly:
+                        offset_param.Set(z_pos - target_level.Elevation)
+                # TIER_HOSTED: level only — never touch offset, so the
+                # element stays flush against its host wall/ceiling face.
+
+                cat_name = elem.Category.Name
+                updated_stats[cat_name] = updated_stats.get(cat_name, 0) + 1
+                updated_ids.append(elem.Id)
+            except Exception as ex:
+                # One anomalous element (an unexpected parameter type, a
+                # transient API error, etc.) should not roll back every
+                # other change already computed in this run.
+                skipped_errors += 1
+                logger.warning(u"Auto Assign Level: skipped element {} — {}".format(elem.Id, ex))
                 continue
-
-            if doc.IsWorkshared and DB.WorksharingUtils.GetCheckoutStatus(
-                    doc, elem.Id) == DB.CheckoutStatus.OwnedByOtherUser:
-                skipped_workshare += 1
-                continue
-
-            z_pos = get_element_z(elem)
-            if z_pos is None:
-                continue
-
-            target_level = find_associated_level(active_levels, z_pos)
-            tier = classify_element(elem)
-            level_param = _first_writable_param(
-                elem, MEP_LEVEL_PARAMS if tier == TIER_MEP_CURVE else LEVEL_PARAMS)
-
-            # Hosted/face-based instances only drive physical position via
-            # their host — that does not make the Level parameter itself
-            # uneditable, so they still get their level fixed (just never
-            # an offset write, below). Only elements whose level parameter
-            # is genuinely missing or locked are skipped here.
-            if level_param is None or level_param.IsReadOnly:
-                if tier == TIER_HOSTED:
-                    skipped_hosted += 1
-                continue
-
-            if level_param.AsElementId() == target_level.Id:
-                continue
-
-            level_param.Set(target_level.Id)
-
-            if tier == TIER_MEP_CURVE:
-                # Ducts/pipes/cable trays/conduits: recalculate the offset
-                # so the absolute Z height is preserved under the new
-                # reference level. Prefer the exact on-screen "Offset"
-                # field over guessing a BuiltInParameter, since a curve
-                # can expose more than one offset-shaped parameter.
-                offset_param = _first_writable_named_or_param(elem, [u"Offset"], MEP_OFFSET_PARAMS)
-                if offset_param and not offset_param.IsReadOnly:
-                    offset_param.Set(z_pos - target_level.Elevation)
-            elif tier == TIER_FREESTANDING:
-                # Freestanding furniture/equipment/generic models: same
-                # offset recalculation. Prefer the exact on-screen
-                # "Elevation from Level" field — an unhosted instance can
-                # still carry an unrelated, separately-existing "Offset
-                # from Host" parameter, and picking that one instead would
-                # leave the real Z-driving parameter untouched.
-                offset_param = _first_writable_named_or_param(
-                    elem, [u"Elevation from Level"], FREESTANDING_OFFSET_PARAMS)
-                if offset_param and not offset_param.IsReadOnly:
-                    offset_param.Set(z_pos - target_level.Elevation)
-            # TIER_HOSTED: level only — never touch offset, so the element
-            # stays flush against its host wall/ceiling face.
-
-            cat_name = elem.Category.Name
-            updated_stats[cat_name] = updated_stats.get(cat_name, 0) + 1
-            updated_ids.append(elem.Id)
 
         t.Commit()
         tg.Assimilate()
@@ -363,6 +394,8 @@ def run_assignment(elements, active_levels, process_groups):
             u"skipped_groups": skipped_groups,
             u"skipped_workshare": skipped_workshare,
             u"skipped_hosted": skipped_hosted,
+            u"skipped_sloped": skipped_sloped,
+            u"skipped_errors": skipped_errors,
         }
     except Exception:
         tg.RollBack()
@@ -397,6 +430,10 @@ def print_console_report(result):
         output.print_md(u"Skipped **{}** element(s) checked out by another user.".format(result[u"skipped_workshare"]))
     if result[u"skipped_hosted"]:
         output.print_md(u"Skipped **{}** element(s) whose level is locked to their host (e.g. doors/windows).".format(result[u"skipped_hosted"]))
+    if result[u"skipped_sloped"]:
+        output.print_md(u"Skipped **{}** sloped run(s) (e.g. drainage pipes) — a single Offset value can't represent both ends safely.".format(result[u"skipped_sloped"]))
+    if result[u"skipped_errors"]:
+        output.print_md(u"Skipped **{}** element(s) due to an unexpected error — see the pyRevit log for details.".format(result[u"skipped_errors"]))
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -1350,6 +1387,8 @@ class AutoAssignLevelDialog(object):
             (u"Skipped — inside Model Groups", result[u"skipped_groups"]),
             (u"Skipped — checked out by another user", result[u"skipped_workshare"]),
             (u"Skipped — level locked to host", result[u"skipped_hosted"]),
+            (u"Skipped — sloped run", result[u"skipped_sloped"]),
+            (u"Skipped — unexpected error", result[u"skipped_errors"]),
         ]
         skip_rows = [(label, count) for label, count in skip_rows if count > 0]
         skip_card = w.FindName(u"ResultSkippedCard")
@@ -1415,10 +1454,14 @@ class AutoAssignLevelDialog(object):
         frame = DispatcherFrame()
 
         # Keep the wizard above Revit's main window and always on top —
-        # otherwise it's easy to lose the dialog behind Revit, leaving the
-        # model apparently "stuck" with no visible reason why.
+        # otherwise it's easy to lose the dialog behind Revit, or have it
+        # rendered on top but not actually own input focus, so clicks on
+        # it silently do nothing. UIApplication.MainWindowHandle is the
+        # documented Revit API handle for exactly this (an AdWindows.
+        # ComponentManager-based Owner assignment was found to fail
+        # silently in this same pattern elsewhere in the plugin).
         try:
-            WindowInteropHelper(window).Owner = AdWindows.ComponentManager.ApplicationWindow
+            WindowInteropHelper(window).Owner = revit.uiapp.MainWindowHandle
         except Exception:
             pass
         window.Topmost = True
@@ -1428,6 +1471,7 @@ class AutoAssignLevelDialog(object):
 
         window.Closed += on_closed
         window.Show()
+        window.Activate()
         Dispatcher.PushFrame(frame)
 
 
