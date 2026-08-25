@@ -1,0 +1,10 @@
+title: |-
+  Level
+  Sheets
+tooltip: >-
+  Batch-create a floor plan, ceiling plan and sheet for every selected level —
+  applies the EB_MEP_FP_1-50 / EB_MEP_CP_1-50 templates, renames both views to
+  the EasyBIM standard, and places them together on one sheet per level (RCP
+  above floor plan, aligned to the model).
+author: EasyBIM
+highlight: new
