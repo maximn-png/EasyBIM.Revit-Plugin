@@ -17,12 +17,20 @@ Scope can be limited to:
   - Entire Model       — every duplicate group in the project
 
 For each group, the element with the lowest Element Id is kept (treated as
-the original) and the rest are deleted. Pinned elements and elements that
-belong to a Group are skipped rather than force-deleted, since both cases
-require the user to make an explicit decision first.
+the original) and the rest are deleted. Before anything is deleted, the
+candidate list is shown in a review screen so items can be unchecked.
+
+Group instances get special treatment: if every member of a Model Group
+instance is itself flagged as a duplicate of a member in one specific other
+Group instance, the whole duplicate Group instance is deleted as a unit
+(rather than leaving orphaned members behind). Elements that belong to a
+Group but are only *partially* duplicated are skipped, since resolving that
+requires the user to edit the group directly. Pinned elements are skipped
+too.
 """
 
 import clr
+from collections import defaultdict
 
 clr.AddReference('RevitAPI')
 clr.AddReference('RevitAPIUI')
@@ -74,10 +82,25 @@ def get_scope_ids(scope):
 
 
 def find_duplicates_to_delete(scope_ids):
-    """Return (groups_in_scope, {IntegerValue: ElementId} to delete)."""
+    """Scan Revit's own duplicate-instance warnings and sort the failing
+    elements into what can be safely deleted.
+
+    Returns:
+        groups_in_scope  - number of duplicate-instance warnings processed
+        element_deletes  - {IntegerValue: ElementId} standalone elements
+        group_deletes    - {IntegerValue: ElementId} whole Group instances
+                            whose every member duplicates another group
+        skipped_grouped  - [(ElementId, reason)] grouped elements that are
+                            only *partially* duplicated and can't be safely
+                            auto-resolved
+    """
     to_delete = {}
     to_keep = set()
     groups_in_scope = 0
+
+    # dup group IntegerValue -> set of that group's member IntegerValues
+    # seen as duplicates
+    group_dup_members = defaultdict(set)
 
     for msg in doc.GetWarnings():
         if not is_duplicate_warning(msg):
@@ -96,23 +119,127 @@ def find_duplicates_to_delete(scope_ids):
         to_keep.add(keep.IntegerValue)
         for eid in dupes:
             to_delete[eid.IntegerValue] = eid
+            dup_elem = doc.GetElement(eid)
+            if dup_elem is not None and dup_elem.GroupId != DB.ElementId.InvalidElementId:
+                group_dup_members[dup_elem.GroupId.IntegerValue].add(eid.IntegerValue)
 
     # An element already kept as "the original" for one group must never be
     # deleted, even if it also shows up as a duplicate in another group.
     for kept_id in to_keep:
         to_delete.pop(kept_id, None)
 
-    return groups_in_scope, to_delete
+    # Promote a Group instance to a whole-group deletion when every one of
+    # its members was independently flagged as a duplicate — that means the
+    # entire group instance is a copy of another group sitting in the same
+    # place, so it can be deleted as a unit instead of leaving it hollowed
+    # out with dangling members.
+    group_deletes = {}
+    for gid, dup_member_ids in group_dup_members.items():
+        if gid in to_keep:
+            continue  # this instance was itself treated as "the original" elsewhere
+        group_elem_id = DB.ElementId(gid)
+        group_elem = doc.GetElement(group_elem_id)
+        if group_elem is None or not isinstance(group_elem, DB.Group):
+            continue
+        member_ids = set(m.IntegerValue for m in group_elem.GetMemberIds())
+        if member_ids and member_ids.issubset(dup_member_ids):
+            group_deletes[gid] = group_elem_id
+            for mid in member_ids:
+                to_delete.pop(mid, None)
+
+    # Whatever is left in to_delete but still belongs to a group is only a
+    # *partial* duplicate of that group — deleting individual members would
+    # corrupt the group, so leave it for the user to resolve by hand.
+    skipped_grouped = []
+    for iv in list(to_delete.keys()):
+        eid = to_delete[iv]
+        elem = doc.GetElement(eid)
+        if elem is not None and elem.GroupId != DB.ElementId.InvalidElementId:
+            skipped_grouped.append((eid, "part of a group that is only partially duplicated"))
+            del to_delete[iv]
+
+    return groups_in_scope, to_delete, group_deletes, skipped_grouped
 
 
-def delete_elements(to_delete):
-    """Delete each candidate element inside a single transaction, skipping
-    elements that can't be safely deleted (pinned / grouped) and recording
-    anything Revit itself refuses."""
+class PreviewItem(object):
+    """One row in the pre-deletion review list. str(item) is what the user
+    sees; is_group tells main() which bucket to put it back into once the
+    user confirms their selection."""
+
+    def __init__(self, eid, label, is_group=False):
+        self.eid = eid
+        self.label = label
+        self.is_group = is_group
+
+    def __str__(self):
+        return self.label
+
+
+def describe_element(eid):
+    elem = doc.GetElement(eid)
+    cat_name = elem.Category.Name if elem and elem.Category else "Unknown category"
+    return "{}  —  Id {}".format(cat_name, eid.IntegerValue)
+
+
+def describe_group(eid):
+    group_elem = doc.GetElement(eid)
+    member_count = len(list(group_elem.GetMemberIds()))
+    type_id = group_elem.GetTypeId()
+    type_name = doc.GetElement(type_id).Name if type_id != DB.ElementId.InvalidElementId else "Group"
+    return "Group '{}'  —  Id {} ({} member{})".format(
+        type_name, eid.IntegerValue, member_count, "" if member_count == 1 else "s"
+    )
+
+
+def build_preview_items(element_deletes, group_deletes):
+    items = [PreviewItem(eid, describe_group(eid), is_group=True) for eid in group_deletes.values()]
+    items += [PreviewItem(eid, describe_element(eid), is_group=False) for eid in element_deletes.values()]
+    return items
+
+
+def review_candidates(element_deletes, group_deletes):
+    """Show the pending deletions and let the user uncheck anything before
+    committing. Returns (selected_element_ids, selected_group_ids), both
+    empty if the user cancelled."""
+    preview_items = build_preview_items(element_deletes, group_deletes)
+    checked_items = [forms.TemplateListItem(pi, checked=True) for pi in preview_items]
+
+    selected = forms.SelectFromList.show(
+        checked_items,
+        title="Delete Duplicates — Review Before Deleting",
+        multiselect=True,
+        button_name="Delete Selected",
+    )
+    if not selected:
+        return [], []
+
+    selected_element_ids = [pi.eid for pi in selected if not pi.is_group]
+    selected_group_ids = [pi.eid for pi in selected if pi.is_group]
+    return selected_element_ids, selected_group_ids
+
+
+def delete_elements(element_ids, group_ids):
+    """Delete the confirmed candidates inside a single transaction, skipping
+    anything that can't be safely deleted and recording anything Revit
+    itself refuses. Groups are deleted first so their members don't show up
+    as "already gone" noise in the report."""
     deleted, skipped = [], []
 
     with revit.Transaction("Delete Duplicate Elements"):
-        for eid in to_delete.values():
+        for eid in group_ids:
+            group_elem = doc.GetElement(eid)
+            if group_elem is None:
+                continue  # already gone
+            try:
+                result = doc.Delete(eid)
+                if result and result.Count > 0:
+                    deleted.append(eid)
+                else:
+                    skipped.append((eid, "Revit did not delete it"))
+            except Exception as ex:
+                skipped.append((eid, str(ex)))
+
+        for eid in element_ids:
             element = doc.GetElement(eid)
             if element is None:
                 continue  # already gone (e.g. cascade-deleted with an earlier duplicate)
@@ -140,16 +267,16 @@ def print_report(scope, groups_in_scope, deleted, skipped):
     output.print_md("# Delete Duplicate Elements — Report")
     output.print_md("**Scope:** {}".format(scope))
     output.print_md("**Duplicate groups processed:** {}".format(groups_in_scope))
-    output.print_md("**Elements deleted:** {}".format(len(deleted)))
-    output.print_md("**Elements skipped:** {}".format(len(skipped)))
+    output.print_md("**Elements/groups deleted:** {}".format(len(deleted)))
+    output.print_md("**Elements/groups skipped:** {}".format(len(skipped)))
 
     if deleted:
-        output.print_md("### Deleted Element IDs")
+        output.print_md("### Deleted")
         for eid in deleted:
             output.print_md("- {}".format(output.linkify(eid)))
 
     if skipped:
-        output.print_md("### Skipped Elements")
+        output.print_md("### Skipped")
         for eid, reason in skipped:
             output.print_md("- {} — {}".format(output.linkify(eid), reason))
 
@@ -163,32 +290,27 @@ def main():
         return  # user cancelled
 
     scope_ids = get_scope_ids(scope)
-    groups_in_scope, to_delete = find_duplicates_to_delete(scope_ids)
+    groups_in_scope, element_deletes, group_deletes, skipped_grouped = find_duplicates_to_delete(scope_ids)
 
-    if not to_delete:
+    if not element_deletes and not group_deletes:
         forms.alert(
             "No duplicate elements were found in this scope ({}).".format(scope),
             title="Delete Duplicates",
         )
         return
 
-    confirmed = forms.alert(
-        "Found {} duplicate group(s), {} element(s) to delete.\n\nProceed?".format(
-            groups_in_scope, len(to_delete)
-        ),
-        title="Delete Duplicates",
-        yes=True,
-        no=True,
-    )
-    if not confirmed:
-        return
+    selected_element_ids, selected_group_ids = review_candidates(element_deletes, group_deletes)
+    if not selected_element_ids and not selected_group_ids:
+        return  # user cancelled the review or unchecked everything
 
-    deleted, skipped = delete_elements(to_delete)
+    deleted, skipped = delete_elements(selected_element_ids, selected_group_ids)
+    skipped = skipped + skipped_grouped
+
     print_report(scope, groups_in_scope, deleted, skipped)
 
-    summary = "Deleted {} duplicate element(s).".format(len(deleted))
+    summary = "Deleted {} duplicate element(s)/group(s).".format(len(deleted))
     if skipped:
-        summary += "\n{} element(s) were skipped — see the report window.".format(len(skipped))
+        summary += "\n{} item(s) were skipped — see the report window.".format(len(skipped))
     forms.alert(summary, title="Delete Duplicates")
 
 
