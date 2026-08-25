@@ -66,9 +66,36 @@ MEP_CATEGORIES = [
     DB.BuiltInCategory.OST_ElectricalEquipment,
     DB.BuiltInCategory.OST_ElectricalFixtures,
     DB.BuiltInCategory.OST_LightingFixtures,
-    DB.BuiltInCategory.OST_DuctInsulations,
-    DB.BuiltInCategory.OST_PipeInsulations,
 ]
+# NOTE: OST_DuctInsulations / OST_PipeInsulations are deliberately NOT collected.
+# Revit copies insulation together with its host duct/pipe. Collecting them
+# independently lets the bounding-box filter pick up an insulation whose host
+# falls outside the section volume, and pasting an orphan insulation makes Revit
+# abort the whole CopyElements batch — losing every element from that link.
+
+# Friendly names for the per-category diagnostic tally shown when a link copies 0.
+CATEGORY_LABELS = {
+    DB.BuiltInCategory.OST_DuctCurves:          u"Ducts",
+    DB.BuiltInCategory.OST_DuctFitting:         u"Duct Fittings",
+    DB.BuiltInCategory.OST_DuctAccessory:       u"Duct Accessories",
+    DB.BuiltInCategory.OST_PipeCurves:          u"Pipes",
+    DB.BuiltInCategory.OST_PipeFitting:         u"Pipe Fittings",
+    DB.BuiltInCategory.OST_PipeAccessory:       u"Pipe Accessories",
+    DB.BuiltInCategory.OST_CableTray:           u"Cable Trays",
+    DB.BuiltInCategory.OST_CableTrayFitting:    u"Cable Tray Fittings",
+    DB.BuiltInCategory.OST_Conduit:             u"Conduits",
+    DB.BuiltInCategory.OST_ConduitFitting:      u"Conduit Fittings",
+    DB.BuiltInCategory.OST_MechanicalEquipment: u"Mechanical Equipment",
+    DB.BuiltInCategory.OST_PlumbingFixtures:    u"Plumbing Fixtures",
+    DB.BuiltInCategory.OST_ElectricalEquipment: u"Electrical Equipment",
+    DB.BuiltInCategory.OST_ElectricalFixtures:  u"Electrical Fixtures",
+    DB.BuiltInCategory.OST_LightingFixtures:    u"Lighting Fixtures",
+}
+
+# Elements are copied in batches this size. Small enough that one un-copyable
+# element only costs its own batch, large enough to stay fast on big sections.
+COPY_BATCH_SIZE = 200
+
 
 # ─────────────────────────────────────────────────────────────────────────────
 # DATA GATHERING
@@ -230,51 +257,571 @@ def get_or_create_workset(name):
 # ─────────────────────────────────────────────────────────────────────────────
 
 def get_existing_stamped_uids():
+    """UniqueIds of every source already copied into this model.
+
+    Matches the stamp ANYWHERE in Comments, not only at the start: a copy whose
+    source carried its own comment keeps that text, with the stamp appended after
+    it. Reading only the start would miss those and copy them again every run.
+    """
     uids = set()
     collector = DB.FilteredElementCollector(doc).WhereElementIsNotElementType()
     for elem in collector:
         try:
             p = elem.get_Parameter(DB.BuiltInParameter.ALL_MODEL_INSTANCE_COMMENTS)
-            if p:
-                val = p.AsString()
-                if val and val.startswith(EB_SS_PREFIX):
-                    for uid_part in val[len(EB_SS_PREFIX):].split(u"|"):
-                        uid_part = uid_part.strip()
-                        if uid_part:
-                            uids.add(uid_part)
+            if not p:
+                continue
+            val = p.AsString()
+            if not val or EB_SS_PREFIX not in val:
+                continue
+            stamp = val.partition(EB_SS_PREFIX)[2]
+            for uid_part in stamp.split(u"|"):
+                uid_part = uid_part.strip()
+                if uid_part:
+                    uids.add(uid_part)
         except Exception:
             pass
     return uids
 
 
 def stamp_element(elem, source_uid):
+    """Record which source element this copy came from, in Instance Comments.
+
+    The stamp is what skip-duplicates reads on later runs, so failing to write it
+    means the source gets copied again every time. It therefore has to survive a
+    copy that already carries a comment of its own: linked elements often do, and
+    that comment comes across with the copy. The stamp is appended after any
+    existing text rather than replacing it, and an existing stamp is merged.
+    """
     try:
         p = elem.get_Parameter(DB.BuiltInParameter.ALL_MODEL_INSTANCE_COMMENTS)
-        if p and not p.IsReadOnly:
-            existing = p.AsString() or u""
-            if existing.startswith(EB_SS_PREFIX):
-                parts = set(u.strip() for u in existing[len(EB_SS_PREFIX):].split(u"|") if u.strip())
-                parts.add(source_uid)
-                p.Set(EB_SS_PREFIX + u"|".join(sorted(parts)))
-            elif not existing:
-                p.Set(EB_SS_PREFIX + source_uid)
-    except Exception:
-        pass
+        if p is None or p.IsReadOnly:
+            logger.debug(u"Cannot stamp element {}: Comments unavailable."
+                         .format(elem.Id))
+            return
+        existing = p.AsString() or u""
+
+        if EB_SS_PREFIX in existing:
+            # Merge into the stamp already present, keeping any leading text.
+            head, _, stamp = existing.partition(EB_SS_PREFIX)
+            uids = set(u.strip() for u in stamp.split(u"|") if u.strip())
+            uids.add(source_uid)
+            p.Set(head + EB_SS_PREFIX + u"|".join(sorted(uids)))
+        elif existing:
+            # The copy inherited a comment from its source. Keep it and append.
+            p.Set(u"{} {}{}".format(existing, EB_SS_PREFIX, source_uid))
+        else:
+            p.Set(EB_SS_PREFIX + source_uid)
+    except Exception as ex:
+        logger.debug(u"Cannot stamp element {}: {}".format(elem.Id, ex))
 
 # ─────────────────────────────────────────────────────────────────────────────
 # CORE OPERATION
 # ─────────────────────────────────────────────────────────────────────────────
 
-def collect_mep_ids_in_volume(link_doc, host_crop_box, link_transform):
-    """Collect MEP element IDs from a linked model within the section volume.
+class _UseDestinationTypes(DB.IDuplicateTypeNamesHandler):
+    """Answer Revit's "duplicate types" question without a modal dialog.
 
-    CropBox.Min/Max are in the box's LOCAL coordinate system, not world space.
-    Apply CropBox.Transform first to get world corners, then transform to link space.
+    CopyPasteOptions with no handler makes Revit try to ask the user which type
+    to keep. It cannot show that dialog from an API transaction, so it aborts the
+    entire CopyElements call — the most common reason a whole link copies zero.
+    Keeping the destination types is right here: the host model's own MEP types
+    win, and the copies stay consistent with what is already in the project.
+    """
+    def OnDuplicateTypeNamesFound(self, args):
+        return DB.DuplicateTypeAction.UseDestinationTypes
+
+
+def _copy_options():
+    opts = DB.CopyPasteOptions()
+    opts.SetDuplicateTypeNamesHandler(_UseDestinationTypes())
+    return opts
+
+
+def copy_elements_resilient(link_doc, src_ids, transform):
+    """Copy src_ids into the host doc, surviving individual un-copyable elements.
+
+    Returns (pairs, failed_count) where pairs is a list of (source_id, new_id)
+    tuples. Batching means one bad element costs only its own batch, which is
+    then retried element-by-element so the rest still get through — instead of
+    the all-or-nothing single call that silently lost entire links.
+
+    On the source→copy mapping: CopyElements returns the requested copies in
+    input order, with any dependents Revit brought along interleaved or appended.
+    Duct and pipe INSULATION is the common dependent, so a returned count larger
+    than the batch is normal, not an error. Returned ids are walked in order and
+    each is paired with the next unmatched source whose category it shares;
+    anything that does not match is a dependent and is kept unpaired.
+
+    A batch that succeeded is NEVER re-copied, whatever its shape — the copies
+    already exist, and copying again would duplicate them. Only a batch that
+    threw is retried, because then nothing was created.
+
+    Getting this right matters beyond tidiness: an unpaired copy cannot be
+    stamped, an unstamped copy is invisible to skip-duplicates, and every later
+    run copies its source again — piling duplicates into the model.
+    """
+    opts  = _copy_options()
+    pairs = []
+    failed = 0
+
+    def _copy_batch(batch):
+        id_list = SCG.List[DB.ElementId](batch)
+        return list(DB.ElementTransformUtils.CopyElements(
+            link_doc, id_list, doc, transform, opts))
+
+    def _align(batch, new_ids):
+        """Pair returned ids with sources, tolerating dependents and reordering.
+
+        Sources arrive grouped by category, and CopyElements returns the copies
+        plus dependents (insulation above all) whose order is not guaranteed. A
+        strict positional walk stalls the moment the two sequences diverge, and
+        every remaining element in the batch then goes unpaired and unstamped.
+
+        Instead each returned id is matched against the first source of the SAME
+        category that is still unclaimed. Dependents claim nothing, and a single
+        out-of-order element no longer poisons the rest of the batch.
+        """
+        by_cat = {}
+        for i, sid in enumerate(batch):
+            try:
+                el = link_doc.GetElement(sid)
+                cid = el.Category.Id.IntegerValue if (
+                    el is not None and el.Category is not None) else None
+            except Exception:
+                cid = None
+            by_cat.setdefault(cid, []).append(i)
+
+        claimed = [False] * len(batch)
+        out = []
+        for nid in new_ids:
+            try:
+                n = doc.GetElement(nid)
+                ncid = n.Category.Id.IntegerValue if (
+                    n is not None and n.Category is not None) else None
+            except Exception:
+                ncid = None
+
+            match = None
+            for i in by_cat.get(ncid, ()):
+                if not claimed[i]:
+                    match = i
+                    break
+            if match is None:
+                out.append((None, nid))         # a dependent, or an extra
+            else:
+                claimed[match] = True
+                out.append((batch[match], nid))
+
+        missed = claimed.count(False)
+        if missed:
+            logger.debug(u"{} of {} elements in a batch could not be paired "
+                         u"with a copy; they stay unstamped."
+                         .format(missed, len(batch)))
+        return out
+
+    for start in range(0, len(src_ids), COPY_BATCH_SIZE):
+        batch = src_ids[start:start + COPY_BATCH_SIZE]
+        try:
+            new_ids = _copy_batch(batch)
+        except Exception as ex:
+            # Nothing was created, so retrying individually cannot duplicate.
+            logger.debug(u"Batch copy of {} elements failed ({}); "
+                         u"retrying one by one".format(len(batch), ex))
+            for eid in batch:
+                try:
+                    one = _copy_batch([eid])
+                except Exception as ex_one:
+                    failed += 1
+                    logger.debug(u"Element {} could not be copied: {}".format(
+                        eid, ex_one))
+                    continue
+                pairs.extend(_align([eid], one))
+            continue
+
+        pairs.extend(_align(batch, new_ids))
+
+    return pairs, failed
+
+
+def link_shown_in_view(host_view, link_instance):
+    """Does host_view display this link at all?
+
+    Purely informational — the capture volume is geometric by design, so this
+    never changes what gets copied. It exists because the two are independent:
+    the wizard offers every loaded link, while the existing section draws only
+    the links its Visibility/Graphics permits. Copy from a link the section does
+    not draw and the solution section gains elements that are nowhere to be seen
+    in the existing one, which reads as if they came from nothing.
+
+    Returns True (shown), False (hidden), or None when it cannot be determined —
+    the per-link visibility API is not uniform across Revit versions, and a
+    wrong guess here must never be presented as fact.
+    """
+    if host_view is None or link_instance is None:
+        return None
+
+    # Whole "Revit Links" category switched off in the view.
+    try:
+        if host_view.GetCategoryHidden(
+                DB.ElementId(DB.BuiltInCategory.OST_RvtLinks)):
+            return False
+    except Exception:
+        pass
+
+    # This particular link instance hidden in this view.
+    try:
+        return not link_instance.IsHidden(host_view)
+    except Exception:
+        return None
+def category_visibility_diff(existing_view, solution_view):
+    """Which MEP categories the two sections disagree about.
+
+    The existing section draws linked elements; the solution section draws the
+    copies as native host elements. Both are governed by the same Model
+    Categories switches, but each view gets them from its OWN template. Where
+    the templates disagree, an element can be captured, copied, and then drawn in
+    the solution section while the existing section hides it — which reads as an
+    element that exists nowhere.
+
+    Returns (only_in_solution, only_in_existing) as lists of friendly names.
+    Read-only: nothing here changes visibility, it only reports the difference.
+    """
+    only_sol, only_exist = [], []
+    for cat in MEP_CATEGORIES:
+        label = CATEGORY_LABELS.get(cat, unicode(cat))
+        try:
+            cid = DB.ElementId(cat)
+            hid_e = existing_view.GetCategoryHidden(cid)
+            hid_s = solution_view.GetCategoryHidden(cid)
+        except Exception:
+            continue        # category absent in this model — nothing to compare
+        if hid_e and not hid_s:
+            only_sol.append(label)
+        elif hid_s and not hid_e:
+            only_exist.append(label)
+    return only_sol, only_exist
+VIEW_DIFF_PARAMS = (
+    (DB.BuiltInParameter.VIEW_PHASE,        u"Phase"),
+    (DB.BuiltInParameter.VIEW_PHASE_FILTER, u"Phase Filter"),
+    (DB.BuiltInParameter.VIEW_DISCIPLINE,   u"Discipline"),
+    (DB.BuiltInParameter.VIEW_DETAIL_LEVEL, u"Detail Level"),
+    (DB.BuiltInParameter.VIEW_MODEL_DISPLAY_MODE, u"Display Model"),
+)
+
+
+def _link_override_host(view):
+    """The view that actually owns link graphical overrides.
+
+    A view controlled by a template does not own its link overrides — the
+    template does, and asking the view throws "The view does not support link
+    graphical overrides." Resolve to the template when one is applied.
+    """
+    if view is None:
+        return None
+    try:
+        tid = view.ViewTemplateId
+        if tid and tid != DB.ElementId.InvalidElementId:
+            tmpl = doc.GetElement(tid)
+            if tmpl is not None:
+                return tmpl
+    except Exception:
+        pass
+    return view
+def _param_text(view, bip):
+    """Human-readable value of a view parameter, or None."""
+    try:
+        p = view.get_Parameter(bip)
+        if p is None:
+            return None
+        s = p.AsValueString()
+        if s:
+            return s
+        if p.StorageType == DB.StorageType.ElementId:
+            el = doc.GetElement(p.AsElementId())
+            return el.Name if el is not None else unicode(p.AsElementId())
+        return unicode(p.AsInteger())
+    except Exception:
+        return None
+
+
+def _hidden_worksets(view):
+    """Names of worksets explicitly hidden in this view, or None if unavailable."""
+    try:
+        if not doc.IsWorkshared:
+            return []
+        hidden = []
+        for ws in DB.FilteredWorksetCollector(doc).OfKind(DB.WorksetKind.UserWorkset):
+            try:
+                vis = view.GetWorksetVisibility(ws.Id)
+                if vis == DB.WorksetVisibility.Hidden:
+                    hidden.append(ws.Name)
+            except Exception:
+                continue
+        return sorted(hidden)
+    except Exception:
+        return None
+
+
+def _filter_states(view):
+    """{filter name: visible?} for every filter applied to the view.
+
+    Comparing filter NAMES is not enough: two views routinely carry the same
+    filter set with different on/off states, and a filter switched off in one
+    view and on in the other hides elements in one section only.
+    """
+    try:
+        states = {}
+        for fid in view.GetFilters():
+            f = doc.GetElement(fid)
+            nm = f.Name if f is not None else unicode(fid)
+            try:
+                states[nm] = view.GetFilterVisibility(fid)
+            except Exception:
+                states[nm] = None
+        return states
+    except Exception:
+        return None
+
+
+def _workset_visibility(view, name):
+    """Visibility of one named workset in this view, as text."""
+    try:
+        if not doc.IsWorkshared:
+            return u"model is not workshared"
+        for ws in DB.FilteredWorksetCollector(doc).OfKind(DB.WorksetKind.UserWorkset):
+            if ws.Name == name:
+                return unicode(view.GetWorksetVisibility(ws.Id))
+        return u"workset not found"
+    except Exception as ex:
+        return u"could not be read ({})".format(ex)
+def report_view_differences(existing_view, solution_view, link_instances):
+    """Log everything that can make these two sections draw different things.
+
+    Category visibility, link visibility and clip depth are checked elsewhere.
+    This covers the rest: phase and phase filter (elements are created in the
+    host's phase, which need not be the phase the existing section shows),
+    view filters (they act on elements, not categories, so a category comparison
+    cannot see them), workset visibility (copies land on "MEP Solution" while the
+    originals sit on the link's own worksets), and how each link is displayed.
+
+    Read-only. Nothing here changes the model or either view.
+    """
+    logger.debug(u"── Section comparison: '{}' vs '{}' ──".format(
+        existing_view.Name, solution_view.Name))
+
+    for bip, label in VIEW_DIFF_PARAMS:
+        a = _param_text(existing_view, bip)
+        b = _param_text(solution_view, bip)
+        if a != b:
+            logger.debug(u"  {}: existing = {} | solution = {}  <-- DIFFERS"
+                           .format(label, a, b))
+        else:
+            logger.debug(u"  {}: {}".format(label, a))
+
+    sa, sb = _filter_states(existing_view), _filter_states(solution_view)
+    if sa is None or sb is None:
+        logger.debug(u"  View filters: could not be read")
+    else:
+        diffs = []
+        for nm in sorted(set(list(sa.keys()) + list(sb.keys()))):
+            va, vb = sa.get(nm, u"absent"), sb.get(nm, u"absent")
+            if va != vb:
+                diffs.append(u"{}: existing={} solution={}".format(nm, va, vb))
+        if diffs:
+            logger.debug(u"  FILTER VISIBILITY DIFFERS on {} filter(s):"
+                           .format(len(diffs)))
+            for d in diffs:
+                logger.debug(u"      {}".format(d))
+            logger.debug(u"  ^^ These are the most likely cause: a filter "
+                           u"switched off in one section and on in the other "
+                           u"hides elements in one view only.")
+        else:
+            logger.debug(u"  View filters: {} applied, visibility identical"
+                           .format(len(sa)))
+
+    wa, wb = _hidden_worksets(existing_view), _hidden_worksets(solution_view)
+    if wa is None or wb is None:
+        logger.debug(u"  Hidden worksets: could not be read")
+    elif wa != wb:
+        logger.debug(u"  Hidden worksets DIFFER: existing = {} | solution = {}"
+                       .format(wa or u"none", wb or u"none"))
+    else:
+        logger.debug(u"  Hidden worksets: {}".format(wa or u"none"))
+
+    # Reported for information only. GetWorksetVisibility returns the VIEW's own
+    # setting, which is stale and misleading when a template controls worksets —
+    # this reported Hidden for a view that demonstrably displays the copies, so
+    # no conclusion is drawn from it.
+    sol_ws_e = _workset_visibility(existing_view, SOLUTION_WORKSET)
+    sol_ws_s = _workset_visibility(solution_view, SOLUTION_WORKSET)
+    logger.debug(u"  Workset '{}' (view-level value, may be overridden by the "
+                   u"template): existing = {} | solution = {}".format(
+                       SOLUTION_WORKSET, sol_ws_e, sol_ws_s))
+
+    for li in link_instances or []:
+        try:
+            s = _link_override_host(existing_view).GetLinkOverrides(li.Id)
+            mode = unicode(s.LinkVisibilityType) if s is not None else u"default"
+        except Exception as ex:
+            mode = u"could not be read ({}: {})".format(type(ex).__name__, ex)
+        logger.debug(u"  Link '{}' displayed as: {}".format(li.Name, mode))
+
+    logger.debug(u"── end comparison ──")
+def link_display_mode(host_view, link_instance, link_doc):
+    """How host_view draws this link: (mode, linked_view).
+
+    mode is one of "link view", "host view", "custom" or "unknown".
+    linked_view is the view inside link_doc that governs what is drawn, and is
+    only non-None for "link view" — the one case where visibility can be
+    resolved exactly, by collecting through that view.
+    """
+    if host_view is None or link_instance is None:
+        return u"unknown", None
+    try:
+        settings = _link_override_host(host_view).GetLinkOverrides(link_instance.Id)
+    except Exception:
+        return u"unknown", None
+    if settings is None:
+        return u"host view", None
+    try:
+        vis = settings.LinkVisibilityType
+        if vis == DB.LinkVisibility.ByLinkView:
+            vid = settings.LinkedViewId
+            if vid and vid != DB.ElementId.InvalidElementId:
+                lv = link_doc.GetElement(vid)
+                if lv is not None:
+                    return u"link view", lv
+            return u"link view", None
+        if vis == DB.LinkVisibility.ByHostView:
+            return u"host view", None
+        return u"custom", None
+    except Exception:
+        return u"unknown", None
+
+
+def link_design_option_id(link_instance, link_doc):
+    """The design option the host displays this link through, as an ElementId.
+
+    A linked model can carry several design options, and the link instance in the
+    host decides which one is drawn. A document-wide collector ignores that
+    entirely and returns elements from EVERY option — which is how a section can
+    gain a duct that the design does not actually contain, clashing with the real
+    one.
+
+    Returns:
+        ElementId  the option whose elements should be captured
+        None       no option set on the link, or it could not be read; the caller
+                   then keeps main-model elements and skips all option content,
+                   which is reported rather than assumed.
+    """
+    if link_instance is None:
+        return None
+    # The link instance exposes its design option through a parameter on the
+    # instance; the name differs across versions, so try the typed property and
+    # then the built-in parameter.
+    try:
+        opt = link_instance.DesignOption
+        if opt is not None:
+            return opt.Id
+    except Exception:
+        pass
+    for bip in (DB.BuiltInParameter.DESIGN_OPTION_ID,
+                DB.BuiltInParameter.DESIGN_OPTION_PARAM):
+        try:
+            p = link_instance.get_Parameter(bip)
+            if p is not None:
+                oid = p.AsElementId()
+                if oid and oid != DB.ElementId.InvalidElementId:
+                    return oid
+        except Exception:
+            continue
+    return None
+
+
+def _primary_option_ids(link_doc):
+    """ElementIds of the PRIMARY option in each option set of link_doc.
+
+    Used when the link itself names no option: Revit draws the primary of every
+    set in that case, so capturing those matches what is on screen.
+    """
+    ids = set()
+    try:
+        for opt in (DB.FilteredElementCollector(link_doc)
+                      .OfClass(DB.DesignOption)
+                      .ToElements()):
+            try:
+                if opt.IsPrimary:
+                    ids.add(opt.Id.IntegerValue)
+            except Exception:
+                continue
+    except Exception:
+        pass
+    return ids
+
+
+def _element_option_ok(elem, wanted_id, primary_ids):
+    """Is this element in a design option the existing section displays?
+
+    Elements belonging to no option are main-model content and always pass.
+    """
+    try:
+        opt = elem.DesignOption
+    except Exception:
+        return True
+    if opt is None:
+        return True                     # main model — always shown
+    try:
+        oid = opt.Id.IntegerValue
+    except Exception:
+        return True
+    if wanted_id is not None:
+        return oid == wanted_id.IntegerValue
+    return oid in primary_ids
+def visible_categories(host_view):
+    """MEP_CATEGORIES minus those the host view hides."""
+    if host_view is None:
+        return list(MEP_CATEGORIES)
+    vis = []
+    for cat in MEP_CATEGORIES:
+        try:
+            if host_view.GetCategoryHidden(DB.ElementId(cat)):
+                continue
+        except Exception:
+            pass        # not answerable for this category — keep it
+        vis.append(cat)
+    return vis
+
+
+def collect_mep_ids_in_volume(link_doc, host_crop_box, link_transform,
+                              host_view=None, link_instance=None):
+    """Collect MEP element IDs a linked model SHOWS inside the section volume.
+
+    Two conditions, both required:
+
+    * Geometry — the element overlaps the existing section's CropBox volume.
+      CropBox.Min/Max are in the box's LOCAL coordinate system, so corners go
+      local → world → link space for the Revit-side prefilter, and each candidate
+      is re-tested in section space where the volume is exactly axis-aligned.
+    * Visibility — the existing section actually draws the element. Elements
+      hidden by the link's display properties are NOT captured.
+
+    Resolving visibility of linked elements is not uniform, so fidelity is
+    reported rather than assumed:
+
+    * "link view"  — the section shows the link through a linked view. Collecting
+                     through that view is exact: its hidden categories, filters
+                     and hidden elements all apply.
+    * "host view"  — the host view's own category visibility applies. Per-element
+                     hiding and view filters inside the link are NOT evaluated.
+    * "custom"/"unknown" — same treatment as "host view", flagged as approximate.
+
+    Returns (ids, tally, mode).
     """
     try:
         inv = link_transform.Inverse
     except Exception:
-        return []
+        logger.warning(u"Link transform is not invertible; nothing collected.")
+        return [], {}, u"unknown"
 
     ct = host_crop_box.Transform   # local → world
     mn = host_crop_box.Min
@@ -294,23 +841,171 @@ def collect_mep_ids_in_volume(link_doc, host_crop_box, link_transform):
     )
     bbox_filter = DB.BoundingBoxIntersectsFilter(outline)
 
-    ids = []
-    for cat in MEP_CATEGORIES:
+    mode, linked_view = link_display_mode(host_view, link_instance, link_doc)
+    if linked_view is not None:
+        categories = list(MEP_CATEGORIES)   # the linked view already filters them
+    else:
+        categories = visible_categories(host_view)
+        hidden_n = len(MEP_CATEGORIES) - len(categories)
+        if hidden_n:
+            logger.debug(u"{} categor(ies) hidden in the existing section — "
+                         u"not captured.".format(hidden_n))
+
+    # Design options: capture only the option this link is displayed through.
+    # A linked model may hold several; a document-wide collector returns them all,
+    # which puts elements in the section that the design does not contain.
+    wanted_opt  = link_design_option_id(link_instance, link_doc)
+    primary_ids = _primary_option_ids(link_doc) if wanted_opt is None else set()
+    dropped_opt = 0
+    if wanted_opt is not None:
+        _o = link_doc.GetElement(wanted_opt)
+        logger.debug(u"  Design option for this link: {}".format(
+            _o.Name if _o is not None else wanted_opt))
+    elif primary_ids:
+        logger.debug(u"  No design option set on the link; capturing the "
+                       u"primary option of each set ({} set(s)).".format(
+                           len(primary_ids)))
+
+    ids   = []
+    tally = {}
+    for cat in categories:
+        label = CATEGORY_LABELS.get(cat, unicode(cat))
         try:
             combined = DB.LogicalAndFilter(DB.ElementCategoryFilter(cat), bbox_filter)
-            for elem in (DB.FilteredElementCollector(link_doc)
-                           .WherePasses(combined)
-                           .WhereElementIsNotElementType()
-                           .ToElements()):
+            if linked_view is not None:
+                collector = DB.FilteredElementCollector(link_doc, linked_view.Id)
+            else:
+                collector = DB.FilteredElementCollector(link_doc)
+            found = (collector
+                       .WherePasses(combined)
+                       .WhereElementIsNotElementType()
+                       .ToElements())
+            n = 0
+            for elem in found:
+                if not _element_option_ok(elem, wanted_opt, primary_ids):
+                    dropped_opt += 1
+                    continue
                 ids.append(elem.Id)
+                n += 1
+            if n:
+                tally[label] = n
+        except Exception as ex:
+            # A category unsupported by this Revit version, or a link that cannot
+            # be queried. Previously silent — now at least traceable in the log.
+            logger.debug(u"Category {} could not be collected: {}".format(label, ex))
+
+    if dropped_opt:
+        logger.warning(
+            u"  {} element(s) skipped: they belong to a design option the "
+            u"existing section does not display.".format(dropped_opt))
+    return ids, tally, mode
+
+def _log_section_volume(view, crop_box):
+    """Report the volume elements are collected from, and the view's clip state.
+
+    The collection volume is the view's CropBox. Its depth (local Z) only matches
+    what the section actually draws while Far Clipping is active — with it off,
+    the box can reach far behind the section plane and pull in elements the
+    existing section never shows.
+    """
+    try:
+        mn, mx = crop_box.Min, crop_box.Max
+        w = abs(mx.X - mn.X) / 3.28084
+        h = abs(mx.Y - mn.Y) / 3.28084
+        d = abs(mx.Z - mn.Z) / 3.28084
+
+        far_p = view.get_Parameter(DB.BuiltInParameter.VIEWER_BOUND_FAR_CLIPPING)
+        far_on = far_p.AsInteger() if far_p else None
+        crop_on = getattr(view, u"CropBoxActive", None)
+
+        logger.debug(
+            u"Section '{}': volume {:.2f} x {:.2f} m, depth {:.2f} m · "
+            u"far clipping = {} · crop active = {}".format(
+                view.Name, w, h, d,
+                {0: u"none", 1: u"clip with line",
+                 2: u"clip without line"}.get(far_on, far_on),
+                crop_on))
+        if far_on == 0:
+            logger.warning(
+                u"Section '{}' has Far Clipping set to none, so the collection "
+                u"depth is {:.1f} m. Elements far behind the section plane will "
+                u"be copied even though the existing section does not show "
+                u"them.".format(view.Name, d))
+    except Exception as ex:
+        logger.debug(u"Could not report section volume: {}".format(ex))
+
+
+CLIP_PARAMS = (
+    (DB.BuiltInParameter.VIEWER_BOUND_FAR_CLIPPING, u"Far Clipping"),
+    (DB.BuiltInParameter.VIEWER_BOUND_OFFSET_FAR,   u"Far Clip Offset"),
+)
+
+
+def _sync_clip(src_view, dst_view):
+    """Give dst_view the same cut depth as src_view.
+
+    The solution view is a duplicate, so it starts with the right clip — but the
+    solution view template is applied afterwards and can override Far Clipping /
+    Far Clip Offset. When the two disagree the sections draw different depths and
+    the solution section shows elements the existing one cuts away.
+
+    Only the view's own parameters are touched. View templates are never
+    modified: a template-controlled parameter is read-only here, and is reported
+    only when it actually produces a different cut.
+    """
+    differing = []
+    for bip, label in CLIP_PARAMS:
+        try:
+            sp = src_view.get_Parameter(bip)
+            dp = dst_view.get_Parameter(bip)
+            if sp is None or dp is None:
+                continue
+            if sp.StorageType == DB.StorageType.Integer:
+                s_val, d_val = sp.AsInteger(), dp.AsInteger()
+            else:
+                s_val, d_val = sp.AsDouble(), dp.AsDouble()
+            if dp.IsReadOnly:
+                # Template-controlled. A locked parameter that already matches is
+                # perfectly fine and must not warn on every single run.
+                if s_val != d_val:
+                    differing.append(u"{} ({} vs {})".format(label, d_val, s_val))
+                continue
+            dp.Set(s_val)
+        except Exception as ex:
+            logger.debug(u"Could not sync {}: {}".format(label, ex))
+
+    # Crop extents are per-view, not template-controlled, so this normally sticks.
+    try:
+        dst_view.CropBox = src_view.CropBox
+    except Exception as ex:
+        logger.debug(u"Could not sync crop box: {}".format(ex))
+    for attr in (u"CropBoxActive", u"CropBoxVisible"):
+        try:
+            setattr(dst_view, attr, getattr(src_view, attr))
         except Exception:
             pass
-    return ids
+
+    if differing:
+        logger.warning(
+            u"{} is controlled by the view template on '{}' and differs from "
+            u"'{}', so the two sections cut at different depths. Templates were "
+            u"not modified.".format(
+                u", ".join(differing), dst_view.Name, src_view.Name))
+    return differing
 
 
 def run(existing_section, sheet, selected_links, skip_duplicates=True,
         existing_template=None):
-    """Execute the full coordination build. Returns (per-link-count-dict, new_section_view)."""
+    """Execute the full coordination build.
+
+    Returns (results, new_section_view) where results maps a link name to a dict:
+        count        elements actually copied
+        collected    elements found inside the section volume
+        skipped_dup  elements skipped as already-copied
+        failed       elements Revit refused to copy
+        error        None, or why this link produced nothing
+        by_category  {friendly category name: count found}
+    """
     results = {}
     view_name = u"{} Solution".format(existing_section.Name)
     existing_uids = get_existing_stamped_uids() if skip_duplicates else set()
@@ -323,16 +1018,50 @@ def run(existing_section, sheet, selected_links, skip_duplicates=True,
         t1 = DB.Transaction(doc, u"EasyBIM: Copy MEP elements")
         t1.Start()
         ws_id = get_or_create_workset(SOLUTION_WORKSET)
+
         crop_box = existing_section.CropBox
+        _log_section_volume(existing_section, crop_box)
 
         for link_info in selected_links:
+            name = link_info[u"name"]
+            info = {u"count": 0, u"collected": 0, u"skipped_dup": 0,
+                    u"failed": 0, u"error": None, u"by_category": {},
+                    u"shown": None, u"vis_mode": None, u"stamped": 0}
+            results[name] = info
+
             if not link_info[u"loaded"] or link_info[u"doc"] is None:
-                results[link_info[u"name"]] = 0
+                info[u"error"] = u"Link is not loaded."
                 continue
 
             link_doc = link_info[u"doc"]
+            info[u"shown"] = link_shown_in_view(
+                existing_section, link_info[u"instance"])
+            if info[u"shown"] is False:
+                logger.warning(
+                    u"'{}' is not displayed in section '{}', but was selected "
+                    u"for capture. Its elements will appear only in the "
+                    u"solution section.".format(name, existing_section.Name))
+            elif info[u"shown"] is None:
+                logger.warning(u"Could not determine whether '{}' is displayed "
+                               u"in the existing section — this check was "
+                               u"inconclusive, not negative.".format(name))
             transform = link_info[u"instance"].GetTotalTransform()
-            src_ids = collect_mep_ids_in_volume(link_doc, crop_box, transform)
+            src_ids, tally, vis_mode = collect_mep_ids_in_volume(
+                link_doc, crop_box, transform,
+                host_view=existing_section,
+                link_instance=link_info[u"instance"])
+            info[u"collected"]   = len(src_ids)
+            info[u"by_category"] = tally
+            info[u"vis_mode"]    = vis_mode
+            if vis_mode == u"link view":
+                logger.debug(
+                    u"'{}': capture follows the linked view the section displays "
+                    u"— hidden elements excluded exactly.".format(name))
+            else:
+                logger.debug(
+                    u"'{}': shown '{}'. Hidden CATEGORIES are excluded, but "
+                    u"per-element hiding and view filters inside the link are "
+                    u"not evaluated in this mode.".format(name, vis_mode))
 
             if skip_duplicates:
                 filtered = []
@@ -340,24 +1069,38 @@ def run(existing_section, sheet, selected_links, skip_duplicates=True,
                     elem = link_doc.GetElement(eid)
                     if elem and elem.UniqueId not in existing_uids:
                         filtered.append(eid)
+                info[u"skipped_dup"] = len(src_ids) - len(filtered)
                 src_ids = filtered
 
             if not src_ids:
-                results[link_info[u"name"]] = 0
+                if info[u"collected"] == 0:
+                    info[u"error"] = u"No MEP elements found inside the section volume."
+                else:
+                    # Report what was SKIPPED, not what was collected. They differ
+                    # when a previous run created dependents (insulation) that were
+                    # never separate sources, so quoting "collected" here reads as
+                    # one or two more than the run that made the copies reported.
+                    info[u"error"] = (
+                        u"All {} elements were already copied for this section. "
+                        u"Turn off “Skip elements already copied” to copy them "
+                        u"again.".format(info[u"skipped_dup"]))
                 continue
 
             try:
-                id_list = SCG.List[DB.ElementId](src_ids)
-                new_ids = DB.ElementTransformUtils.CopyElements(
-                    link_doc, id_list, doc, transform, DB.CopyPasteOptions()
-                )
+                pairs, failed = copy_elements_resilient(link_doc, src_ids, transform)
             except Exception as ex:
-                logger.warning(u"Copy from {} failed: {}".format(link_info[u"name"], ex))
-                results[link_info[u"name"]] = 0
+                logger.warning(u"Copy from {} failed: {}".format(name, ex))
+                info[u"error"] = u"Copy failed: {}".format(ex)
                 continue
 
+            info[u"failed"] = failed
+            if failed:
+                logger.warning(u"{}: {} element(s) could not be copied.".format(
+                    name, failed))
+
             count = 0
-            for i, new_id in enumerate(new_ids):
+            stamped = 0
+            for src_id, new_id in pairs:
                 new_elem = doc.GetElement(new_id)
                 if new_elem is None:
                     continue
@@ -368,13 +1111,29 @@ def run(existing_section, sheet, selected_links, skip_duplicates=True,
                             wp.Set(ws_id.IntegerValue)
                     except Exception:
                         pass
-                if i < len(src_ids):
-                    src_elem = link_doc.GetElement(src_ids[i])
+                # src_id is None when Revit returned a different number of copies
+                # than requested — stamping then would record the wrong UniqueId
+                # and wrongly skip that element on every later run.
+                if src_id is not None:
+                    src_elem = link_doc.GetElement(src_id)
                     if src_elem:
                         stamp_element(new_elem, src_elem.UniqueId)
+                        stamped += 1
                         existing_uids.add(src_elem.UniqueId)
                 count += 1
-            results[link_info[u"name"]] = count
+            info[u"count"] = count
+            info[u"stamped"] = stamped
+            if stamped < count:
+                logger.warning(
+                    u"'{}': {} of {} copies could not be linked back to their "
+                    u"source, so they are unstamped and WILL be copied again on "
+                    u"the next run.".format(name, count - stamped, count))
+            else:
+                logger.debug(u"'{}': all {} copies stamped."
+                               .format(name, count))
+
+            if count == 0 and info[u"error"] is None:
+                info[u"error"] = u"Nothing could be copied from this link."
         t1.Commit()
 
         # ── Txn 2: create solution section view ───────────────────────────────
@@ -405,6 +1164,29 @@ def run(existing_section, sheet, selected_links, skip_duplicates=True,
         tmpl = find_view_template(SOLUTION_TEMPLATE)
         if tmpl:
             sv.ViewTemplateId = tmpl.Id
+            # After the template, not before: it can override the clip the
+            # duplicate inherited.
+            _sync_clip(existing_section, sv)
+            only_sol, only_exist = category_visibility_diff(existing_section, sv)
+            if only_sol:
+                logger.warning(
+                    u"Shown in the solution section but HIDDEN in '{}': {}. "
+                    u"Copies of these appear only in the solution section — the "
+                    u"two templates disagree about these categories.".format(
+                        existing_section.Name, u", ".join(only_sol)))
+            if only_exist:
+                logger.warning(
+                    u"Hidden in the solution section but shown in '{}': {}.".format(
+                        existing_section.Name, u", ".join(only_exist)))
+            if not only_sol and not only_exist:
+                logger.warning(
+                    u"Category visibility matches between the two sections.")
+            try:
+                report_view_differences(
+                    existing_section, sv,
+                    [li[u"instance"] for li in selected_links])
+            except Exception as _ex:
+                logger.debug(u"View comparison failed: {}".format(_ex))
         else:
             try:
                 sv.ViewTemplateId = DB.ElementId.InvalidElementId
@@ -1076,6 +1858,8 @@ GREEN_COLOR = WM.Color.FromRgb(0x22, 0xb0, 0x7c)
 BODY_COLOR  = WM.Color.FromRgb(0x37, 0x41, 0x51)
 MUTED_COLOR = WM.Color.FromRgb(0x9a, 0xa0, 0xac)
 LINE_COLOR  = WM.Color.FromRgb(0xf0, 0xf1, 0xff)
+AMBER_COLOR = WM.Color.FromRgb(0xd9, 0x77, 0x06)
+RED_COLOR   = WM.Color.FromRgb(0xdc, 0x26, 0x26)
 SEL_BG      = WM.Color.FromArgb(0x16, 0x44, 0xb8, 0xd3)
 
 
@@ -1719,7 +2503,7 @@ class SolutionSectionDialog(object):
     def _show_result(self, results, sel_links, new_sv):
         self._done = True
         w = self._window
-        total = sum(results.values()) if results else 0
+        total = sum(r[u"count"] for r in results.values()) if results else 0
 
         # Show result panel, hide review panel
         w.FindName(u"ReviewPanel").Visibility = System.Windows.Visibility.Collapsed
@@ -1733,7 +2517,30 @@ class SolutionSectionDialog(object):
         lp = w.FindName(u"ResultLinksPanel")
         lp.Children.Clear()
         for i, info in enumerate(sel_links):
-            cnt   = results.get(info[u"name"], 0)
+            res = results.get(info[u"name"]) or {}
+            cnt = res.get(u"count", 0)
+            # A link that copied nothing is a failure, not a success — say so
+            # instead of showing a green tick next to a zero.
+            ok  = cnt > 0
+            bits = []
+            if res.get(u"error"):
+                bits.append(res[u"error"])
+            if ok and res.get(u"failed"):
+                bits.append(u"{} element(s) could not be copied".format(res[u"failed"]))
+            if ok and res.get(u"shown") is False:
+                # Copied from a link the existing section does not draw, so these
+                # elements appear only in the solution section. Reported, not
+                # prevented: which links to capture is the user's choice.
+                bits.append(u"not shown in the existing section — "
+                            u"these elements appear only here")
+            if ok and res.get(u"vis_mode") not in (None, u"link view"):
+                bits.append(u"visibility resolved by category only "
+                            u"({})".format(res[u"vis_mode"]))
+            if not ok and res.get(u"by_category"):
+                bits.append(u"found: {}".format(
+                    u", ".join(u"{} {}".format(v, k) for k, v
+                               in sorted(res[u"by_category"].items()))))
+            reason = u"  ·  ".join(bits)
             is_last = (i == len(sel_links) - 1)
             row   = WC.Border()
             row.Padding = System.Windows.Thickness(12, 9, 12, 9)
@@ -1747,13 +2554,14 @@ class SolutionSectionDialog(object):
             c2.Width = System.Windows.GridLength(1, System.Windows.GridUnitType.Auto)
             inner.ColumnDefinitions.Add(c1)
             inner.ColumnDefinitions.Add(c2)
+            left_col = WC.StackPanel()
+            WC.Grid.SetColumn(left_col, 0)
             left_row = WC.StackPanel()
             left_row.Orientation = WC.Orientation.Horizontal
-            WC.Grid.SetColumn(left_row, 0)
             chk_tb = WC.TextBlock()
-            chk_tb.Text      = u"✓"
+            chk_tb.Text      = u"✓" if ok else u"⚠"
             chk_tb.FontSize  = 13
-            chk_tb.Foreground = _color(GREEN_COLOR)
+            chk_tb.Foreground = _color(GREEN_COLOR if ok else RED_COLOR)
             chk_tb.Margin    = System.Windows.Thickness(0, 0, 9, 0)
             chk_tb.VerticalAlignment = System.Windows.VerticalAlignment.Center
             link_tb = WC.TextBlock()
@@ -1764,15 +2572,24 @@ class SolutionSectionDialog(object):
             link_tb.VerticalAlignment = System.Windows.VerticalAlignment.Center
             left_row.Children.Add(chk_tb)
             left_row.Children.Add(link_tb)
+            left_col.Children.Add(left_row)
+            if reason:
+                why_tb = WC.TextBlock()
+                why_tb.Text         = reason.strip()
+                why_tb.FontSize     = 11
+                why_tb.Foreground   = _color(RED_COLOR if not ok else AMBER_COLOR)
+                why_tb.TextWrapping = System.Windows.TextWrapping.Wrap
+                why_tb.Margin       = System.Windows.Thickness(22, 3, 0, 0)
+                left_col.Children.Add(why_tb)
             cnt_tb = WC.TextBlock()
             cnt_tb.Text       = str(cnt)
             cnt_tb.FontFamily = WM.FontFamily(u"Consolas")
             cnt_tb.FontSize   = 12.5
             cnt_tb.FontWeight = System.Windows.FontWeights.Bold
-            cnt_tb.Foreground = _color(NAVY_COLOR)
-            cnt_tb.VerticalAlignment = System.Windows.VerticalAlignment.Center
+            cnt_tb.Foreground = _color(NAVY_COLOR if ok else RED_COLOR)
+            cnt_tb.VerticalAlignment = System.Windows.VerticalAlignment.Top
             WC.Grid.SetColumn(cnt_tb, 1)
-            inner.Children.Add(left_row)
+            inner.Children.Add(left_col)
             inner.Children.Add(cnt_tb)
             row.Child = inner
             lp.Children.Add(row)
