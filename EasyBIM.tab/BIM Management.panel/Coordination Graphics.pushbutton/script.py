@@ -83,6 +83,7 @@ from Autodesk.Revit.UI import TaskDialog
 
 import System
 import System.Collections.Generic as SCG
+import System.Windows.Controls as WC
 import System.Windows.Media as WM
 
 from System.Windows.Markup import XamlReader
@@ -91,6 +92,7 @@ from System.Xml import XmlReader as SysXmlReader
 
 from pyrevit import revit, script
 from easybim import coordination_settings as cfgmod
+from easybim import coordination_settings_ui as settings_ui
 from easybim import ui as ebui
 
 doc    = revit.doc
@@ -172,6 +174,25 @@ GRID_CATEGORY_NAME = "OST_Grids"
 # Refinement 2 — automatic sheet creation
 TITLEBLOCK_TOKEN   = u"EB_Title Block_A0"
 SHEET_NUMBER_PREFIX= u"ARC/STR-"
+
+
+def _elem_name(elem):
+    """Safe Element/ElementType .Name getter. Plain attribute access on
+    ElementType.Name (FamilySymbol, WallType, and other *Type classes) raises
+    AttributeError in this Revit API binding, on both IronPython and CPython3
+    pyrevit engines (see pyrevitlabs/pyRevit#854) — Element.Name.GetValue(elem)
+    is the confirmed fix. Falls back to it for any object where plain .Name fails."""
+    if elem is None:
+        return u""
+    try:
+        return elem.Name or u""
+    except AttributeError:
+        try:
+            return DB.Element.Name.GetValue(elem) or u""
+        except Exception:
+            return u""
+    except Exception:
+        return u""
 
 
 def _resolve_categories(names, warnings):
@@ -306,7 +327,7 @@ PICKER_XAML = u"""
         <Grid.ColumnDefinitions>
           <ColumnDefinition Width="Auto"/>
           <ColumnDefinition Width="*"/>
-          <ColumnDefinition Width="32"/>
+          <ColumnDefinition Width="Auto"/>
         </Grid.ColumnDefinitions>
         <Border Grid.Column="0" Width="44" Height="44" CornerRadius="10" VerticalAlignment="Center"
                 Background="#151b6e">
@@ -322,9 +343,14 @@ PICKER_XAML = u"""
           <TextBlock Text="Set up clash-coordination graphics for the active view"
                      FontSize="10" Foreground="#b8d8f0" Margin="0,3,0,0"/>
         </StackPanel>
-        <Button x:Name="BtnCloseX" Grid.Column="2" Content="&#10005;" Width="28" Height="28"
-                Background="Transparent" Foreground="White" BorderThickness="0"
-                FontSize="13" Cursor="Hand" VerticalAlignment="Center"/>
+        <StackPanel Grid.Column="2" Orientation="Horizontal" VerticalAlignment="Center">
+          <Button x:Name="BtnGear" Content="&#9881;" Width="28" Height="28"
+                  Background="Transparent" Foreground="White" BorderThickness="0"
+                  FontSize="15" Cursor="Hand" Margin="0,0,4,0" ToolTip="Settings (keywords, colors, patterns)"/>
+          <Button x:Name="BtnCloseX" Content="&#10005;" Width="28" Height="28"
+                  Background="Transparent" Foreground="White" BorderThickness="0"
+                  FontSize="13" Cursor="Hand"/>
+        </StackPanel>
       </Grid>
     </Border>
 
@@ -400,14 +426,18 @@ PICKER_XAML = u"""
         <StackPanel x:Name="Step2Panel" Visibility="Collapsed">
           <Border Style="{StaticResource Card}">
             <StackPanel>
-              <TextBlock Text="ARCHITECTURE LINK" Style="{StaticResource SectionLabel}"/>
-              <ComboBox x:Name="ArchCombo" Style="{StaticResource ComboStyle}"/>
+              <TextBlock Text="ARCHITECTURE LINKS (SELECT ONE OR MORE)" Style="{StaticResource SectionLabel}"/>
+              <ScrollViewer MaxHeight="120" VerticalScrollBarVisibility="Auto">
+                <StackPanel x:Name="ArchLinksPanel"/>
+              </ScrollViewer>
             </StackPanel>
           </Border>
           <Border Style="{StaticResource Card}">
             <StackPanel>
-              <TextBlock Text="STRUCTURE LINK" Style="{StaticResource SectionLabel}"/>
-              <ComboBox x:Name="StructCombo" Style="{StaticResource ComboStyle}"/>
+              <TextBlock Text="STRUCTURE LINKS (SELECT ONE OR MORE)" Style="{StaticResource SectionLabel}"/>
+              <ScrollViewer MaxHeight="120" VerticalScrollBarVisibility="Auto">
+                <StackPanel x:Name="StructLinksPanel"/>
+              </ScrollViewer>
             </StackPanel>
           </Border>
           <TextBlock x:Name="Step2Error" Foreground="#d64545" FontSize="11.5" TextWrapping="Wrap"/>
@@ -433,10 +463,10 @@ PICKER_XAML = u"""
           <Border Style="{StaticResource Card}">
             <StackPanel>
               <TextBlock Text="READY TO APPLY" Style="{StaticResource SectionLabel}"/>
-              <TextBlock x:Name="SumView"    FontSize="12" Foreground="#374151" Margin="0,2,0,2"/>
-              <TextBlock x:Name="SumArch"    FontSize="12" Foreground="#374151" Margin="0,2,0,2"/>
-              <TextBlock x:Name="SumStruct"  FontSize="12" Foreground="#374151" Margin="0,2,0,2"/>
-              <TextBlock x:Name="SumTraffic" FontSize="12" Foreground="#374151" Margin="0,2,0,2"/>
+              <TextBlock x:Name="SumView"    FontSize="12" Foreground="#374151" Margin="0,2,0,2" TextWrapping="Wrap"/>
+              <TextBlock x:Name="SumArch"    FontSize="12" Foreground="#374151" Margin="0,2,0,2" TextWrapping="Wrap"/>
+              <TextBlock x:Name="SumStruct"  FontSize="12" Foreground="#374151" Margin="0,2,0,2" TextWrapping="Wrap"/>
+              <TextBlock x:Name="SumTraffic" FontSize="12" Foreground="#374151" Margin="0,2,0,2" TextWrapping="Wrap"/>
               <TextBlock Text="Click Apply to set up the template, links, filters and coordination sheet."
                          FontSize="11" Foreground="#8b93a7" TextWrapping="Wrap" Margin="0,10,0,0"/>
             </StackPanel>
@@ -474,21 +504,24 @@ STEP_LABELS = (u"Active View", u"Select Links", u"Options", u"Final Summary")
 
 class LinkPickerDialog(object):
     """4-step wizard: Active View -> Select Links -> Options/Traffic -> Summary.
-    defaults = {'arch': (name_or_None, source_label), 'struct': (...),
-    'traffic': (...), 'use_traffic': bool}"""
+    Architecture and Structure each support selecting multiple links.
+    defaults = {'arch': (list_of_names, source_label), 'struct': (...),
+    'traffic': (name_or_None, source_label), 'use_traffic': bool}"""
 
     def __init__(self, links, defaults, view_info):
-        self.links       = links
-        self.defaults    = defaults
-        self.view_info   = view_info
-        self.cancelled   = True
-        self.arch_link   = None
-        self.struct_link = None
-        self.traffic_link = None
-        self.use_traffic  = False
-        self._window     = None
-        self._by_name    = {}
-        self._step       = 1
+        self.links         = links
+        self.defaults      = defaults
+        self.view_info     = view_info
+        self.cancelled     = True
+        self.arch_links    = []
+        self.struct_links  = []
+        self.traffic_link  = None
+        self.use_traffic   = False
+        self._window       = None
+        self._by_name      = {}
+        self._arch_checks  = []
+        self._struct_checks = []
+        self._step         = 1
 
     def _build(self):
         ctx    = SysXmlReader.Create(StringReader(PICKER_XAML))
@@ -507,29 +540,23 @@ class LinkPickerDialog(object):
         else:
             w.FindName(u"ViewBasementText").Text = u""
 
-        # Step 2 — link combos
+        # Step 2 — link checklists (multi-select)
         names = sorted((li[u"name"] for li in self.links), key=lambda n: n.upper())
         by_name = {}
         for li in self.links:
             by_name.setdefault(li[u"name"], li)
         self._by_name = by_name
 
-        arch_combo    = w.FindName(u"ArchCombo")
-        struct_combo  = w.FindName(u"StructCombo")
+        arch_default_names, _arch_src     = self.defaults.get(u"arch", ([], u"no match"))
+        struct_default_names, _struct_src = self.defaults.get(u"struct", ([], u"no match"))
+        traffic_name, _traffic_src        = self.defaults.get(u"traffic", (None, u"no match"))
+
+        self._arch_checks   = self._build_checklist(u"ArchLinksPanel", names, arch_default_names)
+        self._struct_checks = self._build_checklist(u"StructLinksPanel", names, struct_default_names)
+
         traffic_combo = w.FindName(u"TrafficCombo")
         for n in names:
-            arch_combo.Items.Add(n)
-            struct_combo.Items.Add(n)
             traffic_combo.Items.Add(n)
-
-        arch_name, _arch_src       = self.defaults.get(u"arch", (None, u"no match"))
-        struct_name, _struct_src   = self.defaults.get(u"struct", (None, u"no match"))
-        traffic_name, _traffic_src = self.defaults.get(u"traffic", (None, u"no match"))
-
-        if arch_name:
-            arch_combo.SelectedItem = arch_name
-        if struct_name:
-            struct_combo.SelectedItem = struct_name
         if traffic_name:
             traffic_combo.SelectedItem = traffic_name
 
@@ -545,6 +572,7 @@ class LinkPickerDialog(object):
         traffic_check.Unchecked += lambda s, e: setattr(
             traffic_panel, u"Visibility", System.Windows.Visibility.Collapsed)
 
+        w.FindName(u"BtnGear").Click   += self._on_settings
         w.FindName(u"BtnCloseX").Click += lambda s, e: window.Close()
         w.FindName(u"BtnCancel").Click += lambda s, e: window.Close()
         w.FindName(u"BtnBack").Click   += self._on_back
@@ -552,6 +580,31 @@ class LinkPickerDialog(object):
 
         self._go_to_step(1)
         return window
+
+    def _build_checklist(self, panel_name, names, checked_names):
+        panel = self._window.FindName(panel_name)
+        panel.Children.Clear()
+        checked_set = set(checked_names or [])
+        checks = []
+        for n in names:
+            cb = WC.CheckBox()
+            cb.Content = n
+            cb.FontSize = 12
+            cb.Margin = System.Windows.Thickness(0, 3, 0, 3)
+            cb.IsChecked = n in checked_set
+            panel.Children.Add(cb)
+            checks.append(cb)
+        return checks
+
+    def _checked_names(self, checks):
+        return [cb.Content for cb in checks if cb.IsChecked]
+
+    def _on_settings(self, sender, e):
+        """Gear icon — the two tools were merged into one button, this is
+        where the settings editor now lives. run() reloads Settings.json
+        fresh after the wizard closes, so anything changed here is picked
+        up for this same run without needing to reopen the tool."""
+        settings_ui.SettingsDialog(cfgmod.load_settings()).show()
 
     def _go_to_step(self, step):
         self._step = step
@@ -565,8 +618,8 @@ class LinkPickerDialog(object):
         info = {
             1: u"This tool modifies the ACTIVE view's visibility, categories, filters and view "
                u"template — confirm you're on the right view before continuing.",
-            2: u"Pick the Architecture and Structure links. Pre-filled from your last run or "
-               u"auto-detected by keyword — change either if needed.",
+            2: u"Pick one or more Architecture links and one or more Structure links. Pre-checked "
+               u"from your last run or auto-detected by keyword — change either if needed.",
             3: u"Optional: also restrict a Traffic link to Parking, Spot Elevations and Spot "
                u"Slopes only, shown in halftone.",
             4: u"Review your choices, then click Apply to set up coordination graphics and "
@@ -607,14 +660,14 @@ class LinkPickerDialog(object):
 
     def _populate_summary(self):
         w = self._window
-        arch_name    = w.FindName(u"ArchCombo").SelectedItem
-        struct_name  = w.FindName(u"StructCombo").SelectedItem
+        arch_names   = self._checked_names(self._arch_checks)
+        struct_names = self._checked_names(self._struct_checks)
         use_traffic  = bool(w.FindName(u"TrafficCheck").IsChecked)
         traffic_name = w.FindName(u"TrafficCombo").SelectedItem if use_traffic else None
 
         w.FindName(u"SumView").Text    = u"Active view: {}".format(self.view_info.get(u"name", u""))
-        w.FindName(u"SumArch").Text    = u"Architecture link: {}".format(arch_name or u"—")
-        w.FindName(u"SumStruct").Text  = u"Structure link: {}".format(struct_name or u"—")
+        w.FindName(u"SumArch").Text    = u"Architecture link(s): {}".format(u", ".join(arch_names) or u"—")
+        w.FindName(u"SumStruct").Text  = u"Structure link(s): {}".format(u", ".join(struct_names) or u"—")
         w.FindName(u"SumTraffic").Text = (u"Traffic link: {}".format(traffic_name)
                                            if (use_traffic and traffic_name)
                                            else u"Traffic link: (not used)")
@@ -628,13 +681,15 @@ class LinkPickerDialog(object):
 
         if self._step == 2:
             err = w.FindName(u"Step2Error")
-            arch_name   = w.FindName(u"ArchCombo").SelectedItem
-            struct_name = w.FindName(u"StructCombo").SelectedItem
-            if not arch_name or not struct_name:
-                err.Text = u"Select both an Architecture link and a Structure link."
+            arch_names   = self._checked_names(self._arch_checks)
+            struct_names = self._checked_names(self._struct_checks)
+            if not arch_names or not struct_names:
+                err.Text = u"Select at least one Architecture link and at least one Structure link."
                 return
-            if arch_name == struct_name:
-                err.Text = u"The Architecture and Structure links must be different."
+            overlap = set(arch_names) & set(struct_names)
+            if overlap:
+                err.Text = u"{} cannot be both an Architecture and a Structure link.".format(
+                    u", ".join(sorted(overlap)))
                 return
             err.Text = u""
 
@@ -643,13 +698,13 @@ class LinkPickerDialog(object):
             use_traffic = bool(w.FindName(u"TrafficCheck").IsChecked)
             if use_traffic:
                 traffic_name = w.FindName(u"TrafficCombo").SelectedItem
-                arch_name    = w.FindName(u"ArchCombo").SelectedItem
-                struct_name  = w.FindName(u"StructCombo").SelectedItem
+                arch_names   = self._checked_names(self._arch_checks)
+                struct_names = self._checked_names(self._struct_checks)
                 if not traffic_name:
                     err.Text = u"Select a Traffic link, or uncheck the Traffic option."
                     return
-                if traffic_name in (arch_name, struct_name):
-                    err.Text = u"The Traffic link must be different from Architecture and Structure."
+                if traffic_name in arch_names or traffic_name in struct_names:
+                    err.Text = u"The Traffic link must be different from the Architecture and Structure links."
                     return
             err.Text = u""
 
@@ -661,15 +716,15 @@ class LinkPickerDialog(object):
 
     def _finish(self):
         w = self._window
-        arch_name    = w.FindName(u"ArchCombo").SelectedItem
-        struct_name  = w.FindName(u"StructCombo").SelectedItem
+        arch_names   = self._checked_names(self._arch_checks)
+        struct_names = self._checked_names(self._struct_checks)
         use_traffic  = bool(w.FindName(u"TrafficCheck").IsChecked)
         traffic_name = w.FindName(u"TrafficCombo").SelectedItem if use_traffic else None
 
-        self.arch_link    = self._by_name[arch_name]
-        self.struct_link  = self._by_name[struct_name]
-        self.traffic_link = self._by_name[traffic_name] if (use_traffic and traffic_name) else None
-        self.use_traffic  = use_traffic
+        self.arch_links    = [self._by_name[n] for n in arch_names]
+        self.struct_links  = [self._by_name[n] for n in struct_names]
+        self.traffic_link  = self._by_name[traffic_name] if (use_traffic and traffic_name) else None
+        self.use_traffic   = use_traffic
         self.cancelled = False
         w.Close()
 
@@ -700,7 +755,7 @@ def get_all_link_instances():
             link_doc = inst.GetLinkDocument()
         except Exception:
             pass
-        name  = inst.Name or u""
+        name  = _elem_name(inst)
         title = link_doc.Title if link_doc is not None else name
         links.append({
             u"instance": inst,
@@ -740,6 +795,30 @@ def _role_default(links, memory_uid, keywords):
     return None, u"no keyword match"
 
 
+def _role_default_multi(links, memory_uids, keywords):
+    """(list_of_names, source_label) for a multi-select role (Architecture/
+    Structure) — remembered set first (any UID that still resolves), else
+    every keyword match is pre-checked (the user narrows down, not just
+    picks one from an ambiguous set)."""
+    if memory_uids:
+        uid_set = set(memory_uids)
+        names = []
+        for li in links:
+            try:
+                if li[u"instance"].UniqueId in uid_set:
+                    names.append(li[u"name"])
+            except Exception:
+                continue
+        if names:
+            return names, u"remembered"
+
+    candidates = [li[u"name"] for li in links if _matches_any(li, keywords)]
+    if candidates:
+        return candidates, u"{} keyword match{}".format(
+            len(candidates), u"" if len(candidates) == 1 else u"es")
+    return [], u"no keyword match"
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 # VIEW HELPERS
 # ─────────────────────────────────────────────────────────────────────────────
@@ -758,14 +837,14 @@ def get_view_and_validate():
 
 
 def is_basement_view(view):
-    name = (view.Name or u"").upper()
+    name = _elem_name(view).upper()
     for tok in BASEMENT_TOKENS:
         if tok.upper() in name:
             return True
     try:
         level = view.GenLevel
         if level is not None:
-            lname = (level.Name or u"").upper()
+            lname = _elem_name(level).upper()
             for tok in BASEMENT_TOKENS:
                 if tok.upper() in lname:
                     return True
@@ -807,7 +886,7 @@ def _ensure_room_tags_visible(target, warnings):
 
 def _find_view_template_by_name(name):
     for v in DB.FilteredElementCollector(doc).OfClass(DB.View):
-        if v.IsTemplate and v.Name == name:
+        if v.IsTemplate and _elem_name(v) == name:
             return v
     return None
 
@@ -908,7 +987,7 @@ def _hide_dwg_imports_in_link(view, link_info, basement_view, warnings):
     for imp in imports:
         try:
             cat = imp.Category
-            name = cat.Name if cat is not None else u""
+            name = _elem_name(cat)
         except Exception:
             name = u""
 
@@ -1098,7 +1177,7 @@ def _material_name(link_doc, material_id):
         return u""
     try:
         mat = link_doc.GetElement(material_id)
-        return mat.Name if mat is not None else u""
+        return _elem_name(mat)
     except Exception:
         return u""
 
@@ -1139,7 +1218,7 @@ def _type_is_concrete(link_doc, elem_type, bic, cfg):
     concrete_kw = cfg.get(u"ConcreteKeywords") or []
     exclude_kw  = cfg.get(u"ExcludeKeywords") or []
 
-    texts = [elem_type.Name or u""]
+    texts = [_elem_name(elem_type)]
     texts.append(_first_text(elem_type, "ALL_MODEL_DESCRIPTION", u"Description"))
     texts.append(_first_text(elem_type, "ALL_MODEL_TYPE_COMMENTS", u"Type Comments"))
 
@@ -1200,7 +1279,7 @@ def _collect_concrete_type_names(link_doc, categories, cfg, warnings, label):
                 is_conc = False
                 type_name = None
                 if elem_type is not None:
-                    type_name = elem_type.Name
+                    type_name = _elem_name(elem_type)
                     try:
                         is_conc = _type_is_concrete(link_doc, elem_type, bic, cfg)
                     except Exception as ex:
@@ -1221,7 +1300,7 @@ def _collect_concrete_type_names(link_doc, categories, cfg, warnings, label):
 
 def _find_existing_filter(name):
     for f in DB.FilteredElementCollector(doc).OfClass(DB.ParameterFilterElement):
-        if f.Name == name:
+        if _elem_name(f) == name:
             return f
     return None
 
@@ -1314,16 +1393,16 @@ def find_fill_pattern_id(exact_name, warnings, label):
             continue
 
     for fpe in drafting:
-        if fpe.Name == exact_name:
+        if _elem_name(fpe) == exact_name:
             return fpe.Id
 
     for fpe in drafting:
-        nm = (fpe.Name or u"").upper()
+        nm = _elem_name(fpe).upper()
         if all(tok in nm for tok in fuzzy_tokens):
             return fpe.Id
 
     for fpe in drafting:
-        if u"DIAGONAL" in (fpe.Name or u"").upper():
+        if u"DIAGONAL" in _elem_name(fpe).upper():
             return fpe.Id
 
     warnings.append(
@@ -1421,18 +1500,18 @@ def find_title_block_symbol(warnings):
 
     def _fam_name(sym):
         try:
-            return sym.Family.Name or u""
+            return _elem_name(sym.Family)
         except Exception:
             return u""
 
     token = TITLEBLOCK_TOKEN.upper()
     for sym in symbols:
-        if token in _fam_name(sym).upper() or token in (sym.Name or u"").upper():
+        if token in _fam_name(sym).upper() or token in _elem_name(sym).upper():
             return sym
 
     label_map = {}
     for sym in symbols:
-        label = u"{} : {}".format(_fam_name(sym), sym.Name or u"")
+        label = u"{} : {}".format(_fam_name(sym), _elem_name(sym))
         label_map[label] = sym
     labels = sorted(label_map.keys())
 
@@ -1561,17 +1640,23 @@ def run():
         return
 
     memory = cfgmod.load_link_memory(doc)
-    arch_default    = _role_default(links, memory.get(u"arch_uid"), settings.get(u"ArchLinkKeywords"))
-    struct_default  = _role_default(links, memory.get(u"struct_uid"), settings.get(u"StructLinkKeywords"))
+    # Back-compat: older memory files (before multi-select) stored a single
+    # 'arch_uid'/'struct_uid' — treat that as a one-item list if the new
+    # plural keys aren't there yet.
+    arch_memory_uids = memory.get(u"arch_uids") or ([memory[u"arch_uid"]] if memory.get(u"arch_uid") else [])
+    struct_memory_uids = memory.get(u"struct_uids") or ([memory[u"struct_uid"]] if memory.get(u"struct_uid") else [])
+
+    arch_default    = _role_default_multi(links, arch_memory_uids, settings.get(u"ArchLinkKeywords"))
+    struct_default  = _role_default_multi(links, struct_memory_uids, settings.get(u"StructLinkKeywords"))
     traffic_default = _role_default(links, memory.get(u"traffic_uid"), settings.get(u"TrafficLinkKeywords"))
     use_traffic_default = bool(memory.get(u"use_traffic")) and traffic_default[0] is not None
 
     try:
-        level_name = view.GenLevel.Name if view.GenLevel is not None else u"—"
+        level_name = _elem_name(view.GenLevel) or u"—"
     except Exception:
         level_name = u"—"
     view_info = {
-        u"name"     : view.Name,
+        u"name"     : _elem_name(view),
         u"view_type": view.ViewType.ToString(),
         u"level"    : level_name,
         u"basement" : is_basement_view(view),
@@ -1585,18 +1670,24 @@ def run():
     if dlg.cancelled:
         return
 
-    arch_link, struct_link = dlg.arch_link, dlg.struct_link
+    arch_links, struct_links = dlg.arch_links, dlg.struct_links
     traffic_link, use_traffic = dlg.traffic_link, dlg.use_traffic
 
+    # Settings may have been edited mid-wizard via the gear icon — reload so
+    # the transaction below (colors, patterns, concrete/exclude keywords)
+    # uses whatever is currently saved, not the snapshot from before dlg.show().
+    settings = cfgmod.load_settings()
+
     cfgmod.save_link_memory(doc, {
-        u"arch_uid"   : arch_link[u"instance"].UniqueId,
-        u"struct_uid" : struct_link[u"instance"].UniqueId,
+        u"arch_uids"  : [li[u"instance"].UniqueId for li in arch_links],
+        u"struct_uids": [li[u"instance"].UniqueId for li in struct_links],
         u"traffic_uid": traffic_link[u"instance"].UniqueId if traffic_link else memory.get(u"traffic_uid"),
         u"use_traffic": use_traffic,
     })
 
     warnings = []
-    chosen_ids = set([arch_link[u"id"].IntegerValue, struct_link[u"id"].IntegerValue])
+    chosen_ids = set(li[u"id"].IntegerValue for li in arch_links)
+    chosen_ids |= set(li[u"id"].IntegerValue for li in struct_links)
     if use_traffic and traffic_link:
         chosen_ids.add(traffic_link[u"id"].IntegerValue)
 
@@ -1644,19 +1735,27 @@ def run():
 
         # ── Step 6 (DWGs): hide imported DWG categories inside Arch/Struct ─────
         basement = is_basement_view(view)
-        _hide_dwg_imports_in_link(view, arch_link, basement, warnings)
-        _hide_dwg_imports_in_link(view, struct_link, basement, warnings)
+        for li in arch_links:
+            _hide_dwg_imports_in_link(view, li, basement, warnings)
+        for li in struct_links:
+            _hide_dwg_imports_in_link(view, li, basement, warnings)
 
         # ── Step 7: Traffic link ────────────────────────────────────────────────
         if use_traffic and traffic_link:
             _restrict_traffic_link_visibility(view, traffic_link, traffic_keep_bics, warnings)
             _set_traffic_halftone(view, traffic_link, warnings)
 
-        # ── Step 8: deep-scan + View Filters ────────────────────────────────────
-        arch_names   = _collect_concrete_type_names(arch_link[u"doc"], override_bics,
-                                                      settings, warnings, u"Architecture")
-        struct_names = _collect_concrete_type_names(struct_link[u"doc"], override_bics,
-                                                      settings, warnings, u"Structure")
+        # ── Step 8: deep-scan (every selected link, per role) + View Filters ───
+        arch_names = set()
+        for li in arch_links:
+            arch_names |= _collect_concrete_type_names(
+                li[u"doc"], override_bics, settings, warnings,
+                u"Architecture ({})".format(li[u"name"]))
+        struct_names = set()
+        for li in struct_links:
+            struct_names |= _collect_concrete_type_names(
+                li[u"doc"], override_bics, settings, warnings,
+                u"Structure ({})".format(li[u"name"]))
 
         struct_pfe = build_or_update_type_name_filter(FILTER_NAME_STRUCT, override_bics,
                                                         struct_names, warnings)
@@ -1674,16 +1773,18 @@ def run():
         apply_filter_to_target(template, struct_pfe, struct_ogs, warnings, u"Structure")
         apply_filter_to_target(template, arch_pfe, arch_ogs, warnings, u"Architecture")
 
-        # ── Refinement 1: color Grids inside the Arch/Struct links ─────────────
-        _color_link_grids(view, struct_link, struct_ogs, warnings, u"Structure")
-        _color_link_grids(view, arch_link, arch_ogs, warnings, u"Architecture")
+        # ── Refinement 1: color Grids inside every selected Arch/Struct link ───
+        for li in struct_links:
+            _color_link_grids(view, li, struct_ogs, warnings, u"Structure")
+        for li in arch_links:
+            _color_link_grids(view, li, arch_ogs, warnings, u"Architecture")
 
         # ── Refinement 2: automatic sheet creation ──────────────────────────────
         sheet = None
         if titleblock_symbol is not None:
             view_for_sheet = _get_view_for_sheet(view, template, warnings)
             if view_for_sheet is not None:
-                sheet = _create_and_place_sheet(view_for_sheet, view_for_sheet.Name,
+                sheet = _create_and_place_sheet(view_for_sheet, _elem_name(view_for_sheet),
                                                  titleblock_symbol, warnings)
 
         t.Commit()
@@ -1702,15 +1803,16 @@ def run():
         except Exception as ex:
             warnings.append(u"Sheet created but could not switch to it: {}".format(ex))
 
-    sheet_line = (u"Sheet: {} — {}".format(sheet.SheetNumber, sheet.Name)
+    sheet_line = (u"Sheet: {} — {}".format(sheet.SheetNumber, _elem_name(sheet))
                   if sheet is not None else u"Sheet: not created (see warnings)")
 
     summary = (
         u"Coordination graphics applied.\n\n"
-        u"Architecture link: {}\nStructure link: {}\nTraffic link: {}\n\n"
+        u"Architecture link(s): {}\nStructure link(s): {}\nTraffic link: {}\n\n"
         u"Architecture concrete types found: {}\nStructure concrete types found: {}\n\n"
         u"{}".format(
-            arch_link[u"name"], struct_link[u"name"],
+            u", ".join(li[u"name"] for li in arch_links),
+            u", ".join(li[u"name"] for li in struct_links),
             traffic_link[u"name"] if (use_traffic and traffic_link) else u"(not used)",
             len(arch_names), len(struct_names), sheet_line)
     )

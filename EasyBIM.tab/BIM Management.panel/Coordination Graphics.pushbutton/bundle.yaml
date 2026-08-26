@@ -3,13 +3,13 @@ title: |-
   Coordination
 tooltip: >-
   Set up coordination graphics in the active 2D plan view: identifies the
-  Architecture, Structure and optional Traffic links (remembered choice,
-  auto-detect, or picked manually), applies a shared "Coordination - Arch vs
-  Str" view template to declutter, hides every other link, deep-scans the
-  Arch/Struct links for concrete Walls / Columns / Structural Framing /
-  Foundations, and colors them red (Structure) / blue (Architecture) via
-  View Filters. Configure keywords/colors/patterns with "Coordination
-  Settings".
+  Architecture, Structure (one or more each) and optional Traffic links
+  (remembered choice, auto-detect, or picked manually), applies a shared
+  "Coordination - Arch vs Str" view template to declutter, hides every other
+  link, deep-scans the Arch/Struct links for concrete Walls / Columns /
+  Structural Framing / Foundations, and colors them red (Structure) / blue
+  (Architecture) via View Filters. Keywords/colors/patterns are configurable
+  from the gear icon inside the tool.
 author: EasyBIM Team
 highlight: new
 min_revit_ver: 2023

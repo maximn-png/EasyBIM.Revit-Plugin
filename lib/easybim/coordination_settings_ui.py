@@ -1,30 +1,26 @@
 # -*- coding: utf-8 -*-
-"""Coordination Settings — EasyBIM BIM Management.
+"""Shared WPF editor for Settings.json — SettingsDialog.
 
-WPF editor for Settings.json, the shared config "Coordination Graphics" reads
-(link-detection keywords, concrete classification keywords, fill pattern
-names, and the Structure/Architecture colors). See lib/easybim/coordination_settings.py
-for where the file lives and why.
+Used by "Coordination Graphics" (via its wizard's gear icon) as a nested
+modal dialog. There is no standalone "Coordination Settings" pushbutton
+anymore — the two tools were merged into one button per request; this
+module is what makes the settings editor reachable from both without
+duplicating ~300 lines of XAML.
 
-Engine: IronPython 2.7 (no "#! python3" shebang) — matches "Coordination
-Graphics" and the tab's other WPF buttons.
+Engine: IronPython 2.7 (no "#! python3" shebang) — matches the tab's other
+WPF buttons. Callers are expected to have already done the WPF
+clr.AddReference calls (PresentationFramework/Core, WindowsBase) — repeating
+AddReference here is harmless (idempotent) so this module also does it
+itself to stay independently usable.
 """
 
-__title__ = "Coordination\nSettings"
-__author__ = "EasyBIM"
-__doc__ = "Edit the keywords, concrete-classification rules, fill pattern names and colors Coordination Graphics uses."
-
 import clr
-import traceback
 
-clr.AddReference('RevitAPIUI')
 clr.AddReference('PresentationFramework')
 clr.AddReference('PresentationCore')
 clr.AddReference('WindowsBase')
 clr.AddReference('System.Xml')
 clr.AddReference('System')
-
-from Autodesk.Revit.UI import TaskDialog
 
 import System
 import System.Windows.Media as WM
@@ -184,7 +180,7 @@ XAML = u"""
                      HorizontalAlignment="Center" VerticalAlignment="Center"/>
         </Border>
         <TextBlock FontSize="11.5" Foreground="#1c6478" TextWrapping="Wrap" VerticalAlignment="Center" Width="440"
-                   Text="Changes here take effect the next time ARC/STR Coordination runs. Settings.json is shared with the team — commit it if you want your changes to stick."/>
+                   Text="Changes here take effect the next time you click Apply. Settings.json is shared with the team — commit it if you want your changes to stick."/>
       </StackPanel>
     </Border>
 
@@ -440,19 +436,3 @@ class SettingsDialog(object):
         window.Closed += on_closed
         window.Show()
         Dispatcher.PushFrame(frame)
-
-
-def main():
-    try:
-        settings = cfgmod.load_settings()
-        dlg = SettingsDialog(settings)
-        dlg.show()
-        if dlg.saved:
-            TaskDialog.Show(u"EasyBIM — Coordination Settings",
-                             u"Settings saved to:\n{}".format(cfgmod.settings_file_path()))
-    except Exception:
-        TaskDialog.Show(u"EasyBIM — Coordination Settings — Error",
-                         u"Unexpected error:\n\n{}".format(traceback.format_exc()))
-
-
-main()

@@ -1,9 +1,0 @@
-title: |-
-  ARC/STR
-  Settings
-tooltip: >-
-  Edit the keywords, concrete-classification rules, fill pattern names and
-  colors that "Coordination Graphics" uses -- saved to Settings.json next to
-  that tool so the whole team shares the same configuration.
-author: EasyBIM Team
-min_revit_ver: 2023
