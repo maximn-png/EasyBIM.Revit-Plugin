@@ -105,20 +105,30 @@ logger = script.get_logger()
 
 TEMPLATE_NAME = u"Coordination - Arch vs Str"
 
-FILTER_NAME_STRUCT = u"EasyBIM - Structure Concrete"
-FILTER_NAME_ARCH   = u"EasyBIM - Architecture Concrete"
+FILTER_NAME_STRUCT         = u"EasyBIM - Structure Concrete"
+FILTER_NAME_ARCH           = u"EasyBIM - Architecture Concrete"
+FILTER_NAME_STRUCT_COLUMNS = u"EasyBIM - Structure Concrete Columns"
+FILTER_NAME_ARCH_COLUMNS   = u"EasyBIM - Architecture Concrete Columns"
 
 GRAY_COLOR = DB.Color(190, 190, 190)
 
-# Categories color-coded via the two View Filters (Step 6/8) — and given the
-# Step 8A gray fallback on the template.
-OVERRIDE_CATEGORY_NAMES = [
+# Categories color-coded via View Filters (Step 6/8) — and given the Step 8A
+# gray fallback on the template. Split into two visual-treatment groups per
+# live-testing feedback: columns get a dashed line pattern (coordination
+# convention — "this is a linked/reference column, not a host element"),
+# everything else stays solid-line. A single View Filter override applies
+# uniformly to every category it targets, so this needs two filters per
+# role (4 total) rather than one — see run().
+OVERRIDE_LINE_CATEGORY_NAMES = [
     "OST_Walls",
-    "OST_Columns",
-    "OST_StructuralColumns",
     "OST_StructuralFoundation",
     "OST_StructuralFraming",
 ]
+OVERRIDE_COLUMN_CATEGORY_NAMES = [
+    "OST_Columns",
+    "OST_StructuralColumns",
+]
+OVERRIDE_CATEGORY_NAMES = OVERRIDE_LINE_CATEGORY_NAMES + OVERRIDE_COLUMN_CATEGORY_NAMES
 
 # Host-model categories hidden on the template to declutter (Step 3). Not
 # exhaustive — edit freely.
@@ -1467,8 +1477,30 @@ def find_fill_pattern_id(exact_name, warnings, label):
 
     warnings.append(
         u"No fill pattern named '{}' (and no diagonal fallback) was found for the "
-        u"{} cut background pattern — that override was skipped.".format(exact_name, label))
+        u"{} cut hatch pattern — that override was skipped.".format(exact_name, label))
     return DB.ElementId.InvalidElementId
+
+
+def find_line_pattern_id(exact_name, warnings, label):
+    """Exact LinePatternElement name match, else a pattern containing 'DASH'
+    or 'HIDDEN', else Solid (+ a warning) — never InvalidElementId, since an
+    unmatched line-pattern setting should degrade to a visible line, not no
+    line pattern set at all."""
+    patterns = list(DB.FilteredElementCollector(doc).OfClass(DB.LinePatternElement))
+
+    for lpe in patterns:
+        if _elem_name(lpe) == exact_name:
+            return lpe.Id
+
+    for lpe in patterns:
+        nm = _elem_name(lpe).upper()
+        if u"DASH" in nm or u"HIDDEN" in nm:
+            return lpe.Id
+
+    warnings.append(
+        u"No line pattern named '{}' (and no Dash/Hidden fallback) was found for "
+        u"{} — using Solid instead.".format(exact_name, label))
+    return get_solid_line_pattern_id()
 
 
 def _settings_color(settings, key, fallback):
@@ -1479,7 +1511,17 @@ def _settings_color(settings, key, fallback):
         return fallback
 
 
-def build_colored_override(color, pattern_name, warnings, label):
+def build_colored_override(color, pattern_name, warnings, label, line_pattern_name=None):
+    """line_pattern_name=None -> Solid cut/projection line (walls, framing,
+    foundations). A name (e.g. Settings.json's ColumnLinePatternName) ->
+    that pattern instead (Dashed by default), used for columns — a
+    coordination-view convention flagging "linked/reference column, not a
+    host element" per live-testing feedback.
+
+    The hatch itself is set on the CUT FOREGROUND pattern, not Background —
+    Background rendered as a flat/solid look in testing even with a diagonal
+    FillPattern assigned; Foreground is the slot that actually draws visible
+    hatch lines."""
     ogs = DB.OverrideGraphicSettings()
 
     # Grids have no "cut" representation (they're a projection-only datum
@@ -1500,22 +1542,29 @@ def build_colored_override(color, pattern_name, warnings, label):
     except Exception as ex:
         warnings.append(u"{}: could not set cut line weight: {}".format(label, ex))
 
-    solid_id = get_solid_line_pattern_id()
-    if solid_id != DB.ElementId.InvalidElementId:
+    if line_pattern_name:
+        line_id = find_line_pattern_id(line_pattern_name, warnings, label)
+    else:
+        line_id = get_solid_line_pattern_id()
+    if line_id != DB.ElementId.InvalidElementId:
         try:
-            ogs.SetCutLinePatternId(solid_id)
+            ogs.SetCutLinePatternId(line_id)
         except Exception as ex:
-            warnings.append(u"{}: could not set cut line pattern: {}".format(label, ex))
+            warnings.append(u"{}: could not set the cut line pattern: {}".format(label, ex))
+        try:
+            ogs.SetProjectionLinePatternId(line_id)
+        except Exception as ex:
+            warnings.append(u"{}: could not set the projection line pattern: {}".format(label, ex))
 
     try:
-        ogs.SetCutForegroundPatternVisible(False)
+        ogs.SetCutBackgroundPatternVisible(False)
     except Exception as ex:
-        warnings.append(u"{}: could not disable the cut foreground pattern: {}".format(label, ex))
+        warnings.append(u"{}: could not disable the cut background pattern: {}".format(label, ex))
 
     try:
-        ogs.SetCutBackgroundPatternVisible(True)
+        ogs.SetCutForegroundPatternVisible(True)
     except Exception as ex:
-        warnings.append(u"{}: could not enable the cut background pattern: {}".format(label, ex))
+        warnings.append(u"{}: could not enable the cut foreground pattern: {}".format(label, ex))
 
     try:
         ogs.SetCutLineColor(color)
@@ -1525,14 +1574,14 @@ def build_colored_override(color, pattern_name, warnings, label):
     fill_id = find_fill_pattern_id(pattern_name, warnings, label)
     if fill_id != DB.ElementId.InvalidElementId:
         try:
-            ogs.SetCutBackgroundPatternId(fill_id)
+            ogs.SetCutForegroundPatternId(fill_id)
         except Exception as ex:
-            warnings.append(u"{}: could not set the cut background pattern id: {}".format(label, ex))
+            warnings.append(u"{}: could not set the cut foreground pattern id: {}".format(label, ex))
 
     try:
-        ogs.SetCutBackgroundPatternColor(color)
+        ogs.SetCutForegroundPatternColor(color)
     except Exception as ex:
-        warnings.append(u"{}: could not set the cut background pattern color: {}".format(label, ex))
+        warnings.append(u"{}: could not set the cut foreground pattern color: {}".format(label, ex))
 
     return ogs
 
@@ -1846,21 +1895,43 @@ def run():
                 li[u"doc"], override_bics, settings, warnings,
                 u"Structure ({})".format(li[u"name"]))
 
-        struct_pfe = build_or_update_type_name_filter(FILTER_NAME_STRUCT, override_bics,
-                                                        struct_names, warnings)
-        arch_pfe   = build_or_update_type_name_filter(FILTER_NAME_ARCH, override_bics,
-                                                        arch_names, warnings)
+        # Two filters per role — line categories (solid) vs columns (dashed)
+        # — because one View Filter override applies uniformly to every
+        # category it targets; giving columns a different line pattern than
+        # walls/framing/foundations needs a separate filter for them.
+        line_bics   = _resolve_categories(OVERRIDE_LINE_CATEGORY_NAMES, warnings)
+        column_bics = _resolve_categories(OVERRIDE_COLUMN_CATEGORY_NAMES, warnings)
+
+        struct_pfe_line   = build_or_update_type_name_filter(
+            FILTER_NAME_STRUCT, line_bics, struct_names, warnings)
+        struct_pfe_column = build_or_update_type_name_filter(
+            FILTER_NAME_STRUCT_COLUMNS, column_bics, struct_names, warnings)
+        arch_pfe_line     = build_or_update_type_name_filter(
+            FILTER_NAME_ARCH, line_bics, arch_names, warnings)
+        arch_pfe_column   = build_or_update_type_name_filter(
+            FILTER_NAME_ARCH_COLUMNS, column_bics, arch_names, warnings)
 
         struct_color = _settings_color(settings, u"StructColor", DB.Color(200, 30, 30))
         arch_color   = _settings_color(settings, u"ArchColor", DB.Color(0, 70, 200))
+        column_line_pattern = settings.get(u"ColumnLinePatternName") or u"Dashed"
 
-        struct_ogs = build_colored_override(struct_color, settings.get(u"StructPatternName"),
-                                             warnings, u"Structure")
-        arch_ogs   = build_colored_override(arch_color, settings.get(u"ArchPatternName"),
-                                             warnings, u"Architecture")
+        struct_ogs        = build_colored_override(struct_color, settings.get(u"StructPatternName"),
+                                                     warnings, u"Structure")
+        struct_ogs_column = build_colored_override(struct_color, settings.get(u"StructPatternName"),
+                                                     warnings, u"Structure Columns",
+                                                     line_pattern_name=column_line_pattern)
+        arch_ogs          = build_colored_override(arch_color, settings.get(u"ArchPatternName"),
+                                                     warnings, u"Architecture")
+        arch_ogs_column   = build_colored_override(arch_color, settings.get(u"ArchPatternName"),
+                                                     warnings, u"Architecture Columns",
+                                                     line_pattern_name=column_line_pattern)
 
-        apply_filter_to_target(template, struct_pfe, struct_ogs, warnings, u"Structure")
-        apply_filter_to_target(template, arch_pfe, arch_ogs, warnings, u"Architecture")
+        apply_filter_to_target(template, struct_pfe_line, struct_ogs, warnings, u"Structure")
+        apply_filter_to_target(template, struct_pfe_column, struct_ogs_column, warnings,
+                                u"Structure Columns")
+        apply_filter_to_target(template, arch_pfe_line, arch_ogs, warnings, u"Architecture")
+        apply_filter_to_target(template, arch_pfe_column, arch_ogs_column, warnings,
+                                u"Architecture Columns")
 
         # ── Refinement 1: color Grids inside every selected Arch/Struct link ───
         for li in struct_links:

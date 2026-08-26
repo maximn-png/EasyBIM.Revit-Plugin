@@ -220,13 +220,16 @@ XAML = u"""
 
         <Border Style="{StaticResource Card}">
           <StackPanel>
-            <TextBlock Text="FILL PATTERNS" Style="{StaticResource SectionHeader}"/>
+            <TextBlock Text="FILL &amp; LINE PATTERNS" Style="{StaticResource SectionHeader}"/>
 
-            <TextBlock Text="STRUCTURE CUT PATTERN NAME" Style="{StaticResource FieldLabel}"/>
+            <TextBlock Text="STRUCTURE CUT HATCH PATTERN NAME" Style="{StaticResource FieldLabel}"/>
             <TextBox x:Name="StructPattern" Style="{StaticResource FieldBox}"/>
 
-            <TextBlock Text="ARCHITECTURE CUT PATTERN NAME" Style="{StaticResource FieldLabel}"/>
+            <TextBlock Text="ARCHITECTURE CUT HATCH PATTERN NAME" Style="{StaticResource FieldLabel}"/>
             <TextBox x:Name="ArchPattern" Style="{StaticResource FieldBox}"/>
+
+            <TextBlock Text="COLUMN LINE PATTERN NAME (COLUMNS ONLY, BOTH DISCIPLINES)" Style="{StaticResource FieldLabel}"/>
+            <TextBox x:Name="ColumnLinePattern" Style="{StaticResource FieldBox}"/>
           </StackPanel>
         </Border>
 
@@ -318,8 +321,9 @@ class SettingsDialog(object):
         w.FindName(u"TrafficLinkKw").Text = _join(s.get(u"TrafficLinkKeywords"))
         w.FindName(u"ConcreteKw").Text    = _join(s.get(u"ConcreteKeywords"))
         w.FindName(u"ExcludeKw").Text     = _join(s.get(u"ExcludeKeywords"))
-        w.FindName(u"StructPattern").Text = s.get(u"StructPatternName") or u""
-        w.FindName(u"ArchPattern").Text   = s.get(u"ArchPatternName") or u""
+        w.FindName(u"StructPattern").Text     = s.get(u"StructPatternName") or u""
+        w.FindName(u"ArchPattern").Text       = s.get(u"ArchPatternName") or u""
+        w.FindName(u"ColumnLinePattern").Text = s.get(u"ColumnLinePatternName") or u""
 
         struct_c = s.get(u"StructColor") or {}
         arch_c   = s.get(u"ArchColor") or {}
@@ -376,8 +380,9 @@ class SettingsDialog(object):
         w.FindName(u"TrafficLinkKw").Text = _join(defaults[u"TrafficLinkKeywords"])
         w.FindName(u"ConcreteKw").Text    = _join(defaults[u"ConcreteKeywords"])
         w.FindName(u"ExcludeKw").Text     = _join(defaults[u"ExcludeKeywords"])
-        w.FindName(u"StructPattern").Text = defaults[u"StructPatternName"]
-        w.FindName(u"ArchPattern").Text   = defaults[u"ArchPatternName"]
+        w.FindName(u"StructPattern").Text     = defaults[u"StructPatternName"]
+        w.FindName(u"ArchPattern").Text       = defaults[u"ArchPatternName"]
+        w.FindName(u"ColumnLinePattern").Text = defaults[u"ColumnLinePatternName"]
         sc = defaults[u"StructColor"]
         ac = defaults[u"ArchColor"]
         w.FindName(u"StructR").Text = unicode(sc[u"R"])
@@ -400,20 +405,25 @@ class SettingsDialog(object):
 
         struct_pattern = (w.FindName(u"StructPattern").Text or u"").strip()
         arch_pattern   = (w.FindName(u"ArchPattern").Text or u"").strip()
+        column_line_pattern = (w.FindName(u"ColumnLinePattern").Text or u"").strip()
         if not struct_pattern or not arch_pattern:
             err_tb.Text = u"Both fill pattern names are required."
             return
+        if not column_line_pattern:
+            err_tb.Text = u"The column line pattern name is required."
+            return
 
         self.settings = {
-            u"ArchLinkKeywords"   : _split(w.FindName(u"ArchLinkKw").Text),
-            u"StructLinkKeywords" : _split(w.FindName(u"StructLinkKw").Text),
-            u"TrafficLinkKeywords": _split(w.FindName(u"TrafficLinkKw").Text),
-            u"ConcreteKeywords"   : _split(w.FindName(u"ConcreteKw").Text),
-            u"ExcludeKeywords"    : _split(w.FindName(u"ExcludeKw").Text),
-            u"StructPatternName"  : struct_pattern,
-            u"ArchPatternName"    : arch_pattern,
-            u"StructColor"        : {u"R": struct_rgb[0], u"G": struct_rgb[1], u"B": struct_rgb[2]},
-            u"ArchColor"          : {u"R": arch_rgb[0], u"G": arch_rgb[1], u"B": arch_rgb[2]},
+            u"ArchLinkKeywords"     : _split(w.FindName(u"ArchLinkKw").Text),
+            u"StructLinkKeywords"   : _split(w.FindName(u"StructLinkKw").Text),
+            u"TrafficLinkKeywords"  : _split(w.FindName(u"TrafficLinkKw").Text),
+            u"ConcreteKeywords"     : _split(w.FindName(u"ConcreteKw").Text),
+            u"ExcludeKeywords"      : _split(w.FindName(u"ExcludeKw").Text),
+            u"StructPatternName"    : struct_pattern,
+            u"ArchPatternName"      : arch_pattern,
+            u"ColumnLinePatternName": column_line_pattern,
+            u"StructColor"          : {u"R": struct_rgb[0], u"G": struct_rgb[1], u"B": struct_rgb[2]},
+            u"ArchColor"            : {u"R": arch_rgb[0], u"G": arch_rgb[1], u"B": arch_rgb[2]},
         }
 
         try:
