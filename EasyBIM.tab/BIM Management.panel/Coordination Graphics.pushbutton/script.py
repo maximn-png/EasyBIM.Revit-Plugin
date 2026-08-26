@@ -935,36 +935,29 @@ def _exclude_rvt_links_from_template_control(template, warnings):
             u"(informational only).".format(ex))
 
 
-def ensure_view_template(view, host_clutter_bics, link_model_bics, wallnoncore_bics,
-                          annotation_bics, override_bics, warnings):
-    template = _find_view_template_by_name(TEMPLATE_NAME)
-    if template is None:
-        try:
-            template_id = view.CreateViewTemplate()
-            template = doc.GetElement(template_id)
-            template.Name = TEMPLATE_NAME
-        except Exception as ex:
-            warnings.append(u"Could not create the '{}' view template: {}".format(
-                TEMPLATE_NAME, ex))
-            return None
-
+def _apply_coordination_categories(target, host_clutter_bics, link_model_bics, wallnoncore_bics,
+                                    annotation_bics, override_bics, warnings):
+    """Category hides/overrides shared between the template path and the
+    direct-to-view fallback below — SetCategoryHidden/SetCategoryOverrides
+    (and, in the caller, AddFilter/SetFilterOverrides) all work identically
+    whether `target` is a ViewTemplate or a plain View."""
     for bic in host_clutter_bics:
-        _hide_category_safe(template, bic, warnings)
+        _hide_category_safe(target, bic, warnings)
     for bic in link_model_bics:
-        _hide_category_safe(template, bic, warnings)
+        _hide_category_safe(target, bic, warnings)
     for bic in wallnoncore_bics:
-        _hide_category_safe(template, bic, warnings)
+        _hide_category_safe(target, bic, warnings)
     for bic in annotation_bics:
-        _hide_category_safe(template, bic, warnings)
+        _hide_category_safe(target, bic, warnings)
 
-    _ensure_room_tags_visible(template, warnings)
+    _ensure_room_tags_visible(target, warnings)
 
     # Refinement 1 — Grids stay visible as a category (so the links' grids
     # show through); the HOST's own grids are hidden separately, per-element,
     # in run() — see module docstring for why this can't be a category hide.
     grids_bic = getattr(DB.BuiltInCategory, "OST_Grids", None)
     if grids_bic is not None:
-        _hide_category_safe(template, grids_bic, warnings, hide=False)
+        _hide_category_safe(target, grids_bic, warnings, hide=False)
 
     gray_ogs = DB.OverrideGraphicSettings()
     try:
@@ -972,15 +965,63 @@ def ensure_view_template(view, host_clutter_bics, link_model_bics, wallnoncore_b
     except Exception as ex:
         warnings.append(u"Could not set the gray fallback projection color: {}".format(ex))
     for bic in override_bics:
-        _override_category_safe(template, bic, gray_ogs, warnings)
+        _override_category_safe(target, bic, gray_ogs, warnings)
 
+
+def ensure_view_template(view, host_clutter_bics, link_model_bics, wallnoncore_bics,
+                          annotation_bics, override_bics, warnings):
+    """Returns a View-like target already configured with the coordination
+    categories/overrides. Normally that's the shared 'Coordination - Arch vs
+    Str' template (created once, refreshed on every run, reusable across any
+    view). Finding/creating/assigning it can legitimately fail — e.g.
+    View.IsViewValidForTemplateCreation() is False for some view types/
+    states — so on ANY failure here this falls back to applying the exact
+    same categories/overrides directly to the active view instead of
+    aborting the whole command (link visibility, filters and colors still
+    all work in that case; the coordination look just isn't captured as a
+    reusable template for other views this run). The full underlying
+    exception is always logged to `warnings`, never swallowed to a generic
+    message, so the real Revit API error is visible if this keeps failing."""
+    template = _find_view_template_by_name(TEMPLATE_NAME)
+
+    if template is None:
+        try:
+            is_valid = getattr(view, "IsViewValidForTemplateCreation", None)
+            if is_valid is not None and not is_valid():
+                raise Exception(
+                    u"View.IsViewValidForTemplateCreation() returned False for the "
+                    u"active view (e.g. a dependent view, or a view type that can't "
+                    u"become a template).")
+            template_id = view.CreateViewTemplate()
+            template = doc.GetElement(template_id)
+            template.Name = TEMPLATE_NAME
+        except Exception:
+            warnings.append(
+                u"Could not create the '{}' view template — applying categories/"
+                u"overrides directly to the active view instead (link visibility, "
+                u"filters and colors still work; just not saved as a reusable "
+                u"template this run). Underlying error:\n{}".format(
+                    TEMPLATE_NAME, traceback.format_exc()))
+            _apply_coordination_categories(view, host_clutter_bics, link_model_bics,
+                                            wallnoncore_bics, annotation_bics,
+                                            override_bics, warnings)
+            return view
+
+    _apply_coordination_categories(template, host_clutter_bics, link_model_bics,
+                                    wallnoncore_bics, annotation_bics, override_bics, warnings)
     _exclude_rvt_links_from_template_control(template, warnings)
 
     try:
         view.ViewTemplateId = template.Id
-    except Exception as ex:
-        warnings.append(u"Could not apply the '{}' template to the active view: {}".format(
-            TEMPLATE_NAME, ex))
+    except Exception:
+        warnings.append(
+            u"Could not apply the '{}' template to the active view — applying "
+            u"categories/overrides directly to the active view instead. Underlying "
+            u"error:\n{}".format(TEMPLATE_NAME, traceback.format_exc()))
+        _apply_coordination_categories(view, host_clutter_bics, link_model_bics,
+                                        wallnoncore_bics, annotation_bics,
+                                        override_bics, warnings)
+        return view
 
     return template
 
@@ -1585,7 +1626,13 @@ def _next_sheet_number(warnings):
 def _get_view_for_sheet(view, template, warnings):
     """Step: safety check. A view can only be placed on one sheet — if the
     active view is already on one, duplicate it (WithDetailing carries over
-    the element-level hides/overrides already applied) and use the copy."""
+    the element-level hides/overrides already applied) and use the copy.
+
+    `template` may be the fallback active view itself, not a real
+    ViewTemplate (see ensure_view_template) — only re-assign ViewTemplateId
+    when it's genuinely a template; in fallback mode Duplicate(WithDetailing)
+    already copied the view-level category hides/overrides directly, so
+    there's nothing template-related to (re-)apply."""
     if not _view_is_on_a_sheet(view):
         return view
     try:
@@ -1595,11 +1642,12 @@ def _get_view_for_sheet(view, template, warnings):
         warnings.append(u"The active view is already on a sheet and could not be "
                          u"duplicated for a new one: {}".format(ex))
         return None
-    try:
-        new_view.ViewTemplateId = template.Id
-    except Exception as ex:
-        warnings.append(u"Could not apply the '{}' template to the duplicated view: {}".format(
-            TEMPLATE_NAME, ex))
+    if getattr(template, "IsTemplate", False):
+        try:
+            new_view.ViewTemplateId = template.Id
+        except Exception as ex:
+            warnings.append(u"Could not apply the '{}' template to the duplicated view: {}".format(
+                TEMPLATE_NAME, ex))
     return new_view
 
 
@@ -1727,6 +1775,18 @@ def run():
     t = DB.Transaction(doc, u"EasyBIM: Coordination Graphics")
     t.Start()
     try:
+        # Unassign any template already active on this view FIRST. Two
+        # reasons: (1) the original spec requirement — an active template
+        # blocks manual per-view overrides; (2) View.CreateViewTemplate()
+        # can fail (View.IsViewValidForTemplateCreation() == False) when the
+        # view already has a template controlling it, which is the likely
+        # cause if template setup below ever needs its fallback path.
+        try:
+            if view.ViewTemplateId != DB.ElementId.InvalidElementId:
+                view.ViewTemplateId = DB.ElementId.InvalidElementId
+        except Exception as ex:
+            warnings.append(u"Could not clear the view's existing template: {}".format(ex))
+
         host_clutter_bics = _resolve_categories(HOST_CLUTTER_CATEGORY_NAMES, warnings)
         link_model_bics   = _resolve_categories(LINK_MODEL_HIDE_CATEGORY_NAMES, warnings)
         wallnoncore_bics  = _resolve_categories([WALL_NONCORE_CATEGORY_NAME], warnings)
@@ -1735,11 +1795,12 @@ def run():
         traffic_keep_bics = set(_resolve_categories(TRAFFIC_KEEP_CATEGORY_NAMES, warnings))
 
         # ── Step 3: shared view template (host clutter + Step 6 categories) ────
+        # ensure_view_template() never returns None — on any failure it falls
+        # back to configuring the active view directly instead of aborting
+        # the whole command (see its docstring).
         template = ensure_view_template(view, host_clutter_bics, link_model_bics,
                                          wallnoncore_bics, annotation_bics,
                                          override_bics, warnings)
-        if template is None:
-            raise Exception(u"Could not set up the '{}' view template.".format(TEMPLATE_NAME))
 
         # ── Step 5: hide every other link ──────────────────────────────────────
         other_link_ids = SCG.List[DB.ElementId]()
