@@ -1301,6 +1301,27 @@ def _structural_material_texts(link_doc, elem_type):
     return []
 
 
+def _instance_material_texts(link_doc, elem):
+    """Per-INSTANCE 'Material' parameter (MATERIAL_ID_PARAM) — some families
+    expose a per-instance material override distinct from the type's
+    Structural Material default, e.g. a framing/column instance manually
+    swapped to a specific concrete without a matching dedicated type. Type
+    classification is cached per type-id for speed (see
+    _collect_concrete_type_names); this is checked per-instance as a
+    supplementary signal precisely because it CAN vary between instances of
+    the same type in a way the type-level cache wouldn't otherwise catch."""
+    bip = getattr(DB.BuiltInParameter, "MATERIAL_ID_PARAM", None)
+    if bip is None:
+        return []
+    try:
+        p = elem.get_Parameter(bip)
+        if p is not None:
+            return _material_texts(link_doc, p.AsElementId())
+    except Exception:
+        pass
+    return []
+
+
 def _type_is_concrete(link_doc, elem_type, bic, cfg):
     concrete_kw = cfg.get(u"ConcreteKeywords") or []
     exclude_kw  = cfg.get(u"ExcludeKeywords") or []
@@ -1326,10 +1347,20 @@ def _type_is_concrete(link_doc, elem_type, bic, cfg):
     return True
 
 
-def _collect_concrete_type_names(link_doc, categories, cfg, warnings, label):
+def _collect_concrete_type_names(link_doc, categories, cfg, warnings, label, _depth=0):
     """Iterate INSTANCES (not just types) because Wall Structural Usage
-    (Bearing/Shear) is an instance property — a type only counts if at least
-    one qualifying instance uses it.
+    (Bearing/Shear) is an instance property, and because an instance-level
+    Material override (_instance_material_texts) can vary between instances
+    of the same type — a type only counts as concrete via the type cache if
+    at least one qualifying instance uses it, but any single instance whose
+    own Material override reads as concrete adds its type name too, even if
+    the type's own default classification came back negative.
+
+    Recurses one level into any RevitLinkInstance found inside `link_doc`
+    itself (a link nested inside the Arch/Struct link, e.g. a separately-
+    linked rebar/precast file within the Structure model) — capped at one
+    level to bound the work and because Revit doesn't allow circular links
+    so a small fixed cap is enough of a safety margin regardless.
 
     Logs a per-category scanned/matched count via the pyRevit logger (not
     `warnings` — this is routine diagnostic info, not something wrong) so
@@ -1345,6 +1376,9 @@ def _collect_concrete_type_names(link_doc, categories, cfg, warnings, label):
     if link_doc is None:
         return names
 
+    concrete_kw = cfg.get(u"ConcreteKeywords") or []
+    exclude_kw  = cfg.get(u"ExcludeKeywords") or []
+
     for bic in categories:
         try:
             elems = (DB.FilteredElementCollector(link_doc)
@@ -1356,11 +1390,12 @@ def _collect_concrete_type_names(link_doc, categories, cfg, warnings, label):
 
         cat_key = bic.ToString()
         counts = per_category.setdefault(cat_key, [0, 0])
+        is_wall = (bic == DB.BuiltInCategory.OST_Walls)
 
         for elem in elems:
             counts[0] += 1
 
-            if bic == DB.BuiltInCategory.OST_Walls:
+            if is_wall:
                 try:
                     usage = elem.StructuralUsage
                 except Exception:
@@ -1391,6 +1426,18 @@ def _collect_concrete_type_names(link_doc, categories, cfg, warnings, label):
                 type_cache[key] = (is_conc, type_name)
 
             is_conc, type_name = type_cache[key]
+
+            if not is_conc and type_name and not is_wall:
+                try:
+                    inst_texts = _instance_material_texts(link_doc, elem)
+                    if inst_texts:
+                        combined = u" | ".join(inst_texts)
+                        if (_contains_any(combined, concrete_kw)
+                                and not _contains_any(combined, exclude_kw)):
+                            is_conc = True
+                except Exception:
+                    pass
+
             if is_conc and type_name:
                 names.add(type_name)
                 counts[1] += 1
@@ -1401,6 +1448,22 @@ def _collect_concrete_type_names(link_doc, categories, cfg, warnings, label):
         logger.info(u"{}: concrete deep-scan — {}".format(label, breakdown or u"no elements found"))
     except Exception:
         pass
+
+    if _depth < 1:
+        try:
+            nested = list(DB.FilteredElementCollector(link_doc).OfClass(DB.RevitLinkInstance))
+        except Exception:
+            nested = []
+        for ninst in nested:
+            try:
+                ndoc = ninst.GetLinkDocument()
+            except Exception:
+                ndoc = None
+            if ndoc is None:
+                continue
+            names |= _collect_concrete_type_names(
+                ndoc, categories, cfg, warnings,
+                u"{} > nested link".format(label), _depth=_depth + 1)
 
     return names
 
@@ -1623,6 +1686,31 @@ def build_colored_override(color, pattern_name, warnings, label, line_pattern_na
         ogs.SetCutForegroundPatternColor(color)
     except Exception as ex:
         warnings.append(u"{}: could not set the cut foreground pattern color: {}".format(label, ex))
+
+    # Surface (projection) hatch, same pattern/color as the cut hatch above.
+    # NOTE: SetSurfaceTransparency(100) above makes the surface itself
+    # see-through in shaded/realistic views, which can make this pattern
+    # very faint or invisible there even though it's correctly applied —
+    # that's the transparency setting winning, not a broken override. It
+    # still renders normally in Hidden Line / Wireframe visual styles,
+    # which don't apply transparency to fills at all.
+    try:
+        ogs.SetSurfaceForegroundPatternVisible(True)
+    except Exception as ex:
+        warnings.append(u"{}: could not enable the surface foreground pattern: {}".format(label, ex))
+    try:
+        ogs.SetSurfaceBackgroundPatternVisible(False)
+    except Exception as ex:
+        warnings.append(u"{}: could not disable the surface background pattern: {}".format(label, ex))
+    if fill_id != DB.ElementId.InvalidElementId:
+        try:
+            ogs.SetSurfaceForegroundPatternId(fill_id)
+        except Exception as ex:
+            warnings.append(u"{}: could not set the surface foreground pattern id: {}".format(label, ex))
+    try:
+        ogs.SetSurfaceForegroundPatternColor(color)
+    except Exception as ex:
+        warnings.append(u"{}: could not set the surface foreground pattern color: {}".format(label, ex))
 
     return ogs
 
