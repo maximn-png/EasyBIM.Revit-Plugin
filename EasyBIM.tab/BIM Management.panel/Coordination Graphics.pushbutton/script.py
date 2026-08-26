@@ -1242,46 +1242,63 @@ def _contains_any(haystack, keywords):
     return any((k or u"").upper() in up for k in (keywords or []) if k)
 
 
-def _material_name(link_doc, material_id):
+def _material_texts(link_doc, material_id):
+    """[Material.Name, Material.MaterialClass] for one material — MaterialClass
+    matters because a real-world concrete material is very often NAMED after
+    its grade only (e.g. "B30", a standard Israeli/European concrete-strength
+    designation with no "concrete" substring at all), while Revit's own
+    Material Browser classification for a properly set-up concrete material
+    is reliably "Concrete" regardless of what it's actually named. Matching
+    on name text alone misses exactly that case."""
     if material_id is None or material_id == DB.ElementId.InvalidElementId:
-        return u""
+        return []
     try:
         mat = link_doc.GetElement(material_id)
-        return _elem_name(mat)
+        if mat is None:
+            return []
     except Exception:
-        return u""
+        return []
+    out = []
+    name = _elem_name(mat)
+    if name:
+        out.append(name)
+    try:
+        cls = mat.MaterialClass
+        if cls:
+            out.append(cls)
+    except Exception:
+        pass
+    return out
 
 
-def _wall_core_material_names(link_doc, wall_type):
-    names = []
+def _wall_core_material_texts(link_doc, wall_type):
+    texts = []
     try:
         cs = wall_type.GetCompoundStructure()
         if cs is None:
-            return names
+            return texts
         first = cs.GetFirstCoreLayerIndex()
         last  = cs.GetLastCoreLayerIndex()
         layers = list(cs.GetLayers())
         for i, layer in enumerate(layers):
             if first <= i <= last:
-                nm = _material_name(link_doc, layer.MaterialId)
-                if nm:
-                    names.append(nm)
+                texts.extend(_material_texts(link_doc, layer.MaterialId))
     except Exception:
         pass
-    return names
+    return texts
 
 
-def _structural_material_name(link_doc, elem_type):
+def _structural_material_texts(link_doc, elem_type):
     bip = getattr(DB.BuiltInParameter, "STRUCTURAL_MATERIAL_PARAM", None)
     if bip is None:
-        return u""
+        return []
     try:
         p = elem_type.get_Parameter(bip)
         if p is not None:
-            return _material_name(link_doc, p.AsElementId())
+            return _material_texts(link_doc, p.AsElementId())
     except Exception:
         pass
-    return u""
+    return []
 
 
 def _type_is_concrete(link_doc, elem_type, bic, cfg):
@@ -1292,12 +1309,14 @@ def _type_is_concrete(link_doc, elem_type, bic, cfg):
     texts.append(_first_text(elem_type, "ALL_MODEL_DESCRIPTION", u"Description"))
     texts.append(_first_text(elem_type, "ALL_MODEL_TYPE_COMMENTS", u"Type Comments"))
 
+    # OST_Columns / OST_StructuralColumns both fall into the "else" branch
+    # here (only Walls use compound-structure core layers) — Structural
+    # Material + its MaterialClass is the signal for columns/framing/
+    # foundations, same as for any other non-wall structural category.
     if bic == DB.BuiltInCategory.OST_Walls:
-        texts.extend(_wall_core_material_names(link_doc, elem_type))
+        texts.extend(_wall_core_material_texts(link_doc, elem_type))
     else:
-        mat = _structural_material_name(link_doc, elem_type)
-        if mat:
-            texts.append(mat)
+        texts.extend(_structural_material_texts(link_doc, elem_type))
 
     combined = u" | ".join(t for t in texts if t)
     if not _contains_any(combined, concrete_kw):
@@ -1310,9 +1329,18 @@ def _type_is_concrete(link_doc, elem_type, bic, cfg):
 def _collect_concrete_type_names(link_doc, categories, cfg, warnings, label):
     """Iterate INSTANCES (not just types) because Wall Structural Usage
     (Bearing/Shear) is an instance property — a type only counts if at least
-    one qualifying instance uses it."""
+    one qualifying instance uses it.
+
+    Logs a per-category scanned/matched count via the pyRevit logger (not
+    `warnings` — this is routine diagnostic info, not something wrong) so
+    that if an element is ever missing from the coloring despite looking
+    like it should qualify, the pyRevit output window immediately shows
+    whether it's a classification gap (matched count too low) or a filter-
+    matching gap downstream (classification looked right, element still
+    didn't get colored)."""
     names = set()
     type_cache = {}  # type_id (int) -> (is_concrete, type_name)
+    per_category = {}  # category display name -> [scanned, matched]
 
     if link_doc is None:
         return names
@@ -1326,7 +1354,12 @@ def _collect_concrete_type_names(link_doc, categories, cfg, warnings, label):
         except Exception:
             continue
 
+        cat_key = bic.ToString()
+        counts = per_category.setdefault(cat_key, [0, 0])
+
         for elem in elems:
+            counts[0] += 1
+
             if bic == DB.BuiltInCategory.OST_Walls:
                 try:
                     usage = elem.StructuralUsage
@@ -1360,6 +1393,14 @@ def _collect_concrete_type_names(link_doc, categories, cfg, warnings, label):
             is_conc, type_name = type_cache[key]
             if is_conc and type_name:
                 names.add(type_name)
+                counts[1] += 1
+
+    try:
+        breakdown = u", ".join(
+            u"{}: {}/{} matched".format(k, v[1], v[0]) for k, v in sorted(per_category.items()))
+        logger.info(u"{}: concrete deep-scan — {}".format(label, breakdown or u"no elements found"))
+    except Exception:
+        pass
 
     return names
 
