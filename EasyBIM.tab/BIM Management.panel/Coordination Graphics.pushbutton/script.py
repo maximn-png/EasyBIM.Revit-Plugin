@@ -181,18 +181,37 @@ def _elem_name(elem):
     ElementType.Name (FamilySymbol, WallType, and other *Type classes) raises
     AttributeError in this Revit API binding, on both IronPython and CPython3
     pyrevit engines (see pyrevitlabs/pyRevit#854) — Element.Name.GetValue(elem)
-    is the confirmed fix. Falls back to it for any object where plain .Name fails."""
+    is the confirmed fix, tried first. SYMBOL_NAME_PARAM is a second-tier
+    fallback (mainly for FamilySymbol) in case GetValue itself is ever
+    unavailable in some Revit version; None on total failure rather than a
+    raised exception, so a caller iterating many elements never crashes on
+    one bad one."""
     if elem is None:
         return u""
     try:
         return elem.Name or u""
     except AttributeError:
-        try:
-            return DB.Element.Name.GetValue(elem) or u""
-        except Exception:
-            return u""
+        pass
     except Exception:
         return u""
+
+    try:
+        v = DB.Element.Name.GetValue(elem)
+        if v:
+            return v
+    except Exception:
+        pass
+
+    try:
+        bip = getattr(DB.BuiltInParameter, "SYMBOL_NAME_PARAM", None)
+        if bip is not None:
+            p = elem.get_Parameter(bip)
+            if p is not None:
+                return p.AsString() or u""
+    except Exception:
+        pass
+
+    return u""
 
 
 def _resolve_categories(names, warnings):
@@ -1506,14 +1525,23 @@ def find_title_block_symbol(warnings):
 
     token = TITLEBLOCK_TOKEN.upper()
     for sym in symbols:
-        if token in _fam_name(sym).upper() or token in _elem_name(sym).upper():
-            return sym
+        try:
+            if token in _fam_name(sym).upper() or token in _elem_name(sym).upper():
+                return sym
+        except Exception:
+            continue
 
     label_map = {}
     for sym in symbols:
-        label = u"{} : {}".format(_fam_name(sym), _elem_name(sym))
-        label_map[label] = sym
+        try:
+            label = u"{} : {}".format(_fam_name(sym), _elem_name(sym))
+            label_map[label] = sym
+        except Exception:
+            continue
     labels = sorted(label_map.keys())
+    if not labels:
+        warnings.append(u"Could not read any title block type's name — sheet creation was skipped.")
+        return None
 
     picked = ebui.pick_from_list(
         labels, title=u"Select Title Block",
