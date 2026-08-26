@@ -170,10 +170,16 @@ LINK_ANNOTATION_HIDE_CATEGORY_NAMES = [
 ]
 
 # Categories left visible inside the Traffic link when enabled (Step 7).
+# Revised per live-testing feedback: the traffic/civil model in practice
+# marks up slopes and grading via annotated Generic Model families and
+# text/dimension callouts rather than native Spot Elevation/Spot Slope
+# elements, so those replaced OST_SpotElevations/OST_SpotSlopes here.
 TRAFFIC_KEEP_CATEGORY_NAMES = [
     "OST_Parking",
-    "OST_SpotElevations",
-    "OST_SpotSlopes",
+    "OST_GenericModel",
+    "OST_TextNotes",
+    "OST_Dimensions",
+    "OST_GenericAnnotation",
 ]
 
 BASEMENT_TOKENS = (u"BASEMENT", u"מרתף")
@@ -951,6 +957,16 @@ def _apply_coordination_categories(target, host_clutter_bics, link_model_bics, w
     direct-to-view fallback below — SetCategoryHidden/SetCategoryOverrides
     (and, in the caller, AddFilter/SetFilterOverrides) all work identically
     whether `target` is a ViewTemplate or a plain View."""
+    # At Coarse detail level Revit renders walls (and some other categories)
+    # with the wall type's own "Coarse Scale Fill Pattern" instead of
+    # respecting per-element/filter graphic overrides — this can make our
+    # hatch overrides look solid regardless of the Foreground/Background
+    # pattern fix. Fine forces Revit to actually honor the overrides.
+    try:
+        target.DetailLevel = DB.ViewDetailLevel.Fine
+    except Exception as ex:
+        warnings.append(u"Could not set detail level to Fine: {}".format(ex))
+
     for bic in host_clutter_bics:
         _hide_category_safe(target, bic, warnings)
     for bic in link_model_bics:
@@ -1002,8 +1018,16 @@ def ensure_view_template(view, host_clutter_bics, link_model_bics, wallnoncore_b
                     u"View.IsViewValidForTemplateCreation() returned False for the "
                     u"active view (e.g. a dependent view, or a view type that can't "
                     u"become a template).")
-            template_id = view.CreateViewTemplate()
-            template = doc.GetElement(template_id)
+            result = view.CreateViewTemplate()
+            # Confirmed via live testing: this returns the resolved View
+            # object directly (not an ElementId as the API docs' summary
+            # implies) — doc.GetElement(result) would then fail with
+            # "TypeError: expected ElementId, got ViewPlan". Handle both
+            # so this keeps working if that ever differs by Revit version.
+            if isinstance(result, DB.ElementId):
+                template = doc.GetElement(result)
+            else:
+                template = result
             template.Name = TEMPLATE_NAME
         except Exception:
             warnings.append(
@@ -1138,6 +1162,34 @@ def _set_traffic_halftone(view, traffic_link, warnings):
         view.SetElementOverrides(traffic_link[u"id"], ogs)
     except Exception as ex:
         warnings.append(u"Could not apply halftone to the Traffic link instance: {}".format(ex))
+
+
+def _set_traffic_link_custom_mode(view, traffic_link, warnings):
+    """Best-effort only: RevitLinkGraphicsSettings/View.GetLinkOverrides was
+    only added in the Revit 2024 API (this extension targets 2023+), and
+    even there it exposes just LinkVisibilityType/LinkedViewId — no
+    per-category control (see module docstring). This does NOT gate whether
+    _restrict_traffic_link_visibility/_set_traffic_halftone above actually
+    work: element-level HideElements/SetElementOverrides on the host view
+    are a separate mechanism from link display mode and apply regardless.
+    Attempted anyway since it's cheap and harmless if unsupported."""
+    settings_cls = getattr(DB, "RevitLinkGraphicsSettings", None)
+    if settings_cls is None:
+        return
+    try:
+        link_settings = view.GetLinkOverrides(traffic_link[u"id"])
+        if link_settings is None:
+            link_settings = settings_cls()
+        vis_type = getattr(DB, "LinkVisibilityType", None)
+        if vis_type is None:
+            return
+        link_settings.LinkVisibilityType = vis_type.Custom
+        view.SetLinkOverrides(traffic_link[u"id"], link_settings)
+    except Exception as ex:
+        warnings.append(
+            u"Could not set the Traffic link's display mode to Custom (likely "
+            u"unavailable before Revit 2024) — informational only, category "
+            u"visibility inside the link was still applied directly: {}".format(ex))
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -1664,6 +1716,10 @@ def build_colored_override(color, pattern_name, warnings, label, line_pattern_na
         ogs.SetCutBackgroundPatternVisible(False)
     except Exception as ex:
         warnings.append(u"{}: could not disable the cut background pattern: {}".format(label, ex))
+    try:
+        ogs.SetCutBackgroundPatternId(DB.ElementId.InvalidElementId)
+    except Exception:
+        pass
 
     try:
         ogs.SetCutForegroundPatternVisible(True)
@@ -1702,6 +1758,10 @@ def build_colored_override(color, pattern_name, warnings, label, line_pattern_na
         ogs.SetSurfaceBackgroundPatternVisible(False)
     except Exception as ex:
         warnings.append(u"{}: could not disable the surface background pattern: {}".format(label, ex))
+    try:
+        ogs.SetSurfaceBackgroundPatternId(DB.ElementId.InvalidElementId)
+    except Exception:
+        pass
     if fill_id != DB.ElementId.InvalidElementId:
         try:
             ogs.SetSurfaceForegroundPatternId(fill_id)
@@ -2009,6 +2069,7 @@ def run():
 
         # ── Step 7: Traffic link ────────────────────────────────────────────────
         if use_traffic and traffic_link:
+            _set_traffic_link_custom_mode(view, traffic_link, warnings)
             _restrict_traffic_link_visibility(view, traffic_link, traffic_keep_bics, warnings)
             _set_traffic_halftone(view, traffic_link, warnings)
 
