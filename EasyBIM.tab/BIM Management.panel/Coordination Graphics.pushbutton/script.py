@@ -227,6 +227,19 @@ GRAY_COLOR = DB.Color(190, 190, 190)
 
 # Host-model categories hidden on the template to declutter (Step 3). Not
 # exhaustive — edit freely.
+#
+# BUG FOUND while implementing the whitelist filters below: OST_Parking was
+# in this list from the very first version of this tool -- a CATEGORY-level
+# hide on the template suppresses that category everywhere the template
+# governs, including inside the Traffic link (element-level "not hidden" in
+# _restrict_traffic_link_visibility cannot override a category that's
+# hidden outright -- category hide is the stronger, overriding mechanism).
+# This directly contradicted TRAFFIC_KEEP_CATEGORY_NAMES = ["OST_Parking"]
+# the whole time, regardless of how correct the Traffic-specific logic was.
+# Removed here so Parking can actually show inside the Traffic link; if the
+# HOST document itself has its own Parking elements that are genuinely
+# clutter, that would need a narrower, element-level hide (like
+# _hide_host_grids does for Grids), not a category-level one.
 HOST_CLUTTER_CATEGORY_NAMES = [
     "OST_Furniture",
     "OST_FurnitureSystems",
@@ -235,12 +248,58 @@ HOST_CLUTTER_CATEGORY_NAMES = [
     "OST_Planting",
     "OST_Entourage",
     "OST_Site",
-    "OST_Parking",
     "OST_Sections",
     "OST_ElevationMarks",
     "OST_Callouts",
     "OST_GenericModel",
     "OST_Mass",
+]
+
+# ── Bulletproof View-Filter-based category hides (this round) ──────────────
+# Category-level SetCategoryHidden and RevitLinkGraphicsSettings both hit
+# real limitations for hiding link content by category (see module
+# docstring / _apply_link_display_settings). View Filters reach linked
+# elements the same way this tool's Structure/Architecture coloring
+# filters already do (Step 8's whole premise), so the same mechanism is
+# reused here as a "hide everything except this whitelist" sweep, per
+# explicit request and accepted tradeoff: this affects the ENTIRE host
+# project everywhere the shared template is used, not just links.
+FILTER_NAME_HIDE_ANNOTATIONS = u"EasyBIM - Hide All Annotations"
+FILTER_NAME_WHITELIST_MODEL  = u"EasyBIM - Whitelist Model Categories"
+
+# Room Tags are the one Annotation category deliberately exempted from the
+# "hide all" sweep — existing, explicit spec requirement, see
+# _ensure_room_tags_visible.
+ANNOTATION_HIDE_KEEP_VISIBLE = ["OST_RoomTags"]
+
+# Model categories exempted from the "hide everything else" sweep.
+# Deliberately differs from the literal list requested in two ways, both
+# to avoid silently reversing existing, previously-confirmed decisions
+# that a fresh generic whitelist didn't cross-reference:
+#   - OST_Floors is NOT included: hiding Floors inside the links has been
+#     an explicit, unreversed requirement since the very first version of
+#     this tool (see LINK_MODEL_HIDE_CATEGORY_NAMES) -- keeping it hidden.
+#   - OST_GenericModel is NOT included: already deliberately hidden as
+#     host clutter since the very first version (HOST_CLUTTER_CATEGORY_
+#     NAMES above), with no complaint about it being hidden since --
+#     leaving it hidden rather than silently un-hiding it.
+# OST_Grids is ADDED (not in the literal request): Grids must stay
+# visible per an existing, explicit requirement (Refinement 1) -- without
+# this, the whitelist sweep would hide them.
+WHITELIST_MODEL_CATEGORY_NAMES = [
+    "OST_Walls",
+    "OST_Columns",
+    "OST_StructuralColumns",
+    "OST_StructuralFraming",
+    "OST_StructuralFoundation",
+    "OST_Stairs",
+    "OST_Doors",
+    "OST_Windows",
+    "OST_Parking",
+    "OST_Roofs",
+    "OST_Ceilings",
+    "OST_RvtLinks",
+    "OST_Grids",
 ]
 
 # Model categories hidden on the template (Step 6). OST_Toposolid only exists
@@ -1389,6 +1448,14 @@ def _apply_coordination_categories(target, host_clutter_bics, link_model_bics, w
     if grids_bic is not None:
         _hide_category_safe(target, grids_bic, warnings, hide=False)
 
+    # Bulletproof View-Filter-based sweep, by explicit request after
+    # SetCategoryHidden/RevitLinkGraphicsSettings both hit real limitations
+    # for hiding link content by category — see FILTER_NAME_HIDE_ANNOTATIONS/
+    # WHITELIST_MODEL_CATEGORY_NAMES above for exactly what's kept visible
+    # and why (including two deliberate deviations from the literal request).
+    _apply_annotation_hide_filter(target, warnings)
+    _apply_model_whitelist_filter(target, warnings)
+
     # Live-testing finding: a non-concrete wall (e.g. "15_BLOCK", correctly
     # excluded from the Structure/Architecture Filters by name) still
     # showed its own hardcoded Type Properties "Coarse Scale Fill Color"
@@ -2181,6 +2248,92 @@ def _find_existing_filter(name):
         if _elem_name(f) == name:
             return f
     return None
+
+
+def _build_and_hide_by_categories(target, filter_name, cat_ids, warnings):
+    """Bulletproof, View-Filter-based category hide. A ParameterFilterElement
+    scoped to `cat_ids` with NO ElementFilter rule set matches every element
+    in those categories (confirmed via reflecting the installed RevitAPI.dll:
+    ParameterFilterElement.Create has a real 3-argument overload — Document,
+    name, categories — with no ElementFilter parameter at all, so this isn't
+    a workaround, it's a directly-supported creation mode). Applied via
+    View.SetFilterVisibility(id, False) — a real, distinct method from
+    SetFilterOverrides (confirmed via reflection), the API for the
+    "Visibility" checkbox in the Filters tab of V/G Overrides, genuinely
+    suppressing matched elements rather than just recoloring them.
+
+    View Filters reach linked elements the same way this tool's Structure/
+    Architecture coloring filters already do (Step 8's whole premise) — this
+    is why this mechanism was reached for after both SetCategoryHidden (on
+    the template) and RevitLinkGraphicsSettings (which has no category
+    control at all) hit real limitations."""
+    if not cat_ids:
+        return
+    net_cat_ids = SCG.List[DB.ElementId](cat_ids)
+    pfe = _find_existing_filter(filter_name)
+    try:
+        if pfe is None:
+            pfe = DB.ParameterFilterElement.Create(doc, filter_name, net_cat_ids)
+        else:
+            pfe.SetCategories(net_cat_ids)
+    except Exception as ex:
+        warnings.append(u"Could not create/update view filter '{}': {}".format(filter_name, ex))
+        return
+    try:
+        applied_ids = [i.IntegerValue for i in target.GetFilters()]
+        if pfe.Id.IntegerValue not in applied_ids:
+            target.AddFilter(pfe.Id)
+        target.SetFilterVisibility(pfe.Id, False)
+    except Exception as ex:
+        warnings.append(u"Could not apply view filter '{}': {}".format(filter_name, ex))
+
+
+def _apply_annotation_hide_filter(target, warnings):
+    """Every Annotation category except ANNOTATION_HIDE_KEEP_VISIBLE (Room
+    Tags). Category.get_AllowsVisibilityControl checked per category to
+    skip (not warn about — matches _hide_category_safe's own reasoning)
+    the ones Revit itself says can't be controlled here, same as every
+    other category-touching function in this file."""
+    keep_names = set(ANNOTATION_HIDE_KEEP_VISIBLE)
+    cat_ids = []
+    for cat in doc.Settings.Categories:
+        try:
+            if cat.CategoryType != DB.CategoryType.Annotation:
+                continue
+            try:
+                bic_name = DB.BuiltInCategory(cat.Id.IntegerValue).ToString()
+            except Exception:
+                bic_name = None
+            if bic_name in keep_names:
+                continue
+            if not cat.get_AllowsVisibilityControl(target):
+                continue
+            cat_ids.append(cat.Id)
+        except Exception:
+            continue
+    _build_and_hide_by_categories(target, FILTER_NAME_HIDE_ANNOTATIONS, cat_ids, warnings)
+
+
+def _apply_model_whitelist_filter(target, warnings):
+    """Every Model category except WHITELIST_MODEL_CATEGORY_NAMES."""
+    keep_bics = set(_resolve_categories(WHITELIST_MODEL_CATEGORY_NAMES, warnings))
+    cat_ids = []
+    for cat in doc.Settings.Categories:
+        try:
+            if cat.CategoryType != DB.CategoryType.Model:
+                continue
+            try:
+                bic = DB.BuiltInCategory(cat.Id.IntegerValue)
+            except Exception:
+                bic = None
+            if bic is not None and bic in keep_bics:
+                continue
+            if not cat.get_AllowsVisibilityControl(target):
+                continue
+            cat_ids.append(cat.Id)
+        except Exception:
+            continue
+    _build_and_hide_by_categories(target, FILTER_NAME_WHITELIST_MODEL, cat_ids, warnings)
 
 
 _STALE_COLUMN_FILTER_NAMES = (
