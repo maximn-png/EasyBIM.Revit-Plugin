@@ -104,16 +104,19 @@ _apply_coordination_categories forces the HOST template/view to
 DB.ViewDetailLevel.Fine, which is unrelated and unaffected by this).
 There is no API way to force a linked view's Detail Level independently
 of the view itself: RevitLinkGraphicsSettings has only IsValidObject/
-LinkVisibilityType/LinkedViewId (confirmed via reflection, twice). Fixed
-defensively rather than by editing someone else's linked file: candidate
-Smart Linked Views are now sorted with Coarse-detail ones last and
-flagged directly in the combo label; if a Coarse view is chosen anyway,
-_apply_smart_linked_view adds an explicit warning at Apply time. Directly
-setting the chosen linked view's own DetailLevel to Fine (by opening a
-transaction against that view's own, separate Document) was deliberately
-NOT implemented — that would silently edit a shared team file (the
-Architecture/Structure consultant's own model) as a side effect of a
-host-side coordination tool, which needs the user's explicit go-ahead.
+LinkVisibilityType/LinkedViewId (confirmed via reflection three times
+now, across two sessions — there is still no SetDetailLevel). Candidate
+Smart Linked Views are sorted with Coarse-detail ones last and flagged
+directly in the combo label (so this should be rare to hit in the first
+place); if a Coarse view is chosen anyway, _ensure_linked_view_detail_level
+now FORCES that view's own DetailLevel to Fine, by explicit user request
+after being told what it requires — opening and committing a separate
+Transaction directly against the linked document itself (a different
+Document from the host). This DOES edit the Architecture/Structure/
+Traffic team's own file, not just something local to this coordination
+view; it falls back to a warning (not a hard failure) if the link isn't
+editable in this session, e.g. read-only or owned by another user in a
+workshared central model.
 """
 
 __title__ = "Coordination\nGraphics"
@@ -1206,8 +1209,26 @@ def is_basement_view(view):
 
 
 def _hide_category_safe(target, bic, warnings, hide=True):
+    """Checked live-testing finding: SetCategoryHidden(..., True) throws
+    ArgumentException ("Category cannot be hidden") for some categories in
+    some view types — e.g. OST_ElevationMarks in a Floor Plan — which
+    matches a grayed-out, un-editable row in Revit's own V/G Overrides
+    dialog for that exact view/category combination. That's not a bug to
+    warn about every run — it's Revit itself saying this category has
+    nothing to hide here. Checked via Category.get_AllowsVisibilityControl
+    (confirmed real via reflecting the installed RevitAPI.dll) *before*
+    attempting the hide, so the expected, un-fixable case exits silently
+    instead of logging a warning; the try/except below still catches and
+    warns about anything genuinely unexpected."""
     try:
         cat_id = DB.ElementId(bic)
+        if hide:
+            try:
+                cat = DB.Category.GetCategory(doc, bic)
+                if cat is not None and not cat.get_AllowsVisibilityControl(target):
+                    return
+            except Exception:
+                pass
         target.SetCategoryHidden(cat_id, hide)
     except Exception as ex:
         warnings.append(u"Could not {} category '{}': {}".format(
@@ -1580,6 +1601,49 @@ def _apply_link_display_settings(target, link_id, linked_view_id, warnings, labe
             u"visibility inside the link was still applied directly: {}".format(label, ex))
 
 
+def _ensure_linked_view_detail_level(chosen, warnings, label):
+    """Forces the CHOSEN linked view's own DetailLevel to Fine when it's
+    Coarse — by explicit user request, after being told this requires
+    editing the linked document itself (there is still no
+    RevitLinkGraphicsSettings.DetailLevel/SetDetailLevel — reflecting the
+    installed RevitAPI.dll confirms that class has exactly three members:
+    IsValidObject, LinkVisibilityType, LinkedViewId — so the picked view's
+    own DetailLevel property is the only place this setting actually
+    lives). This opens and commits its OWN Transaction against `link_doc`
+    (a separate Document from the host, which is mid-transaction at the
+    call site below — independent Transactions on different Documents can
+    be open concurrently, no special nesting needed) — meaning it changes
+    a view's Detail Level inside the Architecture/Structure/Traffic team's
+    own file, not just something local to this coordination view. If the
+    link isn't editable in this session (opened read-only, or elements
+    owned by another user in a workshared central model), this rolls back
+    and falls back to a warning instead of blocking the rest of the
+    command."""
+    if chosen is None or not chosen.get(u"is_coarse"):
+        return
+    view = chosen[u"view"]
+    link_doc = chosen[u"link"].get(u"doc")
+    if link_doc is None:
+        return
+    lt = DB.Transaction(link_doc, u"EasyBIM: set linked view Detail Level to Fine")
+    try:
+        lt.Start()
+        view.DetailLevel = DB.ViewDetailLevel.Fine
+        lt.Commit()
+        chosen[u"is_coarse"] = False
+    except Exception as ex:
+        try:
+            lt.RollBack()
+        except Exception:
+            pass
+        warnings.append(
+            u"Could not force the {} linked view '{}' Detail Level to Fine in its own file "
+            u"(it may not be editable in this session — read-only, or owned by another user "
+            u"in a workshared central model): {}. Revit may still show that link's elements "
+            u"with their own hardcoded 'Coarse Scale Fill Pattern' Type Property instead of "
+            u"this tool's hatch.".format(label, chosen[u"name"], ex))
+
+
 def _apply_smart_linked_view(target, role_links, chosen, warnings, label):
     """chosen: None, or {'view':, 'link':} from the wizard's linked-view
     combo for this role. Only the ONE underlying link the chosen view
@@ -1589,35 +1653,19 @@ def _apply_smart_linked_view(target, role_links, chosen, warnings, label):
     exactly as they were (ByHostView, the default — View Filters keep
     applying to them without question, see module docstring).
 
-    COARSE DETAIL LEVEL RISK (live-testing finding — a wall type's own
-    "Coarse Scale Fill Pattern" Type Property, set to solid blue, was
-    showing through instead of this tool's Filter hatch): Revit's own UI
-    docs describe Custom mode's "Linked view" pick as importing that view's
-    "display settings" into the host view for that link — plausibly
-    including Detail Level, not just view range/cut plane. There is NO API
-    way to force this independently of the picked view: reflecting the
-    installed RevitAPI.dll (both this session and two sessions ago) shows
-    RevitLinkGraphicsSettings has exactly three members — IsValidObject,
-    LinkVisibilityType, LinkedViewId — no DetailLevel/SetDetailLevel at
-    all. The only place Detail Level actually lives is on the View object
-    itself, so the two options are: (a) warn when the CHOSEN view is
-    Coarse (done below — _find_matching_link_views/_populate_linked_view_
-    combo also already sort Coarse candidates last and flag them in the
-    combo label, so this should be rare in practice), or (b) reach into
-    the LINKED document and change that view's own DetailLevel to Fine —
-    NOT done here: that edits a shared team file (the Architecture/
-    Structure consultant's own model) as a side effect of a host-side
-    coordination tool, which needs the user's explicit go-ahead, not a
-    silent default."""
+    Forces the chosen view's own Detail Level to Fine first if it's Coarse
+    (see _ensure_linked_view_detail_level) — the remaining warning below
+    only fires if that force-fix itself failed, not merely because the
+    view started out Coarse."""
     if chosen is None:
         return
+    _ensure_linked_view_detail_level(chosen, warnings, label)
     if chosen.get(u"is_coarse"):
         warnings.append(
-            u"The {} linked view '{}' has Detail Level set to Coarse in its own file — "
-            u"Revit may show that link's elements with their own hardcoded 'Coarse Scale "
-            u"Fill Pattern' Type Property instead of this tool's red/blue hatch. Pick a "
-            u"different linked view, or ask the source model's owner to set this view's "
-            u"Detail Level to Medium/Fine.".format(label, chosen[u"name"]))
+            u"The {} linked view '{}' still has Detail Level set to Coarse in its own file "
+            u"— Revit may show that link's elements with their own hardcoded 'Coarse Scale "
+            u"Fill Pattern' Type Property instead of this tool's red/blue hatch.".format(
+                label, chosen[u"name"]))
     chosen_link_int_id = chosen[u"link"][u"id"].IntegerValue
     for li in role_links:
         if li[u"id"].IntegerValue == chosen_link_int_id:
@@ -2581,6 +2629,7 @@ def run():
 
         # ── Step 7: Traffic link ────────────────────────────────────────────────
         if use_traffic and traffic_link:
+            _ensure_linked_view_detail_level(traffic_linked_view, warnings, u"Traffic")
             linked_view_id = traffic_linked_view[u"view"].Id if traffic_linked_view else None
             _apply_link_display_settings(template, traffic_link[u"id"], linked_view_id,
                                           warnings, u"Traffic")
