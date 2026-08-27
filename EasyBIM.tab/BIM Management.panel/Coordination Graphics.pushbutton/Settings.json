@@ -5,20 +5,23 @@
     "R": 0
   },
   "ArchLinkKeywords": [
-    "ARC"
+    "ARC",
+    "AR"
   ],
   "ArchPatternName": "Diagonal Down - 1.5mm",
-  "ColumnLinePatternName": "Dashed",
   "ConcreteKeywords": [
     "Concrete",
-    "בטון"
+    "בטון",
+    "Con",
+    "Conc"
   ],
   "ExcludeKeywords": [
     "Block",
     "בלוק",
     "Light",
     "קל",
-    "מילוי"
+    "מילוי",
+    "GYP"
   ],
   "StructColor": {
     "B": 30,
@@ -26,10 +29,12 @@
     "R": 200
   },
   "StructLinkKeywords": [
-    "STR"
+    "STR",
+    "ST"
   ],
   "StructPatternName": "Diagonal Up - 1.5mm",
   "TrafficLinkKeywords": [
+    "TR",
     "TRF",
     "Traffic",
     "תנועה"
