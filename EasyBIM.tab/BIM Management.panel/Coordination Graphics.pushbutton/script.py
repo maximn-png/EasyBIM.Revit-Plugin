@@ -59,6 +59,37 @@ few enough per model that this is low-risk even if unsupported (falls back
 to a warning, not a crash). Host grids are hidden the same way — element-
 level, not category-level — because hiding OST_Grids as a category (the
 template) would also hide the links' grids, which must stay visible.
+
+SMART LINKED VIEW (elevation-matched view picker, one per role): each of
+Architecture/Structure/Traffic gets an optional WPF combo, populated by
+finding the SINGLE closest Level in the selected link(s) within
+LEVEL_ELEVATION_TOLERANCE_FT of the active view's own Level (compared via
+RevitLinkInstance.GetTotalTransform(), not raw Level.Elevation-to-
+Level.Elevation — see _find_matching_link_views), then collecting that
+level's non-template, non-dependent ViewPlans. Applying a chosen view sets
+RevitLinkGraphicsSettings.LinkVisibilityType=Custom + LinkedViewId on just
+the one underlying link that view belongs to (_apply_link_display_settings),
+which drives that link's view range/cut plane/detail level/phase from the
+picked view. Fixed a real, previously silent bug while building this: the
+prior Traffic-only Custom-mode code looked up getattr(DB,
+"LinkVisibilityType", None) as if it were a top-level enum type — it isn't;
+that name only exists as a *property* name on RevitLinkGraphicsSettings.
+The actual enum type is DB.LinkVisibility (members ByHostView/ByLinkView/
+Custom), confirmed by reflecting the installed RevitAPI.dll directly. The
+old lookup always returned None, so SetLinkOverrides was silently never
+called on any run — no exception, no warning, it just quietly no-opped.
+UNVERIFIED RISK (flag for the next live test): Revit's own "Custom Display
+Settings for Linked Revit Models" UI has a separate "View filters" control
+(By host view / By linked view / None) alongside the "Linked view" picker —
+RevitLinkGraphicsSettings has no property for that control at all (only
+LinkVisibilityType + LinkedViewId exist, confirmed via reflection). Whether
+Custom+LinkedViewId still evaluates the HOST's View Filters (this tool's
+red/blue coloring) on that link, or silently uses the picked view's own
+filters instead, is genuinely undocumented from the API side. Low risk for
+Traffic (its coloring/visibility never depended on View Filters); real risk
+for Architecture/Structure, since that's the one thing this tool can't
+function without — confirm on the next test that a link with a linked view
+assigned still shows correct red/blue coloring.
 """
 
 __title__ = "Coordination\nGraphics"
@@ -459,6 +490,8 @@ PICKER_XAML = u"""
               <ScrollViewer MaxHeight="120" VerticalScrollBarVisibility="Auto">
                 <StackPanel x:Name="ArchLinksPanel"/>
               </ScrollViewer>
+              <TextBlock Text="ARCHITECTURE LINKED VIEW" Style="{StaticResource SectionLabel}" Margin="0,10,0,6"/>
+              <ComboBox x:Name="ArchLinkedViewCombo" Style="{StaticResource ComboStyle}"/>
             </StackPanel>
           </Border>
           <Border Style="{StaticResource Card}">
@@ -467,6 +500,8 @@ PICKER_XAML = u"""
               <ScrollViewer MaxHeight="120" VerticalScrollBarVisibility="Auto">
                 <StackPanel x:Name="StructLinksPanel"/>
               </ScrollViewer>
+              <TextBlock Text="STRUCTURE LINKED VIEW" Style="{StaticResource SectionLabel}" Margin="0,10,0,6"/>
+              <ComboBox x:Name="StructLinkedViewCombo" Style="{StaticResource ComboStyle}"/>
             </StackPanel>
           </Border>
           <TextBlock x:Name="Step2Error" Foreground="#d64545" FontSize="11.5" TextWrapping="Wrap"/>
@@ -481,6 +516,8 @@ PICKER_XAML = u"""
                         Content="Show Parking &amp; Elevations from Traffic Link"/>
               <StackPanel x:Name="TrafficPanel" Margin="0,10,0,0" Visibility="Collapsed">
                 <ComboBox x:Name="TrafficCombo" Style="{StaticResource ComboStyle}"/>
+                <TextBlock Text="TRAFFIC LINKED VIEW" Style="{StaticResource SectionLabel}" Margin="0,10,0,6"/>
+                <ComboBox x:Name="TrafficLinkedViewCombo" Style="{StaticResource ComboStyle}"/>
               </StackPanel>
             </StackPanel>
           </Border>
@@ -556,11 +593,17 @@ class LinkPickerDialog(object):
         self.traffic_link  = None
         self.use_traffic   = False
         self.scope_box     = None
+        self.arch_linked_view    = None
+        self.struct_linked_view  = None
+        self.traffic_linked_view = None
         self._window       = None
         self._by_name      = {}
         self._scope_by_name = {}
         self._arch_checks  = []
         self._struct_checks = []
+        self._arch_view_by_label    = {}
+        self._struct_view_by_label  = {}
+        self._traffic_view_by_label = {}
         self._step         = 1
 
     def _build(self):
@@ -599,6 +642,44 @@ class LinkPickerDialog(object):
             traffic_combo.Items.Add(n)
         if traffic_name:
             traffic_combo.SelectedItem = traffic_name
+
+        # Smart Linked View — elevation-matched, '#'-prioritized view picker
+        # per role (see _find_matching_link_views). Repopulated live on every
+        # relevant checkbox/combo change, not just once "on load", so the
+        # list never goes stale if the user changes which link(s) are
+        # selected for a role after the wizard opens.
+        host_level = self.view_info.get(u"level_obj")
+        arch_view_combo    = w.FindName(u"ArchLinkedViewCombo")
+        struct_view_combo  = w.FindName(u"StructLinkedViewCombo")
+        traffic_view_combo = w.FindName(u"TrafficLinkedViewCombo")
+
+        def _refresh_arch_views(sender, e):
+            selected = [self._by_name[n] for n in self._checked_names(self._arch_checks)]
+            matches = _find_matching_link_views(selected, host_level)
+            self._arch_view_by_label = _populate_linked_view_combo(arch_view_combo, matches)
+
+        def _refresh_struct_views(sender, e):
+            selected = [self._by_name[n] for n in self._checked_names(self._struct_checks)]
+            matches = _find_matching_link_views(selected, host_level)
+            self._struct_view_by_label = _populate_linked_view_combo(struct_view_combo, matches)
+
+        def _refresh_traffic_views(sender, e):
+            sel_name = traffic_combo.SelectedItem
+            selected = [self._by_name[sel_name]] if sel_name else []
+            matches = _find_matching_link_views(selected, host_level)
+            self._traffic_view_by_label = _populate_linked_view_combo(traffic_view_combo, matches)
+
+        for cb in self._arch_checks:
+            cb.Checked   += _refresh_arch_views
+            cb.Unchecked += _refresh_arch_views
+        for cb in self._struct_checks:
+            cb.Checked   += _refresh_struct_views
+            cb.Unchecked += _refresh_struct_views
+        traffic_combo.SelectionChanged += _refresh_traffic_views
+
+        _refresh_arch_views(None, None)
+        _refresh_struct_views(None, None)
+        _refresh_traffic_views(None, None)
 
         # Scope box — "None" always first/default
         scope_combo = w.FindName(u"ScopeBoxCombo")
@@ -669,7 +750,9 @@ class LinkPickerDialog(object):
             1: u"This tool modifies the ACTIVE view's visibility, categories, filters and view "
                u"template — confirm you're on the right view before continuing.",
             2: u"Pick one or more Architecture links and one or more Structure links. Pre-checked "
-               u"from your last run or auto-detected by keyword — change either if needed.",
+               u"from your last run or auto-detected by keyword — change either if needed. Each "
+               u"card also offers a matching linked view (by level elevation) to drive that "
+               u"link's view range and cut plane — leave it on \"None\" to use the host view's.",
             3: u"Optional: also restrict a Traffic link to Parking, Spot Elevations and Spot "
                u"Slopes only, shown in halftone.",
             4: u"Review your choices, then click Apply to set up coordination graphics and "
@@ -715,10 +798,17 @@ class LinkPickerDialog(object):
         use_traffic  = bool(w.FindName(u"TrafficCheck").IsChecked)
         traffic_name = w.FindName(u"TrafficCombo").SelectedItem if use_traffic else None
 
+        arch_view    = w.FindName(u"ArchLinkedViewCombo").SelectedItem or NONE_LINKED_VIEW_LABEL
+        struct_view  = w.FindName(u"StructLinkedViewCombo").SelectedItem or NONE_LINKED_VIEW_LABEL
+        traffic_view = (w.FindName(u"TrafficLinkedViewCombo").SelectedItem or NONE_LINKED_VIEW_LABEL
+                        if use_traffic else None)
+
         w.FindName(u"SumView").Text    = u"Active view: {}".format(self.view_info.get(u"name", u""))
-        w.FindName(u"SumArch").Text    = u"Architecture link(s): {}".format(u", ".join(arch_names) or u"—")
-        w.FindName(u"SumStruct").Text  = u"Structure link(s): {}".format(u", ".join(struct_names) or u"—")
-        w.FindName(u"SumTraffic").Text = (u"Traffic link: {}".format(traffic_name)
+        w.FindName(u"SumArch").Text    = u"Architecture link(s): {} — linked view: {}".format(
+            u", ".join(arch_names) or u"—", arch_view)
+        w.FindName(u"SumStruct").Text  = u"Structure link(s): {} — linked view: {}".format(
+            u", ".join(struct_names) or u"—", struct_view)
+        w.FindName(u"SumTraffic").Text = (u"Traffic link: {} — linked view: {}".format(traffic_name, traffic_view)
                                            if (use_traffic and traffic_name)
                                            else u"Traffic link: (not used)")
 
@@ -777,6 +867,16 @@ class LinkPickerDialog(object):
         self.traffic_link  = self._by_name[traffic_name] if (use_traffic and traffic_name) else None
         self.use_traffic   = use_traffic
         self.scope_box     = self._scope_by_name.get(scope_name)
+
+        arch_view_label    = w.FindName(u"ArchLinkedViewCombo").SelectedItem
+        struct_view_label  = w.FindName(u"StructLinkedViewCombo").SelectedItem
+        traffic_view_label = w.FindName(u"TrafficLinkedViewCombo").SelectedItem if use_traffic else None
+
+        self.arch_linked_view    = self._arch_view_by_label.get(arch_view_label)
+        self.struct_linked_view  = self._struct_view_by_label.get(struct_view_label)
+        self.traffic_linked_view = (self._traffic_view_by_label.get(traffic_view_label)
+                                     if use_traffic else None)
+
         self.cancelled = False
         w.Close()
 
@@ -856,6 +956,119 @@ def get_all_link_instances():
             u"loaded"  : link_doc is not None,
         })
     return links
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# SMART LINKED VIEW  (elevation-matched, #-prioritized per-link view picker)
+# ─────────────────────────────────────────────────────────────────────────────
+
+LEVEL_ELEVATION_TOLERANCE_FT = 1.0
+# ~300mm — generous enough to bridge typical Architecture-finished-floor vs.
+# Structure-top-of-slab datum offsets, tight enough not to conflate two
+# genuinely different stories. Compared in the HOST document's internal
+# coordinate system (each link's own Level.Elevation run through
+# RevitLinkInstance.GetTotalTransform()), not raw Level.Elevation-to-
+# Level.Elevation — a link's own internal origin/Project Base Point can
+# differ from the host's even when both are placed correctly.
+
+NONE_LINKED_VIEW_LABEL     = u"<None (By Host View)>"
+NO_MATCH_LINKED_VIEW_LABEL = u"<No found matching views>"
+
+
+def _find_matching_link_views(link_infos, host_level):
+    """link_infos: link dicts (from get_all_link_instances()) currently
+    selected for one role — may be more than one for Architecture/Structure.
+    host_level: the active view's Level (view.GenLevel), or None.
+
+    For each link, finds the SINGLE closest Level within
+    LEVEL_ELEVATION_TOLERANCE_FT of the host level, then collects every
+    ViewPlan on that level, excluding templates and dependent views
+    (View.GetPrimaryViewId() != InvalidElementId means "this is a dependent
+    view of some other primary view" — skipped). Returns a flat list of
+    {'view':, 'link':, 'name':} across all given links, sorted so any view
+    name starting with '#' sorts first (then alphabetically)."""
+    if host_level is None:
+        return []
+    try:
+        host_elev = host_level.Elevation
+    except Exception:
+        return []
+
+    results = []
+    for li in link_infos:
+        link_doc = li.get(u"doc")
+        inst     = li.get(u"instance")
+        if link_doc is None or inst is None:
+            continue
+        try:
+            transform = inst.GetTotalTransform()
+        except Exception:
+            continue
+
+        try:
+            levels = list(DB.FilteredElementCollector(link_doc).OfClass(DB.Level))
+        except Exception:
+            levels = []
+        best_level_id = None
+        best_diff = None
+        for lvl in levels:
+            try:
+                pt = transform.OfPoint(DB.XYZ(0.0, 0.0, lvl.Elevation))
+                diff = abs(pt.Z - host_elev)
+                if diff <= LEVEL_ELEVATION_TOLERANCE_FT and (best_diff is None or diff < best_diff):
+                    best_diff = diff
+                    best_level_id = lvl.Id.IntegerValue
+            except Exception:
+                continue
+        if best_level_id is None:
+            continue
+
+        try:
+            plans = list(DB.FilteredElementCollector(link_doc).OfClass(DB.ViewPlan))
+        except Exception:
+            plans = []
+        for vp in plans:
+            try:
+                if vp.IsTemplate:
+                    continue
+                gen_level = vp.GenLevel
+                if gen_level is None or gen_level.Id.IntegerValue != best_level_id:
+                    continue
+                if vp.GetPrimaryViewId() != DB.ElementId.InvalidElementId:
+                    continue  # dependent view
+            except Exception:
+                continue
+            results.append({u"view": vp, u"link": li, u"name": _elem_name(vp) or u"?"})
+
+    results.sort(key=lambda r: (0 if r[u"name"].startswith(u"#") else 1, r[u"name"].upper()))
+    return results
+
+
+def _populate_linked_view_combo(combo, matches):
+    """Fills `combo` per spec (None-option + matches, or exactly one "no
+    match" item) and auto-selects the first real view (already '#'-
+    prioritized by _find_matching_link_views' sort) — or the None option
+    when nothing was found. Returns {label: match_dict} so the caller can
+    resolve the chosen label back to its (view, link) pair at Apply time;
+    a chosen label of NONE_LINKED_VIEW_LABEL/NO_MATCH_LINKED_VIEW_LABEL is
+    simply absent from this dict, which is exactly "unassigned" to callers
+    that do by_label.get(selected_label)."""
+    combo.Items.Clear()
+    if not matches:
+        combo.Items.Add(NO_MATCH_LINKED_VIEW_LABEL)
+        combo.SelectedIndex = 0
+        return {}
+
+    by_label = {}
+    combo.Items.Add(NONE_LINKED_VIEW_LABEL)
+    for m in matches:
+        label = m[u"name"]
+        if label in by_label:
+            label = u"{} ({})".format(m[u"name"], m[u"link"][u"name"])
+        by_label[label] = m
+        combo.Items.Add(label)
+    combo.SelectedIndex = 1
+    return by_label
 
 
 def _matches_any(link_info, keywords):
@@ -1254,7 +1467,7 @@ def _set_traffic_halftone(view, traffic_link, warnings):
         warnings.append(u"Could not apply halftone to the Traffic link instance: {}".format(ex))
 
 
-def _set_traffic_link_custom_mode(target, traffic_link, warnings):
+def _apply_link_display_settings(target, link_id, linked_view_id, warnings, label):
     """`target` must be whatever ensure_view_template() returned (the real
     template, or the fallback view when template setup failed) — NOT
     necessarily the active view. "V/G Overrides RVT Links" is itself a
@@ -1264,30 +1477,78 @@ def _set_traffic_link_custom_mode(target, traffic_link, warnings):
     (uncontrolled, defaulted-to-ByHostView) value wins. Setting it directly
     on `target` is correct whether that's the template or the fallback view.
 
+    BUG FIXED (found by reflecting the installed RevitAPI.dll directly —
+    2026-08-27): the enum for LinkVisibilityType's VALUE is a type called
+    Autodesk.Revit.DB.LinkVisibility, NOT "LinkVisibilityType" — that name
+    only exists as the *property* on RevitLinkGraphicsSettings, there is no
+    top-level DB.LinkVisibilityType type at all. The previous code looked
+    up getattr(DB, "LinkVisibilityType", None), which is always None, so
+    this silently no-opped on every run (no exception — it hit `if vis_enum
+    is None: return` before ever calling SetLinkOverrides). Confirmed via
+    .NET reflection against Revit 2024/RevitAPI.dll: RevitLinkGraphicsSettings
+    has exactly {IsValidObject, LinkVisibilityType, LinkedViewId}; the
+    correct enum is DB.LinkVisibility with members ByHostView/ByLinkView/Custom.
+
+    UNVERIFIED RISK — flag on the next live test: Revit's own UI ("Custom
+    Display Settings for Linked Revit Models") has a SEPARATE "View filters"
+    control (By host view / By linked view / None) alongside the "Linked
+    view" picker used for cut-plane/view-range/detail-level/phase. The API's
+    RevitLinkGraphicsSettings class has NO property for that separate
+    control — confirmed via reflection, only LinkVisibilityType +
+    LinkedViewId exist. Whether setting LinkVisibilityType=Custom with a
+    LinkedViewId still evaluates the HOST's View Filters (this tool's red/
+    blue coloring, see module docstring) on that link, or silently behaves
+    like "by linked view" and uses the picked view's OWN filters instead,
+    is genuinely undocumented from the API side and cannot be confirmed
+    without testing in Revit. Lower risk for the Traffic link (it never
+    relied on View Filters — its coloring is host-view-only halftone and
+    its visibility restriction is element-level HideElements, both
+    independent of link display mode), higher risk for Architecture/
+    Structure specifically, since that's the one thing this whole tool
+    can't function without.
+
     Best-effort regardless: RevitLinkGraphicsSettings/View.GetLinkOverrides
-    was only added in the Revit 2024 API (this extension targets 2023+),
-    and even there it exposes just LinkVisibilityType/LinkedViewId — no
-    per-category control (see module docstring). This does NOT gate whether
-    _restrict_traffic_link_visibility/_set_traffic_halftone below actually
-    work: element-level HideElements/SetElementOverrides on the host view
-    are a separate mechanism from link display mode and apply regardless."""
+    was only added in the Revit 2024 API (this extension targets 2023+).
+    This does NOT gate whether _restrict_traffic_link_visibility/
+    _set_traffic_halftone/View Filters actually work: those are separate
+    mechanisms from link display mode and apply regardless."""
     settings_cls = getattr(DB, "RevitLinkGraphicsSettings", None)
     if settings_cls is None:
         return
+    vis_enum = getattr(DB, "LinkVisibility", None)
+    if vis_enum is None:
+        return
     try:
-        link_settings = target.GetLinkOverrides(traffic_link[u"id"])
+        link_settings = target.GetLinkOverrides(link_id)
         if link_settings is None:
             link_settings = settings_cls()
-        vis_type = getattr(DB, "LinkVisibilityType", None)
-        if vis_type is None:
-            return
-        link_settings.LinkVisibilityType = vis_type.Custom
-        target.SetLinkOverrides(traffic_link[u"id"], link_settings)
+        link_settings.LinkVisibilityType = vis_enum.Custom
+        if linked_view_id is not None:
+            link_settings.LinkedViewId = linked_view_id
+        target.SetLinkOverrides(link_id, link_settings)
     except Exception as ex:
         warnings.append(
-            u"Could not set the Traffic link's display mode to Custom (likely "
+            u"Could not set the {} link's display mode to Custom (likely "
             u"unavailable before Revit 2024) — informational only, category "
-            u"visibility inside the link was still applied directly: {}".format(ex))
+            u"visibility inside the link was still applied directly: {}".format(label, ex))
+
+
+def _apply_smart_linked_view(target, role_links, chosen, warnings, label):
+    """chosen: None, or {'view':, 'link':} from the wizard's linked-view
+    combo for this role. Only the ONE underlying link the chosen view
+    actually belongs to gets switched to Custom + LinkedViewId — Architecture
+    and Structure support selecting more than one link, and there's no
+    chosen view for any other link of the same role, so those are left
+    exactly as they were (ByHostView, the default — View Filters keep
+    applying to them without question, see module docstring)."""
+    if chosen is None:
+        return
+    chosen_link_int_id = chosen[u"link"][u"id"].IntegerValue
+    for li in role_links:
+        if li[u"id"].IntegerValue == chosen_link_int_id:
+            _apply_link_display_settings(target, li[u"id"], chosen[u"view"].Id, warnings, label)
+            return
+    warnings.append(u"The selected {} linked view no longer matches a selected link — skipped.".format(label))
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -2093,13 +2354,17 @@ def run():
     use_traffic_default = bool(memory.get(u"use_traffic")) and traffic_default[0] is not None
 
     try:
-        level_name = _elem_name(view.GenLevel) or u"—"
+        host_level_obj = view.GenLevel
     except Exception:
-        level_name = u"—"
+        host_level_obj = None
+    level_name = u"—"
+    if host_level_obj is not None:
+        level_name = _elem_name(host_level_obj) or u"—"
     view_info = {
         u"name"     : _elem_name(view),
         u"view_type": view.ViewType.ToString(),
         u"level"    : level_name,
+        u"level_obj": host_level_obj,
         u"basement" : is_basement_view(view),
     }
 
@@ -2116,6 +2381,9 @@ def run():
     arch_links, struct_links = dlg.arch_links, dlg.struct_links
     traffic_link, use_traffic = dlg.traffic_link, dlg.use_traffic
     scope_box = dlg.scope_box
+    arch_linked_view    = dlg.arch_linked_view
+    struct_linked_view  = dlg.struct_linked_view
+    traffic_linked_view = dlg.traffic_linked_view
 
     # Settings may have been edited mid-wizard via the gear icon — reload so
     # the transaction below (colors, patterns, concrete/exclude keywords)
@@ -2205,9 +2473,23 @@ def run():
 
         # ── Step 7: Traffic link ────────────────────────────────────────────────
         if use_traffic and traffic_link:
-            _set_traffic_link_custom_mode(template, traffic_link, warnings)
+            linked_view_id = traffic_linked_view[u"view"].Id if traffic_linked_view else None
+            _apply_link_display_settings(template, traffic_link[u"id"], linked_view_id,
+                                          warnings, u"Traffic")
             _restrict_traffic_link_visibility(view, traffic_link, traffic_keep_bics, warnings)
             _set_traffic_halftone(view, traffic_link, warnings)
+
+        # ── Smart Linked View: Architecture/Structure (optional, per role) ─────
+        # Only the one link a chosen view actually belongs to switches to
+        # Custom + LinkedViewId; every other selected link of the same role
+        # stays on the default ByHostView (View Filters keep applying to it
+        # without question). See _apply_link_display_settings' docstring for
+        # the unverified interaction between Custom+LinkedViewId and this
+        # tool's own View Filters on Architecture/Structure — needs a live
+        # test to confirm red/blue coloring survives on the specific link
+        # that gets a linked view assigned.
+        _apply_smart_linked_view(template, arch_links, arch_linked_view, warnings, u"Architecture")
+        _apply_smart_linked_view(template, struct_links, struct_linked_view, warnings, u"Structure")
 
         # ── Step 8: deep-scan (every selected link, per role) + View Filters ───
         arch_names = set()
