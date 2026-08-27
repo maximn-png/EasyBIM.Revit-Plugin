@@ -85,12 +85,26 @@ Level.Elevation — see _find_matching_link_views), then collecting that
 level's non-template, non-dependent ViewPlans, sorted non-Coarse-detail
 first, then '#'-prefixed, then genuine Floor Plans, then alphabetical.
 
-TRAFFIC: a chosen view IS applied to the link, via
-RevitLinkGraphicsSettings.LinkVisibilityType=ByLinkView + LinkedViewId
-(_apply_link_display_settings) — safe, because Traffic's own coloring is
-host-view-only halftone (_set_traffic_halftone) plus element-level
-HideElements (_restrict_traffic_link_visibility), both independent of
-link display mode; it never depended on View Filters.
+TRAFFIC: REVERSED after live-testing (persistent "dimensions still
+visible" reports) — a chosen view is now ALSO never applied to the link,
+same as Architecture/Structure. Originally implemented as ByLinkView +
+LinkedViewId, reasoned to be safe because Traffic's own coloring is host-
+view-only halftone (_set_traffic_halftone) plus element-level
+HideElements (_restrict_traffic_link_visibility) — both independent of
+link display mode, so it never depended on View Filters. That reasoning
+missed a DIFFERENT dependency: a link in ByLinkView mode displays using
+THAT VIEW's own settings entirely, including its own dimensions/
+annotations — confirmed via research (Autodesk's own docs: "if you would
+like to display a view from a linked file exactly as it appears in that
+file," that's what ByLinkView is for) — which bypasses BOTH the host
+template's category visibility AND, likely, this tool's own element-level
+hides, since the whole point of ByLinkView is to render independently of
+the host's settings. Traffic's linked-view combo still helps find/preview
+a matching view and its Detail Level is still checked
+(_ensure_linked_view_detail_level); it's just never pushed into
+RevitLinkGraphicsSettings — Traffic always stays on plain Custom mode
+(LinkedViewId always None), matching Architecture/Structure's reasoning
+exactly, just arrived at one round later.
 
 ARCHITECTURE/STRUCTURE: a chosen view is deliberately NEVER applied to
 the link (_apply_smart_linked_view no longer calls
@@ -1648,13 +1662,22 @@ def _apply_link_display_settings(target, link_id, linked_view_id, warnings, labe
     That's a direct conflict with this tool's entire purpose for
     Architecture/Structure (the user's own original requirement was "so
     the host's View Filters still apply on top of the linked view's cut
-    plane" — proven not simultaneously achievable via this API), so by
-    explicit user decision, callers only ever pass a non-None
-    linked_view_id here for Traffic — see _apply_smart_linked_view, which
-    deliberately never does for Architecture/Structure. Traffic never
-    depended on View Filters for its own coloring (halftone + element-
-    level HideElements, both independent of link display mode), so
-    ByLinkView there costs nothing.
+    plane" — proven not simultaneously achievable via this API).
+
+    UPDATE (reversed after further live-testing — see module docstring's
+    TRAFFIC paragraph): Traffic was originally the one caller that DID pass
+    a real linked_view_id here, reasoned to be safe since its own coloring
+    never depended on View Filters. That missed a DIFFERENT risk: ByLinkView
+    mode means the link displays using that view's own dimensions/
+    annotations too, which was very likely the actual cause of persistent
+    "Traffic dimensions still visible" reports — bypassing both the host
+    template's category visibility and this tool's own element-level hides,
+    since ByLinkView renders independently of the host's settings entirely.
+    No caller passes a real linked_view_id here anymore — every call site
+    always passes None, so LinkVisibilityType is always Custom in practice.
+    The ByLinkView branch below is kept (correct, dead code) rather than
+    deleted, in case a future need for it re-emerges with this tradeoff
+    understood up front instead of rediscovered the hard way.
 
     Best-effort regardless: RevitLinkGraphicsSettings/View.GetLinkOverrides
     was only added in the Revit 2024 API (this extension targets 2023+).
@@ -2861,9 +2884,9 @@ def run():
             _hide_dwg_imports_in_link(view, li, basement, warnings)
 
         # ── Step 7: Traffic link ────────────────────────────────────────────────
-        # Element-level hide runs BEFORE the display-mode switch (Custom/
-        # ByLinkView) now, not after — reordered to test a real possibility
-        # raised by a large "could not be hidden" count in live testing:
+        # Element-level hide runs BEFORE the display-mode switch (Custom)
+        # now, not after — reordered to test a real possibility raised by a
+        # large "could not be hidden" count in live testing:
         # CanBeHidden/HideElements for cross-document elements might behave
         # differently once the link has already left ByHostView mode.
         # Low-risk either way (doesn't change what ends up hidden if this
@@ -2874,9 +2897,20 @@ def run():
             traffic_summary = _restrict_traffic_link_visibility(
                 view, traffic_link, traffic_keep_bics, warnings)
             _ensure_linked_view_detail_level(traffic_linked_view, warnings, u"Traffic")
-            linked_view_id = traffic_linked_view[u"view"].Id if traffic_linked_view else None
-            _apply_link_display_settings(template, traffic_link[u"id"], linked_view_id,
-                                          warnings, u"Traffic")
+            # NEVER pass a real linked_view_id here (i.e. never switch
+            # Traffic to ByLinkView) -- confirmed via research that a link
+            # in ByLinkView mode displays using THAT VIEW's own settings,
+            # including its own dimensions/annotations, which would show in
+            # the host regardless of anything this tool hides at the
+            # element or category level (ByLinkView mode bypasses both).
+            # This exactly matches why Architecture/Structure never get
+            # ByLinkView either (see _apply_smart_linked_view) -- same
+            # class of "the picked view's own state leaks through" risk,
+            # just surfacing as dimensions instead of Filter coloring.
+            # Traffic's linked-view combo still helps find/preview a
+            # matching view and its own Detail Level is still checked
+            # above; it's just never pushed into RevitLinkGraphicsSettings.
+            _apply_link_display_settings(template, traffic_link[u"id"], None, warnings, u"Traffic")
             _set_traffic_halftone(view, traffic_link, warnings)
 
         # ── Smart Linked View: Architecture/Structure (optional, per role) ─────
