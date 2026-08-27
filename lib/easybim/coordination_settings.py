@@ -41,11 +41,10 @@ SETTINGS_DEFAULTS = {
     u"TrafficLinkKeywords": [u"TRF", u"Traffic", u"תנועה"],
     u"ConcreteKeywords"   : [u"Concrete", u"בטון"],
     u"ExcludeKeywords"    : [u"Block", u"בלוק", u"Light", u"קל", u"מילוי"],
-    u"StructPatternName"    : u"Diagonal Up - 1.5mm",
-    u"ArchPatternName"      : u"Diagonal Down - 1.5mm",
-    u"ColumnLinePatternName": u"Dashed",
-    u"StructColor"          : {u"R": 200, u"G": 30, u"B": 30},
-    u"ArchColor"            : {u"R": 0, u"G": 70, u"B": 200},
+    u"StructPatternName"  : u"Diagonal Up - 1.5mm",
+    u"ArchPatternName"    : u"Diagonal Down - 1.5mm",
+    u"StructColor"        : {u"R": 200, u"G": 30, u"B": 30},
+    u"ArchColor"          : {u"R": 0, u"G": 70, u"B": 200},
 }
 
 
