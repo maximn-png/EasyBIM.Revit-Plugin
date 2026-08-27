@@ -90,6 +90,30 @@ Traffic (its coloring/visibility never depended on View Filters); real risk
 for Architecture/Structure, since that's the one thing this tool can't
 function without — confirm on the next test that a link with a linked view
 assigned still shows correct red/blue coloring.
+
+CONFIRMED RISK (live-testing finding, root-caused by the user from a
+screenshot of a wall type's Type Properties): a linked view's own Detail
+Level is one of the "display settings" Custom+LinkedViewId imports for
+that link, per Revit's own UI docs for the Basics-tab "Linked view" picker
+("select the view in the linked model whose display settings you want to
+use"). At Coarse detail level, Revit shows a linked element's own
+hardcoded "Coarse Scale Fill Pattern" Type Property (e.g. a wall type
+literally set to solid blue fill) INSTEAD of respecting this tool's View
+Filter hatch override — this is a real, general Revit behavior (also why
+_apply_coordination_categories forces the HOST template/view to
+DB.ViewDetailLevel.Fine, which is unrelated and unaffected by this).
+There is no API way to force a linked view's Detail Level independently
+of the view itself: RevitLinkGraphicsSettings has only IsValidObject/
+LinkVisibilityType/LinkedViewId (confirmed via reflection, twice). Fixed
+defensively rather than by editing someone else's linked file: candidate
+Smart Linked Views are now sorted with Coarse-detail ones last and
+flagged directly in the combo label; if a Coarse view is chosen anyway,
+_apply_smart_linked_view adds an explicit warning at Apply time. Directly
+setting the chosen linked view's own DetailLevel to Fine (by opening a
+transaction against that view's own, separate Document) was deliberately
+NOT implemented — that would silently edit a shared team file (the
+Architecture/Structure consultant's own model) as a side effect of a
+host-side coordination tool, which needs the user's explicit go-ahead.
 """
 
 __title__ = "Coordination\nGraphics"
@@ -1037,16 +1061,23 @@ def _find_matching_link_views(link_infos, host_level):
                 if vp.GetPrimaryViewId() != DB.ElementId.InvalidElementId:
                     continue  # dependent view
                 is_floor_plan = (vp.ViewType == DB.ViewType.FloorPlan)
+                is_coarse = (vp.DetailLevel == DB.ViewDetailLevel.Coarse)
             except Exception:
                 continue
             results.append({u"view": vp, u"link": li, u"name": _elem_name(vp) or u"?",
-                             u"is_floor_plan": is_floor_plan})
+                             u"is_floor_plan": is_floor_plan, u"is_coarse": is_coarse})
 
     # '#'-prefixed names always first; when none exist, a genuine Floor Plan
     # is preferred over a Ceiling/Area/Structural/Engineering plan on the
-    # same level as the auto-selected default, then alphabetical.
+    # same level, and a Medium/Fine-detail view is preferred over a Coarse
+    # one (Coarse makes Revit show a linked element's own hardcoded "Coarse
+    # Scale Fill Pattern" from its Type Properties instead of respecting
+    # this tool's View Filter hatch — see _apply_smart_linked_view's
+    # docstring and the Coarse-detail warning added at Apply time), then
+    # alphabetical.
     results.sort(key=lambda r: (0 if r[u"name"].startswith(u"#") else 1,
                                  0 if r[u"is_floor_plan"] else 1,
+                                 1 if r[u"is_coarse"] else 0,
                                  r[u"name"].upper()))
     return results
 
@@ -1054,8 +1085,13 @@ def _find_matching_link_views(link_infos, host_level):
 def _populate_linked_view_combo(combo, matches):
     """Fills `combo` per spec (None-option + matches, or exactly one "no
     match" item) and auto-selects the first real view (already '#'-
-    prioritized by _find_matching_link_views' sort) — or the None option
-    when nothing was found. Returns {label: match_dict} so the caller can
+    prioritized, non-Coarse-preferred by _find_matching_link_views' sort)
+    — or the None option when nothing was found. A Coarse-detail candidate
+    gets a visible warning suffix right in the label — see the module
+    docstring / _apply_smart_linked_view for why Coarse detail level on a
+    linked view can make Revit show a linked element's own hardcoded
+    "Coarse Scale Fill Pattern" from its Type Properties instead of this
+    tool's View Filter hatch. Returns {label: match_dict} so the caller can
     resolve the chosen label back to its (view, link) pair at Apply time;
     a chosen label of NONE_LINKED_VIEW_LABEL/NO_MATCH_LINKED_VIEW_LABEL is
     simply absent from this dict, which is exactly "unassigned" to callers
@@ -1067,11 +1103,15 @@ def _populate_linked_view_combo(combo, matches):
         return {}
 
     by_label = {}
+    seen_names = set()
     combo.Items.Add(NONE_LINKED_VIEW_LABEL)
     for m in matches:
-        label = m[u"name"]
-        if label in by_label:
-            label = u"{} ({})".format(m[u"name"], m[u"link"][u"name"])
+        base = m[u"name"]
+        if base in seen_names:
+            base = u"{} ({})".format(m[u"name"], m[u"link"][u"name"])
+        seen_names.add(m[u"name"])
+        label = (u"{} — Coarse detail, may show solid fill".format(base)
+                 if m.get(u"is_coarse") else base)
         by_label[label] = m
         combo.Items.Add(label)
     combo.SelectedIndex = 1
@@ -1547,9 +1587,37 @@ def _apply_smart_linked_view(target, role_links, chosen, warnings, label):
     and Structure support selecting more than one link, and there's no
     chosen view for any other link of the same role, so those are left
     exactly as they were (ByHostView, the default — View Filters keep
-    applying to them without question, see module docstring)."""
+    applying to them without question, see module docstring).
+
+    COARSE DETAIL LEVEL RISK (live-testing finding — a wall type's own
+    "Coarse Scale Fill Pattern" Type Property, set to solid blue, was
+    showing through instead of this tool's Filter hatch): Revit's own UI
+    docs describe Custom mode's "Linked view" pick as importing that view's
+    "display settings" into the host view for that link — plausibly
+    including Detail Level, not just view range/cut plane. There is NO API
+    way to force this independently of the picked view: reflecting the
+    installed RevitAPI.dll (both this session and two sessions ago) shows
+    RevitLinkGraphicsSettings has exactly three members — IsValidObject,
+    LinkVisibilityType, LinkedViewId — no DetailLevel/SetDetailLevel at
+    all. The only place Detail Level actually lives is on the View object
+    itself, so the two options are: (a) warn when the CHOSEN view is
+    Coarse (done below — _find_matching_link_views/_populate_linked_view_
+    combo also already sort Coarse candidates last and flag them in the
+    combo label, so this should be rare in practice), or (b) reach into
+    the LINKED document and change that view's own DetailLevel to Fine —
+    NOT done here: that edits a shared team file (the Architecture/
+    Structure consultant's own model) as a side effect of a host-side
+    coordination tool, which needs the user's explicit go-ahead, not a
+    silent default."""
     if chosen is None:
         return
+    if chosen.get(u"is_coarse"):
+        warnings.append(
+            u"The {} linked view '{}' has Detail Level set to Coarse in its own file — "
+            u"Revit may show that link's elements with their own hardcoded 'Coarse Scale "
+            u"Fill Pattern' Type Property instead of this tool's red/blue hatch. Pick a "
+            u"different linked view, or ask the source model's owner to set this view's "
+            u"Detail Level to Medium/Fine.".format(label, chosen[u"name"]))
     chosen_link_int_id = chosen[u"link"][u"id"].IntegerValue
     for li in role_links:
         if li[u"id"].IntegerValue == chosen_link_int_id:
