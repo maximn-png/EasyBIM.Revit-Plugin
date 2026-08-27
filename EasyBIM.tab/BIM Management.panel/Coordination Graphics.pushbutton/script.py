@@ -1269,6 +1269,12 @@ def _hide_category_safe(target, bic, warnings, hide=True):
             try:
                 cat = DB.Category.GetCategory(doc, bic)
                 if cat is not None and not cat.get_AllowsVisibilityControl(target):
+                    try:
+                        logger.info(u"Category '{}' does not allow visibility control on this "
+                                    u"target — hide skipped silently (not a bug, see "
+                                    u"_hide_category_safe's docstring).".format(bic.ToString()))
+                    except Exception:
+                        pass
                     return
             except Exception:
                 pass
@@ -2711,14 +2717,24 @@ def run():
                                          wallnoncore_bics, annotation_bics,
                                          override_bics, warnings)
 
-        # ── Step 5: hide every other link ──────────────────────────────────────
+        # ── Step 5: hide every other link (e.g. MEP) ────────────────────────────
         other_link_ids = SCG.List[DB.ElementId]()
         for li in links:
             if li[u"id"].IntegerValue in chosen_ids:
                 continue
             try:
-                if li[u"instance"].CanBeHidden(view) and not li[u"instance"].IsHidden(view):
+                if li[u"instance"].IsHidden(view):
+                    continue
+                if li[u"instance"].CanBeHidden(view):
                     other_link_ids.Add(li[u"id"])
+                else:
+                    # Previously a silent skip -- now surfaced, since this is
+                    # exactly the kind of gap that would explain "link X is
+                    # still visible" with no error shown anywhere.
+                    warnings.append(
+                        u"Link '{}' could not be hidden — Revit reports it as "
+                        u"un-hideable in this view (CanBeHidden=False), so it "
+                        u"remains visible.".format(li[u"name"]))
             except Exception as ex:
                 warnings.append(u"Could not hide link '{}': {}".format(li[u"name"], ex))
         if other_link_ids.Count:
