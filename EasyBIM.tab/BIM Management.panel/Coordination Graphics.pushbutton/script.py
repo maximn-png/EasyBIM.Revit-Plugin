@@ -1086,17 +1086,21 @@ def _find_matching_link_views(link_infos, host_level):
             results.append({u"view": vp, u"link": li, u"name": _elem_name(vp) or u"?",
                              u"is_floor_plan": is_floor_plan, u"is_coarse": is_coarse})
 
-    # '#'-prefixed names always first; when none exist, a genuine Floor Plan
-    # is preferred over a Ceiling/Area/Structural/Engineering plan on the
-    # same level, and a Medium/Fine-detail view is preferred over a Coarse
-    # one (Coarse makes Revit show a linked element's own hardcoded "Coarse
-    # Scale Fill Pattern" from its Type Properties instead of respecting
-    # this tool's View Filter hatch — see _apply_smart_linked_view's
-    # docstring and the Coarse-detail warning added at Apply time), then
-    # alphabetical.
-    results.sort(key=lambda r: (0 if r[u"name"].startswith(u"#") else 1,
+    # Medium/Fine-detail views ALWAYS sort ahead of Coarse ones — even a
+    # '#'-prefixed view loses to a plain non-Coarse one, per explicit
+    # feedback: a Coarse view should never win the auto-selected default
+    # just because it happens to start with '#'. (Coarse still makes
+    # Revit show a linked element's own hardcoded "Coarse Scale Fill
+    # Pattern" for OTHER things beyond the wall/column fill this tool's
+    # OverrideGraphicSettings.SetDetailLevel(Fine) already neutralizes —
+    # doors/windows/simplified linework etc. — so avoiding it as a default
+    # is still worth doing even after that fix.) Within the same Coarse-
+    # status tier: '#'-prefixed first, then a genuine Floor Plan preferred
+    # over a Ceiling/Area/Structural/Engineering plan on the same level,
+    # then alphabetical.
+    results.sort(key=lambda r: (1 if r[u"is_coarse"] else 0,
+                                 0 if r[u"name"].startswith(u"#") else 1,
                                  0 if r[u"is_floor_plan"] else 1,
-                                 1 if r[u"is_coarse"] else 0,
                                  r[u"name"].upper()))
     return results
 
