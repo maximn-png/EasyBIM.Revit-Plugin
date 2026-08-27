@@ -478,7 +478,7 @@ PICKER_XAML = u"""
           <TextBlock x:Name="Step2Error" Foreground="#d64545" FontSize="11.5" TextWrapping="Wrap"/>
         </StackPanel>
 
-        <!-- STEP 3: OPTIONS / TRAFFIC LINK -->
+        <!-- STEP 3: OPTIONS / TRAFFIC LINK / SCOPE BOX -->
         <StackPanel x:Name="Step3Panel" Visibility="Collapsed">
           <Border Style="{StaticResource Card}">
             <StackPanel>
@@ -488,6 +488,14 @@ PICKER_XAML = u"""
               <StackPanel x:Name="TrafficPanel" Margin="0,10,0,0" Visibility="Collapsed">
                 <ComboBox x:Name="TrafficCombo" Style="{StaticResource ComboStyle}"/>
               </StackPanel>
+            </StackPanel>
+          </Border>
+          <Border Style="{StaticResource Card}">
+            <StackPanel>
+              <TextBlock Text="SCOPE BOX (OPTIONAL)" Style="{StaticResource SectionLabel}"/>
+              <TextBlock Text="Crops the coordination view and sheet to this scope box."
+                         FontSize="10.5" Foreground="#8b93a7" TextWrapping="Wrap" Margin="0,0,0,6"/>
+              <ComboBox x:Name="ScopeBoxCombo" Style="{StaticResource ComboStyle}"/>
             </StackPanel>
           </Border>
           <TextBlock x:Name="Step3Error" Foreground="#d64545" FontSize="11.5" TextWrapping="Wrap"/>
@@ -543,17 +551,20 @@ class LinkPickerDialog(object):
     defaults = {'arch': (list_of_names, source_label), 'struct': (...),
     'traffic': (name_or_None, source_label), 'use_traffic': bool}"""
 
-    def __init__(self, links, defaults, view_info):
+    def __init__(self, links, defaults, view_info, scope_boxes):
         self.links         = links
         self.defaults      = defaults
         self.view_info     = view_info
+        self.scope_boxes   = scope_boxes
         self.cancelled     = True
         self.arch_links    = []
         self.struct_links  = []
         self.traffic_link  = None
         self.use_traffic   = False
+        self.scope_box     = None
         self._window       = None
         self._by_name      = {}
+        self._scope_by_name = {}
         self._arch_checks  = []
         self._struct_checks = []
         self._step         = 1
@@ -594,6 +605,16 @@ class LinkPickerDialog(object):
             traffic_combo.Items.Add(n)
         if traffic_name:
             traffic_combo.SelectedItem = traffic_name
+
+        # Scope box — "None" always first/default
+        scope_combo = w.FindName(u"ScopeBoxCombo")
+        none_label = u"None"
+        scope_combo.Items.Add(none_label)
+        self._scope_by_name = {}
+        for sb in self.scope_boxes:
+            scope_combo.Items.Add(sb[u"name"])
+            self._scope_by_name.setdefault(sb[u"name"], sb)
+        scope_combo.SelectedItem = none_label
 
         # Step 3 — traffic option
         traffic_check = w.FindName(u"TrafficCheck")
@@ -755,11 +776,13 @@ class LinkPickerDialog(object):
         struct_names = self._checked_names(self._struct_checks)
         use_traffic  = bool(w.FindName(u"TrafficCheck").IsChecked)
         traffic_name = w.FindName(u"TrafficCombo").SelectedItem if use_traffic else None
+        scope_name   = w.FindName(u"ScopeBoxCombo").SelectedItem
 
         self.arch_links    = [self._by_name[n] for n in arch_names]
         self.struct_links  = [self._by_name[n] for n in struct_names]
         self.traffic_link  = self._by_name[traffic_name] if (use_traffic and traffic_name) else None
         self.use_traffic   = use_traffic
+        self.scope_box     = self._scope_by_name.get(scope_name)
         self.cancelled = False
         w.Close()
 
@@ -779,6 +802,44 @@ class LinkPickerDialog(object):
 # ─────────────────────────────────────────────────────────────────────────────
 # LINK IDENTIFICATION  (keyword auto-detect + persisted memory, feeds the wizard's Step 2/3 defaults)
 # ─────────────────────────────────────────────────────────────────────────────
+
+def get_all_scope_boxes():
+    """One dict per Scope Box (OST_VolumeOfInterest instance) in the host doc."""
+    boxes = []
+    try:
+        elems = (DB.FilteredElementCollector(doc)
+                   .OfCategory(DB.BuiltInCategory.OST_VolumeOfInterest)
+                   .WhereElementIsNotElementType()
+                   .ToElements())
+    except Exception:
+        elems = []
+    for e in elems:
+        boxes.append({u"instance": e, u"id": e.Id, u"name": _elem_name(e)})
+    return boxes
+
+
+def apply_scope_box(view, scope_box, warnings):
+    """scope_box is a dict from get_all_scope_boxes(), or None for 'no crop
+    change'. BuiltInParameter.VIEWER_VOLUME_OF_INTEREST_CROP is the
+    documented way to assign a Scope Box to a view/template programmatically."""
+    if scope_box is None:
+        return
+    bip = getattr(DB.BuiltInParameter, "VIEWER_VOLUME_OF_INTEREST_CROP", None)
+    if bip is None:
+        warnings.append(u"VIEWER_VOLUME_OF_INTEREST_CROP is not available in this "
+                         u"Revit version — could not apply the scope box '{}'.".format(
+                             scope_box[u"name"]))
+        return
+    try:
+        p = view.get_Parameter(bip)
+        if p is None or p.IsReadOnly:
+            warnings.append(u"The active view has no editable scope-box parameter — "
+                             u"could not apply '{}'.".format(scope_box[u"name"]))
+            return
+        p.Set(scope_box[u"id"])
+    except Exception as ex:
+        warnings.append(u"Could not apply scope box '{}': {}".format(scope_box[u"name"], ex))
+
 
 def get_all_link_instances():
     """One dict per placed RevitLinkInstance (not de-duplicated by file —
@@ -1289,9 +1350,32 @@ def _first_text(elem, bip_name, display_name):
     return _bip_text(elem, bip_name) or _named_text(elem, display_name)
 
 
+_WORD_BOUNDARY_PATTERN_CACHE = {}
+
+
 def _contains_any(haystack, keywords):
-    up = (haystack or u"").upper()
-    return any((k or u"").upper() in up for k in (keywords or []) if k)
+    """Word-boundary match, not raw substring — a keyword must appear as its
+    own token, not merely as a fragment of an unrelated longer word. Matters
+    because short/generic keywords are exactly the kind a team ends up
+    adding (e.g. "Con" as shorthand for concrete) and a raw substring check
+    can't tell "Con" matching "Concrete" apart from "Con" matching
+    "Continuous"/"Contact"/"Connection" — this is very likely why non-
+    concrete elements were getting colored. \\b works correctly for Hebrew
+    too under re.UNICODE (Python 2's \\w is ASCII-only by default)."""
+    if not haystack:
+        return False
+    up = haystack.upper()
+    for k in (keywords or []):
+        if not k:
+            continue
+        ku = k.upper()
+        pattern = _WORD_BOUNDARY_PATTERN_CACHE.get(ku)
+        if pattern is None:
+            pattern = re.compile(u"\\b" + re.escape(ku) + u"\\b", re.UNICODE)
+            _WORD_BOUNDARY_PATTERN_CACHE[ku] = pattern
+        if pattern.search(up):
+            return True
+    return False
 
 
 def _material_texts(link_doc, material_id):
@@ -1976,16 +2060,19 @@ def run():
         u"basement" : is_basement_view(view),
     }
 
+    scope_boxes = get_all_scope_boxes()
+
     dlg = LinkPickerDialog(links, {
         u"arch": arch_default, u"struct": struct_default, u"traffic": traffic_default,
         u"use_traffic": use_traffic_default,
-    }, view_info)
+    }, view_info, scope_boxes)
     dlg.show()
     if dlg.cancelled:
         return
 
     arch_links, struct_links = dlg.arch_links, dlg.struct_links
     traffic_link, use_traffic = dlg.traffic_link, dlg.use_traffic
+    scope_box = dlg.scope_box
 
     # Settings may have been edited mid-wizard via the gear icon — reload so
     # the transaction below (colors, patterns, concrete/exclude keywords)
@@ -2024,6 +2111,12 @@ def run():
                 view.ViewTemplateId = DB.ElementId.InvalidElementId
         except Exception as ex:
             warnings.append(u"Could not clear the view's existing template: {}".format(ex))
+
+        # Scope box crop, if one was picked — applied directly to the working
+        # view (same place colors/hides get applied); if a duplicate is later
+        # needed for the sheet (view already on one), Duplicate(WithDetailing)
+        # carries the crop over the same way it carries everything else.
+        apply_scope_box(view, scope_box, warnings)
 
         host_clutter_bics = _resolve_categories(HOST_CLUTTER_CATEGORY_NAMES, warnings)
         link_model_bics   = _resolve_categories(LINK_MODEL_HIDE_CATEGORY_NAMES, warnings)
@@ -2147,11 +2240,8 @@ def run():
         )
         return
 
-    if sheet is not None:
-        try:
-            uidoc.ActiveView = sheet
-        except Exception as ex:
-            warnings.append(u"Sheet created but could not switch to it: {}".format(ex))
+    # Deliberately NOT switching uidoc.ActiveView here — the sheet is created
+    # in the background and the user stays on whatever view they started on.
 
     sheet_line = (u"Sheet: {} — {}".format(sheet.SheetNumber, _elem_name(sheet))
                   if sheet is not None else u"Sheet: not created (see warnings)")
