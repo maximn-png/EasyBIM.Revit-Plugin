@@ -102,25 +102,37 @@ literally set to solid blue fill) INSTEAD of respecting this tool's View
 Filter hatch override — this is a real, general Revit behavior (also why
 _apply_coordination_categories forces the HOST template/view to
 DB.ViewDetailLevel.Fine, which is unrelated and unaffected by this).
-DEAD END, CONFIRMED (not just undocumented): there is no API path at all
-to change this from a host-side script. Two independent attempts were
-made and both are closed off for good reasons: (1) opening a Transaction
-directly against the linked document (a separate Document from the host)
-to set the view's own DetailLevel — live testing hit a hard Revit
-exception: "Document is a linked file. Transactions can only be used in
-primary documents." This is unconditional, not a permissions/worksharing
-edge case — Revit bans Transaction(link_doc, ...) for ANY document from
-RevitLinkInstance.GetLinkDocument(), always. (2) RevitLinkGraphicsSettings
-.SetDetailLevel — reflected the installed RevitAPI.dll three separate
-times across three rounds and gotten the identical answer every time:
-that class has exactly three members, IsValidObject/LinkVisibilityType/
-LinkedViewId, nothing else, ever, in this Revit version. _ensure_linked_
-view_detail_level is warning-only now: it names the exact link/view so
-the fix is actionable (the source model's owner changing that view's own
-Detail Level in their file) without pretending this tool can do it for
-them. _find_matching_link_views/_populate_linked_view_combo still sort
-Coarse candidates last and flag them directly in the combo label, so this
-should be uncommon to hit in the first place.
+DEAD END for changing the LINK's/LINKED VIEW's own Detail Level from a
+host-side script — two independent attempts confirmed this, for good
+reasons: (1) opening a Transaction directly against the linked document
+(a separate Document from the host) to set the view's own DetailLevel —
+live testing hit a hard Revit exception: "Document is a linked file.
+Transactions can only be used in primary documents." Unconditional, not a
+permissions/worksharing edge case — Revit bans Transaction(link_doc, ...)
+for ANY document from RevitLinkInstance.GetLinkDocument(), always.
+(2) RevitLinkGraphicsSettings.DetailLevel/.SetDetailLevel — reflected the
+installed RevitAPI.dll four separate times across four rounds (the fourth
+by actually instantiating the class and attempting the exact call live,
+not just reading a member list) and gotten the identical answer every
+time: that class has exactly three members, IsValidObject/
+LinkVisibilityType/LinkedViewId, nothing else, ever, in this Revit
+version — confirmed neither a settable property nor a callable method
+exists.
+
+THE ACTUAL FIX, found one property class over: OverrideGraphicSettings
+(a completely different, much older class — available since Revit 2014,
+not gated to 2024+ like RevitLinkGraphicsSettings) ALSO has
+SetDetailLevel(ViewDetailLevel) — and this is the override object already
+being applied to the Structure/Architecture filters via
+View.SetFilterOverrides (see apply_filter_to_target). Calling it forces
+elements matched by that filter to render as if the detail level were
+Fine, independent of the link's or the linked view's actual detail level
+— no linked document involved at all. Wired into build_colored_override.
+_ensure_linked_view_detail_level's warning (naming the exact Coarse
+linked view, for the case where the source model's owner still needs to
+know) and _find_matching_link_views/_populate_linked_view_combo's
+Coarse-last sorting/labeling are left in place as belt-and-suspenders —
+harmless now, and still correct if this override is ever unavailable.
 """
 
 __title__ = "Coordination\nGraphics"
@@ -2238,8 +2250,31 @@ def build_colored_override(color, pattern_name, warnings, label):
     Grids have no Cut representation at all (they're a projection-only
     datum category) — see build_grid_line_override for the separate,
     minimal override that actually colors a Grid line; this function's
-    output is no longer usable for that now that Projection is dropped."""
+    output is no longer usable for that now that Projection is dropped.
+
+    THE REAL FIX for Coarse Scale Fill Pattern (a linked element's own
+    Type Property, e.g. a wall type hardcoded to solid blue fill, winning
+    over this hatch when the effective detail level is Coarse — see the
+    module docstring's DEAD END paragraph for everything that does NOT
+    work): OverrideGraphicSettings.SetDetailLevel(ViewDetailLevel), found
+    by reflecting the installed RevitAPI.dll one property class over from
+    where the last three rounds were looking. This is a COMPLETELY
+    different class from RevitLinkGraphicsSettings — it's the override
+    object already being applied to elements via View.SetFilterOverrides
+    (see apply_filter_to_target), available since Revit 2014, and (unlike
+    everything tried against RevitLinkGraphicsSettings/the linked document
+    itself) forces the elements THIS FILTER matches to render as if the
+    detail level were Fine, regardless of the link's or the linked view's
+    actual detail level — no linked-document Transaction involved at all,
+    confirmed by actually instantiating the class and calling
+    SetDetailLevel(Fine) live via .NET reflection, not just reading a
+    member list."""
     ogs = DB.OverrideGraphicSettings()
+
+    try:
+        ogs.SetDetailLevel(DB.ViewDetailLevel.Fine)
+    except Exception as ex:
+        warnings.append(u"{}: could not force the override's own detail level to Fine: {}".format(label, ex))
 
     try:
         ogs.SetCutLineWeight(1)
