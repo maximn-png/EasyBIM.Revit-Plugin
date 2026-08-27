@@ -2313,31 +2313,43 @@ def _settings_color(settings, key, fallback):
 
 
 def build_colored_override(color, pattern_name, warnings, label):
-    """Cut geometry ONLY — no Projection/Surface overrides at all, per
-    live-testing feedback that elements were rendering as 100% solid,
-    opaque colored blocks instead of a hatch. Two independent contributors,
-    both closed off here: (1) SetSurfaceTransparency(100) only affects
-    Shaded/Realistic visual styles (it never touched Hidden Line, the
-    default and by far the most common style for a 2D coordination plan
-    view), so the Surface foreground fill was rendering at full opacity
-    there, visually dominating the thin Cut hatch underneath; (2) even when
-    a diagonal pattern fails to resolve (find_fill_pattern_id returns
-    InvalidElementId), SetCutForegroundPatternColor was still being called
-    unconditionally — tinting the element's own INHERENT cut pattern
-    (often Solid fill, for many default concrete materials) instead of a
-    hatch. Dropping Surface entirely removes contributor (1) outright;
-    guarding the color-without-a-pattern case below (only set
-    CutForegroundPatternColor when fill_id actually resolved) closes (2).
+    """Cut AND Surface/Projection, both hatched — Surface was dropped
+    entirely a few rounds back (elements were rendering as 100% solid,
+    opaque colored blocks), then live-testing found a DIFFERENT symptom
+    that needs Surface back: walls (unlike columns, which reliably span
+    the full cut-plane height) can have their top BELOW the view's cut
+    plane, in which case Revit shows them via Projection/Surface, not
+    Cut, at all — meaning a Cut-only override never touches them, and
+    they fall through to their own native Surface pattern, the exact same
+    class of bug as the Coarse Scale Fill Pattern issue, just on the
+    Surface side instead of Cut. Re-added, but NOT the same way as
+    before — the two actual causes of the original "solid block" bug are
+    both still avoided:
+      (1) SetSurfaceTransparency is NOT used here at all (it only ever
+          affected Shaded/Realistic visual styles, never Hidden Line —
+          the default, and by far the most common, style for a 2D
+          coordination plan view — so it was never a reliable mechanism
+          for anything and only added confusion).
+      (2) SetSurfaceForegroundPatternColor is only ever set when fill_id
+          actually resolved to a real pattern (same guard already used
+          for the Cut side) — setting a color with no pattern in place
+          tints the element's own inherent Surface pattern instead
+          (often Solid), which was the second real contributor to the
+          original bug.
+    SetDetailLevel(Fine), below, forces Fine for the WHOLE element this
+    override applies to — Cut and Surface both — so it protects both
+    sides against Coarse-driven native patterns equally; re-adding
+    Surface here doesn't reopen that particular risk.
 
     All boundary lines are Solid — a dashed line pattern for columns was
     tried and then explicitly reversed per earlier live-testing feedback.
-    Only the CUT LINE color and the diagonal CUT FOREGROUND hatch differ
-    between Structure (red) and Architecture (blue).
+    Only the line color and the diagonal hatch differ between Structure
+    (red) and Architecture (blue).
 
-    Grids have no Cut representation at all (they're a projection-only
-    datum category) — see build_grid_line_override for the separate,
-    minimal override that actually colors a Grid line; this function's
-    output is no longer usable for that now that Projection is dropped.
+    Grids have no Cut OR Surface representation in the sense this
+    function overrides (they're a projection-LINE-only datum category,
+    no fillable face at all) — see build_grid_line_override for the
+    separate, minimal override that actually colors a Grid line.
 
     THE REAL FIX for Coarse Scale Fill Pattern (a linked element's own
     Type Property, e.g. a wall type hardcoded to solid blue fill, winning
@@ -2345,7 +2357,7 @@ def build_colored_override(color, pattern_name, warnings, label):
     module docstring's DEAD END paragraph for everything that does NOT
     work): OverrideGraphicSettings.SetDetailLevel(ViewDetailLevel), found
     by reflecting the installed RevitAPI.dll one property class over from
-    where the last three rounds were looking. This is a COMPLETELY
+    where several earlier rounds were looking. This is a COMPLETELY
     different class from RevitLinkGraphicsSettings — it's the override
     object already being applied to elements via View.SetFilterOverrides
     (see apply_filter_to_target), available since Revit 2014, and (unlike
@@ -2363,23 +2375,22 @@ def build_colored_override(color, pattern_name, warnings, label):
     except Exception as ex:
         warnings.append(u"{}: could not force the override's own detail level to Fine: {}".format(label, ex))
 
+    line_id = get_solid_line_pattern_id()
+
+    # ── Cut ──────────────────────────────────────────────────────────────
     try:
         ogs.SetCutLineWeight(1)
     except Exception as ex:
         warnings.append(u"{}: could not set cut line weight: {}".format(label, ex))
-
-    line_id = get_solid_line_pattern_id()
     if line_id != DB.ElementId.InvalidElementId:
         try:
             ogs.SetCutLinePatternId(line_id)
         except Exception as ex:
             warnings.append(u"{}: could not set the cut line pattern: {}".format(label, ex))
-
     try:
         ogs.SetCutLineColor(color)
     except Exception as ex:
         warnings.append(u"{}: could not set the cut line color: {}".format(label, ex))
-
     try:
         ogs.SetCutBackgroundPatternVisible(False)
     except Exception as ex:
@@ -2388,12 +2399,39 @@ def build_colored_override(color, pattern_name, warnings, label):
         ogs.SetCutBackgroundPatternId(DB.ElementId.InvalidElementId)
     except Exception:
         pass
-
     try:
         ogs.SetCutForegroundPatternVisible(True)
     except Exception as ex:
         warnings.append(u"{}: could not enable the cut foreground pattern: {}".format(label, ex))
 
+    # ── Surface / Projection ────────────────────────────────────────────
+    try:
+        ogs.SetProjectionLineWeight(1)
+    except Exception as ex:
+        warnings.append(u"{}: could not set projection line weight: {}".format(label, ex))
+    if line_id != DB.ElementId.InvalidElementId:
+        try:
+            ogs.SetProjectionLinePatternId(line_id)
+        except Exception as ex:
+            warnings.append(u"{}: could not set the projection line pattern: {}".format(label, ex))
+    try:
+        ogs.SetProjectionLineColor(color)
+    except Exception as ex:
+        warnings.append(u"{}: could not set the projection line color: {}".format(label, ex))
+    try:
+        ogs.SetSurfaceBackgroundPatternVisible(False)
+    except Exception as ex:
+        warnings.append(u"{}: could not disable the surface background pattern: {}".format(label, ex))
+    try:
+        ogs.SetSurfaceBackgroundPatternId(DB.ElementId.InvalidElementId)
+    except Exception:
+        pass
+    try:
+        ogs.SetSurfaceForegroundPatternVisible(True)
+    except Exception as ex:
+        warnings.append(u"{}: could not enable the surface foreground pattern: {}".format(label, ex))
+
+    # ── Shared hatch pattern (resolved once, applied to both) ──────────
     fill_id = find_fill_pattern_id(pattern_name, warnings, label)
     if fill_id != DB.ElementId.InvalidElementId:
         try:
@@ -2404,12 +2442,20 @@ def build_colored_override(color, pattern_name, warnings, label):
             ogs.SetCutForegroundPatternColor(color)
         except Exception as ex:
             warnings.append(u"{}: could not set the cut foreground pattern color: {}".format(label, ex))
+        try:
+            ogs.SetSurfaceForegroundPatternId(fill_id)
+        except Exception as ex:
+            warnings.append(u"{}: could not set the surface foreground pattern id: {}".format(label, ex))
+        try:
+            ogs.SetSurfaceForegroundPatternColor(color)
+        except Exception as ex:
+            warnings.append(u"{}: could not set the surface foreground pattern color: {}".format(label, ex))
     else:
         warnings.append(
-            u"{}: no diagonal hatch pattern could be resolved, so the cut pattern color "
-            u"override was skipped too (setting a color with no pattern override in place "
-            u"tints the element's own default cut pattern instead — often Solid fill, "
-            u"exactly the opaque-block bug) — only the cut LINE color was applied.".format(label))
+            u"{}: no diagonal hatch pattern could be resolved, so the cut/surface pattern "
+            u"colors were skipped too (setting a color with no pattern override in place "
+            u"tints the element's own default pattern instead — often Solid fill, exactly "
+            u"the opaque-block bug) — only the cut/projection LINE colors were applied.".format(label))
 
     return ogs
 
