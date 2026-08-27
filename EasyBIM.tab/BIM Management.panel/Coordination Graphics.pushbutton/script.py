@@ -2194,7 +2194,21 @@ def _fuzzy_tokens_from_pattern_name(name):
 def find_fill_pattern_id(exact_name, warnings, label):
     """Exact drafting-pattern name match, else a drafting pattern containing
     every word from the configured name, else any drafting pattern with
-    'DIAGONAL' in its name, else InvalidElementId (+ a warning)."""
+    'DIAGONAL' in its name, else InvalidElementId (+ a warning). Logs which
+    tier matched and the resolved pattern's actual name/id via logger.info
+    (not `warnings` — this is routine diagnostic info) on every call, not
+    just on total failure: live-testing found Structure (red) still
+    rendering solid while Architecture (blue) correctly hatched, from the
+    exact same code path applied to both colors — the two ONLY differ in
+    the pattern *name* they search for (StructPatternName/ArchPatternName)
+    and how many type names their filter matches (48 vs 5 in that test).
+    If Structure's search silently resolves to a DIFFERENT actual pattern
+    than Architecture's (e.g. a much finer/denser one that reads as solid
+    at typical zoom, since these are Drafting-target patterns — fixed
+    paper-space spacing regardless of model zoom), that would explain the
+    visual mismatch without any override/filter logic being wrong at all.
+    This makes that immediately checkable from the pyRevit output window
+    on the next run, instead of guessing from a screenshot."""
     fuzzy_tokens = _fuzzy_tokens_from_pattern_name(exact_name)
 
     drafting = []
@@ -2206,19 +2220,32 @@ def find_fill_pattern_id(exact_name, warnings, label):
         except Exception:
             continue
 
+    def _log_and_return(fpe, tier):
+        try:
+            logger.info(u"{}: cut hatch pattern for '{}' resolved via {} tier -> '{}' (id {})".format(
+                label, exact_name, tier, _elem_name(fpe), fpe.Id.IntegerValue))
+        except Exception:
+            pass
+        return fpe.Id
+
     for fpe in drafting:
         if _elem_name(fpe) == exact_name:
-            return fpe.Id
+            return _log_and_return(fpe, u"exact-name")
 
     for fpe in drafting:
         nm = _elem_name(fpe).upper()
         if all(tok in nm for tok in fuzzy_tokens):
-            return fpe.Id
+            return _log_and_return(fpe, u"fuzzy-token ({})".format(u"+".join(fuzzy_tokens)))
 
     for fpe in drafting:
         if u"DIAGONAL" in _elem_name(fpe).upper():
-            return fpe.Id
+            return _log_and_return(fpe, u"any-diagonal fallback")
 
+    try:
+        logger.info(u"{}: cut hatch pattern for '{}' — NO MATCH at any tier ({} drafting "
+                    u"patterns scanned).".format(label, exact_name, len(drafting)))
+    except Exception:
+        pass
     warnings.append(
         u"No fill pattern named '{}' (and no diagonal fallback) was found for the "
         u"{} cut hatch pattern — that override was skipped.".format(exact_name, label))
