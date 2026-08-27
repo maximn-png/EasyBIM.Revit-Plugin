@@ -37,13 +37,28 @@ place. They're set on the template. Individual RevitLinkInstance visibility
 (Step 5) and halftone (Step 7) are element-level view overrides, which are
 NEVER template-controlled regardless — those stay on the active view.
 
-WHY EXCLUDING "V/G Overrides RVT Links" FROM TEMPLATE CONTROL IS BEST-EFFORT:
-Autodesk's own API docs say this template row had "No API access (Revit
-2020)" and a direct BuiltInParameter.VIS_GRAPHICS_RVT_LINKS lookup returns
-null on the versions checked. This is attempted by parameter *name* instead
-(more likely to keep working if a future API version adds support), wrapped
-so a failure only adds a warning — it doesn't block anything, because link
-visibility/halftone (Steps 5 & 7) don't depend on this template row at all.
+WHY "V/G OVERRIDES RVT LINKS" IS NOW KEPT TEMPLATE-CONTROLLED (reversed a
+prior design decision): earlier rounds deliberately EXCLUDED this row
+from template control (added its parameter Id to
+NonControlledTemplateParameterIds, unchecking "Include" for it), reasoned
+at the time to be harmless since link visibility/halftone (Steps 5 & 7)
+don't depend on this template row. That missed something: when the row
+is NOT template-controlled, each VIEW using the template gets its OWN
+independent value for it instead of inheriting the template's —
+confirmed by the user from an actual screenshot of the template's Include
+column showing it unchecked. Since _apply_link_display_settings calls
+SetLinkOverrides against `target` (the template itself, in the success
+path), excluding this row meant that call was setting a value that
+doesn't propagate to any real view using the template — including a
+sheet's duplicated view (_get_view_for_sheet), which could then diverge
+from the working view's own link display state. Now actively ENSURED
+included instead (_ensure_rvt_links_template_controlled removes the
+parameter Id from the non-controlled list if present, the opposite of
+the old exclusion function) — Autodesk's own API docs still note this row
+had "No API access (Revit 2020)" and a direct
+BuiltInParameter.VIS_GRAPHICS_RVT_LINKS lookup still returns null on the
+versions checked, so this is still attempted by parameter *name*, wrapped
+so a failure only adds a warning.
 
 WHY GRID COLORING USES PER-ELEMENT OVERRIDES, NOT A THIRD VIEW FILTER (V3):
 Walls/Columns/Framing/Foundations can be told apart per-link by Type Name
@@ -1281,9 +1296,14 @@ def _find_view_template_by_name(name):
     return None
 
 
-def _exclude_rvt_links_from_template_control(template, warnings):
-    """Best-effort (see module docstring) — a failure here is informational
-    only, it doesn't block anything else this tool does."""
+def _ensure_rvt_links_template_controlled(template, warnings):
+    """See module docstring ("WHY 'V/G OVERRIDES RVT LINKS' IS NOW KEPT
+    TEMPLATE-CONTROLLED") for why this actively ENSURES the row is
+    included (removes its parameter Id from the template's non-controlled
+    list if present) rather than excluding it — the opposite of an
+    earlier version of this function. Best-effort regardless: a failure
+    here is informational only, it doesn't block anything else this tool
+    does."""
     try:
         param_id = None
         for p in template.Parameters:
@@ -1297,12 +1317,12 @@ def _exclude_rvt_links_from_template_control(template, warnings):
                 u"view-specific regardless of this setting.")
             return
         current_ids = list(template.GetNonControlledTemplateParameterIds())
-        if not any(i.IntegerValue == param_id.IntegerValue for i in current_ids):
-            current_ids.append(param_id)
-            template.SetNonControlledTemplateParameterIds(SCG.List[DB.ElementId](current_ids))
+        kept_ids = [i for i in current_ids if i.IntegerValue != param_id.IntegerValue]
+        if len(kept_ids) != len(current_ids):
+            template.SetNonControlledTemplateParameterIds(SCG.List[DB.ElementId](kept_ids))
     except Exception as ex:
         warnings.append(
-            u"Could not exclude 'V/G Overrides RVT Links' from template control: {} "
+            u"Could not include 'V/G Overrides RVT Links' in template control: {} "
             u"(informational only).".format(ex))
 
 
@@ -1398,7 +1418,7 @@ def ensure_view_template(view, host_clutter_bics, link_model_bics, wallnoncore_b
 
     _apply_coordination_categories(template, host_clutter_bics, link_model_bics,
                                     wallnoncore_bics, annotation_bics, override_bics, warnings)
-    _exclude_rvt_links_from_template_control(template, warnings)
+    _ensure_rvt_links_template_controlled(template, warnings)
 
     try:
         view.ViewTemplateId = template.Id
