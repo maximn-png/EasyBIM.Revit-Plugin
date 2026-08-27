@@ -1162,48 +1162,83 @@ def _hide_dwg_imports_in_link(view, link_info, basement_view, warnings):
 def _restrict_traffic_link_visibility(view, traffic_link, keep_bics, warnings):
     """Best-effort element-level hide (see module docstring — same class of
     cross-document uncertainty as the DWG-import hide above, same defensive
-    handling)."""
+    handling).
+
+    Single pass over every instance in the link, grouped by each element's
+    own resolved .Category (rather than one FilteredElementCollector pass
+    per category via ElementCategoryFilter) -- fewer collector passes on a
+    large civil/traffic model, and it can't disagree with an element about
+    its own category. Per-category counts are logged so a test run gives a
+    definite yes/no on whether View.HideElements actually took effect for
+    elements that live in a linked document (there is no API way to confirm
+    that ahead of time -- see module docstring)."""
     link_doc = traffic_link[u"doc"]
     if link_doc is None:
         warnings.append(u"Traffic link is unloaded — could not restrict its categories.")
         return
 
     try:
-        categories = list(link_doc.Settings.Categories)
+        all_elems = list(DB.FilteredElementCollector(link_doc).WhereElementIsNotElementType())
     except Exception as ex:
-        warnings.append(u"Could not read categories from the Traffic link: {}".format(ex))
+        warnings.append(u"Could not scan elements in the Traffic link: {}".format(ex))
         return
 
     to_hide = SCG.List[DB.ElementId]()
-    for cat in categories:
+    per_category = {}   # category name -> [seen, hidden]
+    no_category = 0
+
+    for e in all_elems:
+        try:
+            cat = e.Category
+        except Exception:
+            cat = None
+        if cat is None:
+            no_category += 1
+            continue
+
         try:
             bic = DB.BuiltInCategory(cat.Id.IntegerValue)
         except Exception:
             bic = None
+
+        cat_name = _elem_name(cat) or u"?"
+        counts = per_category.setdefault(cat_name, [0, 0])
+        counts[0] += 1
+
         if bic in keep_bics:
             continue
-        try:
-            elems = (DB.FilteredElementCollector(link_doc)
-                       .WherePasses(DB.ElementCategoryFilter(cat.Id))
-                       .WhereElementIsNotElementType()
-                       .ToElements())
-        except Exception:
-            continue
-        for e in elems:
-            try:
-                if e.CanBeHidden(view):
-                    to_hide.Add(e.Id)
-            except Exception:
-                pass
 
-    if to_hide.Count:
+        try:
+            if e.CanBeHidden(view):
+                to_hide.Add(e.Id)
+                counts[1] += 1
+        except Exception:
+            pass
+
+    hidden_count = to_hide.Count
+    if hidden_count:
         try:
             view.HideElements(to_hide)
         except Exception as ex:
             warnings.append(
                 u"Could not hide {} element(s) inside the Traffic link: {} "
                 u"(View.HideElements may not support elements from a linked "
-                u"document in this Revit version).".format(to_hide.Count, ex))
+                u"document in this Revit version).".format(hidden_count, ex))
+            hidden_count = 0
+            for counts in per_category.values():
+                counts[1] = 0
+
+    try:
+        breakdown = u", ".join(
+            u"{}: {}/{} hidden".format(k, v[1], v[0]) for k, v in sorted(per_category.items()))
+        logger.info(u"Traffic link — element visibility restriction: {} total hidden "
+                    u"(kept categories: {}). {}{}".format(
+                        hidden_count,
+                        u", ".join(sorted(b.ToString() for b in keep_bics)),
+                        breakdown or u"no elements found",
+                        u"; {} element(s) with no category".format(no_category) if no_category else u""))
+    except Exception:
+        pass
 
 
 def _set_traffic_halftone(view, traffic_link, warnings):
@@ -1467,6 +1502,15 @@ def _type_is_concrete(link_doc, elem_type, bic, cfg):
     texts = [_elem_name(elem_type)]
     texts.append(_first_text(elem_type, "ALL_MODEL_DESCRIPTION", u"Description"))
     texts.append(_first_text(elem_type, "ALL_MODEL_TYPE_COMMENTS", u"Type Comments"))
+    # Family Name — walls are a system family (no .Family the same way loaded
+    # families have one), so this only ever contributes for the loadable-
+    # family categories (columns/framing/foundations); harmless no-op for walls.
+    try:
+        fam = getattr(elem_type, "Family", None)
+        if fam is not None:
+            texts.append(_elem_name(fam))
+    except Exception:
+        pass
 
     # OST_Columns / OST_StructuralColumns both fall into the "else" branch
     # here (only Walls use compound-structure core layers) — Structural
