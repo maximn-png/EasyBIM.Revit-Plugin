@@ -39,7 +39,14 @@ SETTINGS_DEFAULTS = {
     u"ArchLinkKeywords"   : [u"ARC"],
     u"StructLinkKeywords" : [u"STR"],
     u"TrafficLinkKeywords": [u"TRF", u"Traffic", u"תנועה"],
-    u"ConcreteKeywords"   : [u"Concrete", u"בטון"],
+    # B15-B60 are standard Israeli/European concrete-strength grade
+    # designations — a real element's Type/Family/Material name is very
+    # often just the grade with no "concrete" substring at all (see
+    # _type_is_concrete's MaterialClass fast-path for the same problem
+    # solved a second, more authoritative way).
+    u"ConcreteKeywords"   : [u"Concrete", u"בטון", u"ב-30", u"ב30",
+                              u"B15", u"B20", u"B25", u"B30", u"B35",
+                              u"B40", u"B45", u"B50", u"B60"],
     u"ExcludeKeywords"    : [u"Block", u"בלוק", u"Light", u"קל", u"מילוי"],
     u"StructPatternName"  : u"Diagonal Up - 1.5mm",
     u"ArchPatternName"    : u"Diagonal Down - 1.5mm",

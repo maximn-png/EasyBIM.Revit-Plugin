@@ -167,7 +167,7 @@ HOST_CLUTTER_CATEGORY_NAMES = [
     "OST_Site",
     "OST_Parking",
     "OST_Sections",
-    "OST_Elevations",
+    "OST_ElevationMarks",
     "OST_Callouts",
     "OST_GenericModel",
     "OST_Mass",
@@ -181,7 +181,7 @@ LINK_MODEL_HIDE_CATEGORY_NAMES = [
     "OST_Toposolid",
 ]
 
-WALL_NONCORE_CATEGORY_NAME = "OST_WallsNonCoreLayers"
+WALL_NONCORE_CATEGORY_NAME = "OST_WallNonCoreLayer"
 
 # Annotation categories hidden on the template (Step 6). Room Tags are
 # deliberately NOT here — kept visible explicitly, see _ensure_room_tags_visible.
@@ -1036,11 +1036,18 @@ def _find_matching_link_views(link_infos, host_level):
                     continue
                 if vp.GetPrimaryViewId() != DB.ElementId.InvalidElementId:
                     continue  # dependent view
+                is_floor_plan = (vp.ViewType == DB.ViewType.FloorPlan)
             except Exception:
                 continue
-            results.append({u"view": vp, u"link": li, u"name": _elem_name(vp) or u"?"})
+            results.append({u"view": vp, u"link": li, u"name": _elem_name(vp) or u"?",
+                             u"is_floor_plan": is_floor_plan})
 
-    results.sort(key=lambda r: (0 if r[u"name"].startswith(u"#") else 1, r[u"name"].upper()))
+    # '#'-prefixed names always first; when none exist, a genuine Floor Plan
+    # is preferred over a Ceiling/Area/Structural/Engineering plan on the
+    # same level as the auto-selected default, then alphabetical.
+    results.sort(key=lambda r: (0 if r[u"name"].startswith(u"#") else 1,
+                                 0 if r[u"is_floor_plan"] else 1,
+                                 r[u"name"].upper()))
     return results
 
 
@@ -1657,9 +1664,21 @@ def _contains_any(haystack, keywords):
     because short/generic keywords are exactly the kind a team ends up
     adding (e.g. "Con" as shorthand for concrete) and a raw substring check
     can't tell "Con" matching "Concrete" apart from "Con" matching
-    "Continuous"/"Contact"/"Connection" — this is very likely why non-
-    concrete elements were getting colored. \\b works correctly for Hebrew
-    too under re.UNICODE (Python 2's \\w is ASCII-only by default)."""
+    "Continuous"/"Contact"/"Connection".
+
+    BUG FIXED (found live-testing "30x250"/family name
+    "Concrete_Rectangular_Two side Rounded_Column" — it wasn't matching
+    "Concrete" despite the keyword being present verbatim): Python's \\b/\\w
+    treat underscore as a WORD character, so \\bCONCRETE\\b does not match
+    inside "CONCRETE_RECTANGULAR_COLUMN" — there's no boundary between "E"
+    and "_", both count as \\w. That's exactly Revit's own default
+    underscore-delimited family/type naming convention, so the original
+    word-boundary fix (for the "Con"-inside-"Continuous" false-positive)
+    was quietly breaking the far more common case. Fixed with an explicit
+    boundary definition instead of \\b/\\w: only [0-9A-Za-z<Hebrew>] count as
+    "word" characters here, so underscore/hyphen/space/period/parentheses
+    all correctly act as separators on both sides, while plain letters
+    still don't (so "Con" still won't match inside "Continuous")."""
     if not haystack:
         return False
     up = haystack.upper()
@@ -1669,7 +1688,8 @@ def _contains_any(haystack, keywords):
         ku = k.upper()
         pattern = _WORD_BOUNDARY_PATTERN_CACHE.get(ku)
         if pattern is None:
-            pattern = re.compile(u"\\b" + re.escape(ku) + u"\\b", re.UNICODE)
+            pattern = re.compile(
+                u"(?<![0-9A-Za-zא-ת])" + re.escape(ku) + u"(?![0-9A-Za-zא-ת])")
             _WORD_BOUNDARY_PATTERN_CACHE[ku] = pattern
         if pattern.search(up):
             return True
@@ -1677,62 +1697,70 @@ def _contains_any(haystack, keywords):
 
 
 def _material_texts(link_doc, material_id):
-    """[Material.Name, Material.MaterialClass] for one material — MaterialClass
-    matters because a real-world concrete material is very often NAMED after
-    its grade only (e.g. "B30", a standard Israeli/European concrete-strength
+    """(name, material_class) for one material — MaterialClass matters
+    because a real-world concrete material is very often NAMED after its
+    grade only (e.g. "B30", a standard Israeli/European concrete-strength
     designation with no "concrete" substring at all), while Revit's own
     Material Browser classification for a properly set-up concrete material
-    is reliably "Concrete" regardless of what it's actually named. Matching
-    on name text alone misses exactly that case."""
+    is reliably "Concrete" (or "Concrete, Cast-in-Place"/"Concrete,
+    Precast", still containing "Concrete") regardless of what it's actually
+    named. Returned as a pair, not a merged list, because _type_is_concrete
+    checks material_class on its own as an unconditional signal (bypasses
+    ExcludeKeywords entirely) on top of feeding the same name text into the
+    general keyword-matching pool everything else uses."""
     if material_id is None or material_id == DB.ElementId.InvalidElementId:
-        return []
+        return (u"", u"")
     try:
         mat = link_doc.GetElement(material_id)
         if mat is None:
-            return []
+            return (u"", u"")
     except Exception:
-        return []
-    out = []
-    name = _elem_name(mat)
-    if name:
-        out.append(name)
+        return (u"", u"")
+    name = _elem_name(mat) or u""
     try:
-        cls = mat.MaterialClass
-        if cls:
-            out.append(cls)
+        cls = mat.MaterialClass or u""
     except Exception:
-        pass
-    return out
+        cls = u""
+    return (name, cls)
 
 
 def _wall_core_material_texts(link_doc, wall_type):
+    """(texts, material_classes) — texts feed the general keyword pool,
+    material_classes is checked unconditionally in _type_is_concrete."""
     texts = []
+    classes = []
     try:
         cs = wall_type.GetCompoundStructure()
         if cs is None:
-            return texts
+            return texts, classes
         first = cs.GetFirstCoreLayerIndex()
         last  = cs.GetLastCoreLayerIndex()
         layers = list(cs.GetLayers())
         for i, layer in enumerate(layers):
             if first <= i <= last:
-                texts.extend(_material_texts(link_doc, layer.MaterialId))
+                name, cls = _material_texts(link_doc, layer.MaterialId)
+                if name:
+                    texts.append(name)
+                if cls:
+                    classes.append(cls)
     except Exception:
         pass
-    return texts
+    return texts, classes
 
 
 def _structural_material_texts(link_doc, elem_type):
+    """(texts, material_classes) — see _wall_core_material_texts."""
     bip = getattr(DB.BuiltInParameter, "STRUCTURAL_MATERIAL_PARAM", None)
     if bip is None:
-        return []
+        return [], []
     try:
         p = elem_type.get_Parameter(bip)
         if p is not None:
-            return _material_texts(link_doc, p.AsElementId())
+            name, cls = _material_texts(link_doc, p.AsElementId())
+            return ([name] if name else []), ([cls] if cls else [])
     except Exception:
         pass
-    return []
+    return [], []
 
 
 def _instance_material_texts(link_doc, elem):
@@ -1743,14 +1771,18 @@ def _instance_material_texts(link_doc, elem):
     classification is cached per type-id for speed (see
     _collect_concrete_type_names); this is checked per-instance as a
     supplementary signal precisely because it CAN vary between instances of
-    the same type in a way the type-level cache wouldn't otherwise catch."""
+    the same type in a way the type-level cache wouldn't otherwise catch.
+    Flat text list (name + class merged) — this feeds the general keyword
+    pool only, unlike the type-level checks which also test material_class
+    unconditionally."""
     bip = getattr(DB.BuiltInParameter, "MATERIAL_ID_PARAM", None)
     if bip is None:
         return []
     try:
         p = elem.get_Parameter(bip)
         if p is not None:
-            return _material_texts(link_doc, p.AsElementId())
+            name, cls = _material_texts(link_doc, p.AsElementId())
+            return [t for t in (name, cls) if t]
     except Exception:
         pass
     return []
@@ -1778,9 +1810,21 @@ def _type_is_concrete(link_doc, elem_type, bic, cfg):
     # Material + its MaterialClass is the signal for columns/framing/
     # foundations, same as for any other non-wall structural category.
     if bic == DB.BuiltInCategory.OST_Walls:
-        texts.extend(_wall_core_material_texts(link_doc, elem_type))
+        mat_texts, mat_classes = _wall_core_material_texts(link_doc, elem_type)
     else:
-        texts.extend(_structural_material_texts(link_doc, elem_type))
+        mat_texts, mat_classes = _structural_material_texts(link_doc, elem_type)
+    texts.extend(mat_texts)
+
+    # Revit's own Material Browser "Class" is an authoritative signal,
+    # independent of whatever the material/type/family happens to be named
+    # -- e.g. a material literally named "B30" (a grade code, no "concrete"
+    # substring at all) with Class correctly set to "Concrete". Checked
+    # FIRST and unconditionally — bypasses ExcludeKeywords entirely — per
+    # live-testing feedback: Revit's own classification should win over a
+    # team's text-keyword heuristic, not lose to it on an unlucky Exclude
+    # match elsewhere in the same element's text.
+    if _contains_any(u" | ".join(mat_classes), [u"Concrete", u"בטון"]):
+        return True
 
     combined = u" | ".join(t for t in texts if t)
     if not _contains_any(combined, concrete_kw):
@@ -2059,30 +2103,32 @@ def _settings_color(settings, key, fallback):
 
 
 def build_colored_override(color, pattern_name, warnings, label):
-    """All boundary lines are Solid — a dashed line pattern for columns was
-    tried and then explicitly reversed per live-testing feedback: every
-    category's cut/projection lines must be straight and continuous. Only
-    the line COLOR and the diagonal foreground HATCH differ between
-    Structure (red) and Architecture (blue).
+    """Cut geometry ONLY — no Projection/Surface overrides at all, per
+    live-testing feedback that elements were rendering as 100% solid,
+    opaque colored blocks instead of a hatch. Two independent contributors,
+    both closed off here: (1) SetSurfaceTransparency(100) only affects
+    Shaded/Realistic visual styles (it never touched Hidden Line, the
+    default and by far the most common style for a 2D coordination plan
+    view), so the Surface foreground fill was rendering at full opacity
+    there, visually dominating the thin Cut hatch underneath; (2) even when
+    a diagonal pattern fails to resolve (find_fill_pattern_id returns
+    InvalidElementId), SetCutForegroundPatternColor was still being called
+    unconditionally — tinting the element's own INHERENT cut pattern
+    (often Solid fill, for many default concrete materials) instead of a
+    hatch. Dropping Surface entirely removes contributor (1) outright;
+    guarding the color-without-a-pattern case below (only set
+    CutForegroundPatternColor when fill_id actually resolved) closes (2).
 
-    The hatch itself is set on the CUT FOREGROUND pattern, not Background —
-    Background rendered as a flat/solid look in testing even with a diagonal
-    FillPattern assigned; Foreground is the slot that actually draws visible
-    hatch lines."""
+    All boundary lines are Solid — a dashed line pattern for columns was
+    tried and then explicitly reversed per earlier live-testing feedback.
+    Only the CUT LINE color and the diagonal CUT FOREGROUND hatch differ
+    between Structure (red) and Architecture (blue).
+
+    Grids have no Cut representation at all (they're a projection-only
+    datum category) — see build_grid_line_override for the separate,
+    minimal override that actually colors a Grid line; this function's
+    output is no longer usable for that now that Projection is dropped."""
     ogs = DB.OverrideGraphicSettings()
-
-    # Grids have no "cut" representation (they're a projection-only datum
-    # category), so the cut-pattern overrides below have no visible effect on
-    # them — this is what actually colors a grid line.
-    try:
-        ogs.SetProjectionLineColor(color)
-    except Exception as ex:
-        warnings.append(u"{}: could not set the projection line color: {}".format(label, ex))
-
-    try:
-        ogs.SetSurfaceTransparency(100)
-    except Exception as ex:
-        warnings.append(u"{}: could not set surface transparency: {}".format(label, ex))
 
     try:
         ogs.SetCutLineWeight(1)
@@ -2095,10 +2141,11 @@ def build_colored_override(color, pattern_name, warnings, label):
             ogs.SetCutLinePatternId(line_id)
         except Exception as ex:
             warnings.append(u"{}: could not set the cut line pattern: {}".format(label, ex))
-        try:
-            ogs.SetProjectionLinePatternId(line_id)
-        except Exception as ex:
-            warnings.append(u"{}: could not set the projection line pattern: {}".format(label, ex))
+
+    try:
+        ogs.SetCutLineColor(color)
+    except Exception as ex:
+        warnings.append(u"{}: could not set the cut line color: {}".format(label, ex))
 
     try:
         ogs.SetCutBackgroundPatternVisible(False)
@@ -2114,51 +2161,44 @@ def build_colored_override(color, pattern_name, warnings, label):
     except Exception as ex:
         warnings.append(u"{}: could not enable the cut foreground pattern: {}".format(label, ex))
 
-    try:
-        ogs.SetCutLineColor(color)
-    except Exception as ex:
-        warnings.append(u"{}: could not set the cut line color: {}".format(label, ex))
-
     fill_id = find_fill_pattern_id(pattern_name, warnings, label)
     if fill_id != DB.ElementId.InvalidElementId:
         try:
             ogs.SetCutForegroundPatternId(fill_id)
         except Exception as ex:
             warnings.append(u"{}: could not set the cut foreground pattern id: {}".format(label, ex))
-
-    try:
-        ogs.SetCutForegroundPatternColor(color)
-    except Exception as ex:
-        warnings.append(u"{}: could not set the cut foreground pattern color: {}".format(label, ex))
-
-    # Surface (projection) hatch, same pattern/color as the cut hatch above.
-    # NOTE: SetSurfaceTransparency(100) above makes the surface itself
-    # see-through in shaded/realistic views, which can make this pattern
-    # very faint or invisible there even though it's correctly applied —
-    # that's the transparency setting winning, not a broken override. It
-    # still renders normally in Hidden Line / Wireframe visual styles,
-    # which don't apply transparency to fills at all.
-    try:
-        ogs.SetSurfaceForegroundPatternVisible(True)
-    except Exception as ex:
-        warnings.append(u"{}: could not enable the surface foreground pattern: {}".format(label, ex))
-    try:
-        ogs.SetSurfaceBackgroundPatternVisible(False)
-    except Exception as ex:
-        warnings.append(u"{}: could not disable the surface background pattern: {}".format(label, ex))
-    try:
-        ogs.SetSurfaceBackgroundPatternId(DB.ElementId.InvalidElementId)
-    except Exception:
-        pass
-    if fill_id != DB.ElementId.InvalidElementId:
         try:
-            ogs.SetSurfaceForegroundPatternId(fill_id)
+            ogs.SetCutForegroundPatternColor(color)
         except Exception as ex:
-            warnings.append(u"{}: could not set the surface foreground pattern id: {}".format(label, ex))
+            warnings.append(u"{}: could not set the cut foreground pattern color: {}".format(label, ex))
+    else:
+        warnings.append(
+            u"{}: no diagonal hatch pattern could be resolved, so the cut pattern color "
+            u"override was skipped too (setting a color with no pattern override in place "
+            u"tints the element's own default cut pattern instead — often Solid fill, "
+            u"exactly the opaque-block bug) — only the cut LINE color was applied.".format(label))
+
+    return ogs
+
+
+def build_grid_line_override(color, warnings, label):
+    """Grids are a projection-only datum category — no Cut representation
+    to override, unlike Walls/Columns/Framing/Foundations. build_colored_
+    override() above is Cut-only now, so grid coloring needs this separate,
+    minimal override: just the projection line color + solid line pattern,
+    the only things that actually paint a colored, continuous Grid line."""
+    ogs = DB.OverrideGraphicSettings()
     try:
-        ogs.SetSurfaceForegroundPatternColor(color)
+        ogs.SetProjectionLineColor(color)
     except Exception as ex:
-        warnings.append(u"{}: could not set the surface foreground pattern color: {}".format(label, ex))
+        warnings.append(u"{}: could not set the Grid line color: {}".format(label, ex))
+
+    line_id = get_solid_line_pattern_id()
+    if line_id != DB.ElementId.InvalidElementId:
+        try:
+            ogs.SetProjectionLinePatternId(line_id)
+        except Exception as ex:
+            warnings.append(u"{}: could not set the Grid line pattern: {}".format(label, ex))
 
     return ogs
 
@@ -2522,10 +2562,15 @@ def run():
         apply_filter_to_target(template, arch_pfe, arch_ogs, warnings, u"Architecture")
 
         # ── Refinement 1: color Grids inside every selected Arch/Struct link ───
+        # struct_ogs/arch_ogs are Cut-only now (see build_colored_override) —
+        # Grids have no Cut representation, so they need their own minimal
+        # projection-line override instead (see build_grid_line_override).
+        struct_grid_ogs = build_grid_line_override(struct_color, warnings, u"Structure")
+        arch_grid_ogs   = build_grid_line_override(arch_color, warnings, u"Architecture")
         for li in struct_links:
-            _color_link_grids(view, li, struct_ogs, warnings, u"Structure")
+            _color_link_grids(view, li, struct_grid_ogs, warnings, u"Structure")
         for li in arch_links:
-            _color_link_grids(view, li, arch_ogs, warnings, u"Architecture")
+            _color_link_grids(view, li, arch_grid_ogs, warnings, u"Architecture")
 
         # ── Refinement 2: automatic sheet creation ──────────────────────────────
         sheet = None
