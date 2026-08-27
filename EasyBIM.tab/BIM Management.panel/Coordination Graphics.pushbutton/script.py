@@ -2817,6 +2817,33 @@ def run():
                 warnings.append(u"Could not hide {} other link(s): {}".format(
                     other_link_ids.Count, ex))
 
+            # Re-check IsHidden right after the call, per-link, instead of
+            # trusting "HideElements didn't throw" as proof it stuck — this
+            # is the one thing that can actually distinguish "the API call
+            # itself silently failed" from "it worked here, but you're
+            # looking at a different view/sheet than this tool ran on"
+            # (element hides are always per-view, never template-controlled
+            # — that's not fixable by any HideElements variant).
+            still_visible_after = []
+            for li in links:
+                if li[u"id"].IntegerValue in chosen_ids:
+                    continue
+                if li[u"name"] in already_hidden_names or li[u"name"] in unhideable_names:
+                    continue
+                try:
+                    if not li[u"instance"].IsHidden(view):
+                        still_visible_after.append(li[u"name"])
+                except Exception:
+                    pass
+            if still_visible_after:
+                newly_hidden_count -= len(still_visible_after)
+                warnings.append(
+                    u"HideElements reported success but IsHidden still shows FALSE right "
+                    u"after, for: {} — this points at a genuine API/Revit-version quirk, "
+                    u"not a 'wrong view' explanation, since this check runs against the "
+                    u"exact same view object the hide was just applied to.".format(
+                        u", ".join(still_visible_after)))
+
         other_links_summary = u"Other links hidden: {} newly + {} already ({} total)".format(
             newly_hidden_count, len(already_hidden_names),
             newly_hidden_count + len(already_hidden_names))
@@ -2834,14 +2861,22 @@ def run():
             _hide_dwg_imports_in_link(view, li, basement, warnings)
 
         # ── Step 7: Traffic link ────────────────────────────────────────────────
+        # Element-level hide runs BEFORE the display-mode switch (Custom/
+        # ByLinkView) now, not after — reordered to test a real possibility
+        # raised by a large "could not be hidden" count in live testing:
+        # CanBeHidden/HideElements for cross-document elements might behave
+        # differently once the link has already left ByHostView mode.
+        # Low-risk either way (doesn't change what ends up hidden if this
+        # wasn't the cause), and arguably more correct regardless: hide the
+        # elements while the link is still in its simplest, default state.
         traffic_summary = None
         if use_traffic and traffic_link:
+            traffic_summary = _restrict_traffic_link_visibility(
+                view, traffic_link, traffic_keep_bics, warnings)
             _ensure_linked_view_detail_level(traffic_linked_view, warnings, u"Traffic")
             linked_view_id = traffic_linked_view[u"view"].Id if traffic_linked_view else None
             _apply_link_display_settings(template, traffic_link[u"id"], linked_view_id,
                                           warnings, u"Traffic")
-            traffic_summary = _restrict_traffic_link_visibility(
-                view, traffic_link, traffic_keep_bics, warnings)
             _set_traffic_halftone(view, traffic_link, warnings)
 
         # ── Smart Linked View: Architecture/Structure (optional, per role) ─────
