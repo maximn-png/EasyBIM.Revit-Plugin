@@ -251,16 +251,25 @@ LINK_ANNOTATION_HIDE_CATEGORY_NAMES = [
 ]
 
 # Categories left visible inside the Traffic link when enabled (Step 7).
-# Revised per live-testing feedback: the traffic/civil model in practice
-# marks up slopes and grading via annotated Generic Model families and
-# text/dimension callouts rather than native Spot Elevation/Spot Slope
-# elements, so those replaced OST_SpotElevations/OST_SpotSlopes here.
+# Narrowed to Parking only, per explicit request ("isolate Parking, keep
+# the coordination view clean") — this SUPERSEDES an earlier live-testing
+# compromise that also kept GenericModel/TextNotes/Dimensions/
+# GenericAnnotation (because the traffic/civil model marked up slopes and
+# grading via those rather than native Spot Elevation/Spot Slope
+# elements). If that markup is needed again later, re-add the categories
+# here — this is a plain "keep" list, not a per-category API limitation.
+#
+# NOT implemented via RevitLinkGraphicsSettings.SetCategoryHidden, which
+# was suggested but does not exist: reflecting the installed RevitAPI.dll
+# (same class already confirmed to have no DetailLevel — see
+# _apply_link_display_settings/_ensure_linked_view_detail_level) shows
+# RevitLinkGraphicsSettings has exactly three members, none of them
+# category-related. This "keep" list instead drives the existing element-
+# level hide in _restrict_traffic_link_visibility, which already
+# implements exactly this "show only these categories, hide everything
+# else in the link" behavior via View.HideElements.
 TRAFFIC_KEEP_CATEGORY_NAMES = [
     "OST_Parking",
-    "OST_GenericModel",
-    "OST_TextNotes",
-    "OST_Dimensions",
-    "OST_GenericAnnotation",
 ]
 
 BASEMENT_TOKENS = (u"BASEMENT", u"מרתף")
@@ -1360,7 +1369,24 @@ def _apply_coordination_categories(target, host_clutter_bics, link_model_bics, w
     if grids_bic is not None:
         _hide_category_safe(target, grids_bic, warnings, hide=False)
 
+    # Live-testing finding: a non-concrete wall (e.g. "15_BLOCK", correctly
+    # excluded from the Structure/Architecture Filters by name) still
+    # showed its own hardcoded Type Properties "Coarse Scale Fill Color"
+    # as a solid fill. build_colored_override's OverrideGraphicSettings.
+    # SetDetailLevel(Fine) only forces Fine for elements the two concrete
+    # FILTERS actually match — it never touches anything outside those
+    # matches, and this gray fallback (below) is the CATEGORY-level
+    # override applied to every OTHER element in these 5 categories, which
+    # never had its own DetailLevel forced. Fixed here, so every element
+    # in override_bics gets Fine forced one way or another — either via
+    # the Structure/Architecture Filter (if classified concrete) or via
+    # this gray fallback (if not) — closing the gap for every non-concrete
+    # wall/column/etc. in the Arch/Struct links, not just the colored ones.
     gray_ogs = DB.OverrideGraphicSettings()
+    try:
+        gray_ogs.SetDetailLevel(DB.ViewDetailLevel.Fine)
+    except Exception as ex:
+        warnings.append(u"Could not force the gray fallback's detail level to Fine: {}".format(ex))
     try:
         gray_ogs.SetProjectionLineColor(GRAY_COLOR)
     except Exception as ex:
