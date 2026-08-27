@@ -1520,24 +1520,28 @@ def _restrict_traffic_link_visibility(view, traffic_link, keep_bics, warnings):
     own resolved .Category (rather than one FilteredElementCollector pass
     per category via ElementCategoryFilter) -- fewer collector passes on a
     large civil/traffic model, and it can't disagree with an element about
-    its own category. Per-category counts are logged so a test run gives a
-    definite yes/no on whether View.HideElements actually took effect for
-    elements that live in a linked document (there is no API way to confirm
-    that ahead of time -- see module docstring)."""
+    its own category. Per-category counts are logged (pyRevit output) AND
+    returned as a short summary string the caller can put directly in the
+    final TaskDialog -- not just buried in the log -- so a test run gives
+    a definite yes/no on whether View.HideElements actually took effect
+    for elements that live in a linked document, checkable from the result
+    dialog itself (there is no API way to confirm this ahead of time -- see
+    module docstring)."""
     link_doc = traffic_link[u"doc"]
     if link_doc is None:
         warnings.append(u"Traffic link is unloaded — could not restrict its categories.")
-        return
+        return u"Traffic link is unloaded — nothing was hidden."
 
     try:
         all_elems = list(DB.FilteredElementCollector(link_doc).WhereElementIsNotElementType())
     except Exception as ex:
         warnings.append(u"Could not scan elements in the Traffic link: {}".format(ex))
-        return
+        return u"Could not scan the Traffic link's elements."
 
     to_hide = SCG.List[DB.ElementId]()
     per_category = {}   # category name -> [seen, hidden]
     no_category = 0
+    candidate_count = 0   # non-kept elements seen, before HideElements even runs
 
     for e in all_elems:
         try:
@@ -1559,6 +1563,7 @@ def _restrict_traffic_link_visibility(view, traffic_link, keep_bics, warnings):
 
         if bic in keep_bics:
             continue
+        candidate_count += 1
 
         try:
             if e.CanBeHidden(view):
@@ -1580,9 +1585,9 @@ def _restrict_traffic_link_visibility(view, traffic_link, keep_bics, warnings):
             for counts in per_category.values():
                 counts[1] = 0
 
+    breakdown = u", ".join(
+        u"{}: {}/{} hidden".format(k, v[1], v[0]) for k, v in sorted(per_category.items()))
     try:
-        breakdown = u", ".join(
-            u"{}: {}/{} hidden".format(k, v[1], v[0]) for k, v in sorted(per_category.items()))
         logger.info(u"Traffic link — element visibility restriction: {} total hidden "
                     u"(kept categories: {}). {}{}".format(
                         hidden_count,
@@ -1591,6 +1596,12 @@ def _restrict_traffic_link_visibility(view, traffic_link, keep_bics, warnings):
                         u"; {} element(s) with no category".format(no_category) if no_category else u""))
     except Exception:
         pass
+
+    unhidden_note = (u" — {} could not be hidden (CanBeHidden=False, an exception, or "
+                      u"HideElements itself failed)".format(candidate_count - hidden_count)
+                      if hidden_count < candidate_count else u"")
+    return u"Traffic link: {} of {} non-kept element(s) hidden ({}){}".format(
+        hidden_count, candidate_count, breakdown or u"no elements found", unhidden_note)
 
 
 def _set_traffic_halftone(view, traffic_link, warnings):
@@ -2764,31 +2775,53 @@ def run():
                                          override_bics, warnings)
 
         # ── Step 5: hide every other link (e.g. MEP) ────────────────────────────
+        # other_link_ids is ALREADY a typed .NET List[ElementId] (SCG.List),
+        # not a plain Python list -- that's been true since this step was
+        # first written, not something this round changed. Every outcome
+        # (hidden / already-hidden / un-hideable / exception) is now named
+        # explicitly and folded into other_links_summary below, which the
+        # final TaskDialog prints unconditionally -- not just on failure --
+        # so "still visible" is checkable directly from the result dialog
+        # instead of needing to dig through warnings or guess.
         other_link_ids = SCG.List[DB.ElementId]()
+        already_hidden_names = []
+        unhideable_names = []
         for li in links:
             if li[u"id"].IntegerValue in chosen_ids:
                 continue
             try:
                 if li[u"instance"].IsHidden(view):
+                    already_hidden_names.append(li[u"name"])
                     continue
                 if li[u"instance"].CanBeHidden(view):
                     other_link_ids.Add(li[u"id"])
                 else:
-                    # Previously a silent skip -- now surfaced, since this is
-                    # exactly the kind of gap that would explain "link X is
-                    # still visible" with no error shown anywhere.
+                    unhideable_names.append(li[u"name"])
                     warnings.append(
                         u"Link '{}' could not be hidden — Revit reports it as "
                         u"un-hideable in this view (CanBeHidden=False), so it "
                         u"remains visible.".format(li[u"name"]))
             except Exception as ex:
+                unhideable_names.append(li[u"name"])
                 warnings.append(u"Could not hide link '{}': {}".format(li[u"name"], ex))
+
+        newly_hidden_count = 0
         if other_link_ids.Count:
             try:
                 view.HideElements(other_link_ids)
+                newly_hidden_count = other_link_ids.Count
             except Exception as ex:
+                unhideable_names.extend(li[u"name"] for li in links
+                                         if li[u"id"].IntegerValue in
+                                         set(i.IntegerValue for i in other_link_ids))
                 warnings.append(u"Could not hide {} other link(s): {}".format(
                     other_link_ids.Count, ex))
+
+        other_links_summary = u"Other links hidden: {} newly + {} already ({} total)".format(
+            newly_hidden_count, len(already_hidden_names),
+            newly_hidden_count + len(already_hidden_names))
+        if unhideable_names:
+            other_links_summary += u" — COULD NOT HIDE: {}".format(u", ".join(unhideable_names))
 
         # ── Refinement 1: host Grids hidden (element-level — see docstring) ────
         _hide_host_grids(view, warnings)
@@ -2801,12 +2834,14 @@ def run():
             _hide_dwg_imports_in_link(view, li, basement, warnings)
 
         # ── Step 7: Traffic link ────────────────────────────────────────────────
+        traffic_summary = None
         if use_traffic and traffic_link:
             _ensure_linked_view_detail_level(traffic_linked_view, warnings, u"Traffic")
             linked_view_id = traffic_linked_view[u"view"].Id if traffic_linked_view else None
             _apply_link_display_settings(template, traffic_link[u"id"], linked_view_id,
                                           warnings, u"Traffic")
-            _restrict_traffic_link_visibility(view, traffic_link, traffic_keep_bics, warnings)
+            traffic_summary = _restrict_traffic_link_visibility(
+                view, traffic_link, traffic_keep_bics, warnings)
             _set_traffic_halftone(view, traffic_link, warnings)
 
         # ── Smart Linked View: Architecture/Structure (optional, per role) ─────
@@ -2890,11 +2925,15 @@ def run():
         u"Coordination graphics applied.\n\n"
         u"Architecture link(s): {}\nStructure link(s): {}\nTraffic link: {}\n\n"
         u"Architecture concrete types found: {}\nStructure concrete types found: {}\n\n"
+        u"{}\n{}\n\n"
         u"{}".format(
             u", ".join(li[u"name"] for li in arch_links),
             u", ".join(li[u"name"] for li in struct_links),
             traffic_link[u"name"] if (use_traffic and traffic_link) else u"(not used)",
-            len(arch_names), len(struct_names), sheet_line)
+            len(arch_names), len(struct_names),
+            other_links_summary,
+            traffic_summary or u"Traffic link: (not used)",
+            sheet_line)
     )
     if warnings:
         TaskDialog.Show(
