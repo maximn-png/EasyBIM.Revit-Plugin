@@ -60,77 +60,75 @@ to a warning, not a crash). Host grids are hidden the same way — element-
 level, not category-level — because hiding OST_Grids as a category (the
 template) would also hide the links' grids, which must stay visible.
 
-SMART LINKED VIEW (elevation-matched view picker, one per role): each of
+SMART LINKED VIEW (elevation-matched view picker, one per role) — FINAL
+BEHAVIOR, after several rounds of live-testing findings: each of
 Architecture/Structure/Traffic gets an optional WPF combo, populated by
 finding the SINGLE closest Level in the selected link(s) within
 LEVEL_ELEVATION_TOLERANCE_FT of the active view's own Level (compared via
 RevitLinkInstance.GetTotalTransform(), not raw Level.Elevation-to-
 Level.Elevation — see _find_matching_link_views), then collecting that
-level's non-template, non-dependent ViewPlans. Applying a chosen view sets
-RevitLinkGraphicsSettings.LinkVisibilityType=Custom + LinkedViewId on just
-the one underlying link that view belongs to (_apply_link_display_settings),
-which drives that link's view range/cut plane/detail level/phase from the
-picked view. Fixed a real, previously silent bug while building this: the
-prior Traffic-only Custom-mode code looked up getattr(DB,
-"LinkVisibilityType", None) as if it were a top-level enum type — it isn't;
-that name only exists as a *property* name on RevitLinkGraphicsSettings.
-The actual enum type is DB.LinkVisibility (members ByHostView/ByLinkView/
-Custom), confirmed by reflecting the installed RevitAPI.dll directly. The
-old lookup always returned None, so SetLinkOverrides was silently never
-called on any run — no exception, no warning, it just quietly no-opped.
-UNVERIFIED RISK (flag for the next live test): Revit's own "Custom Display
-Settings for Linked Revit Models" UI has a separate "View filters" control
-(By host view / By linked view / None) alongside the "Linked view" picker —
-RevitLinkGraphicsSettings has no property for that control at all (only
-LinkVisibilityType + LinkedViewId exist, confirmed via reflection). Whether
-Custom+LinkedViewId still evaluates the HOST's View Filters (this tool's
-red/blue coloring) on that link, or silently uses the picked view's own
-filters instead, is genuinely undocumented from the API side. Low risk for
-Traffic (its coloring/visibility never depended on View Filters); real risk
-for Architecture/Structure, since that's the one thing this tool can't
-function without — confirm on the next test that a link with a linked view
-assigned still shows correct red/blue coloring.
+level's non-template, non-dependent ViewPlans, sorted non-Coarse-detail
+first, then '#'-prefixed, then genuine Floor Plans, then alphabetical.
 
-CONFIRMED RISK (live-testing finding, root-caused by the user from a
-screenshot of a wall type's Type Properties): a linked view's own Detail
-Level is one of the "display settings" Custom+LinkedViewId imports for
-that link, per Revit's own UI docs for the Basics-tab "Linked view" picker
-("select the view in the linked model whose display settings you want to
-use"). At Coarse detail level, Revit shows a linked element's own
-hardcoded "Coarse Scale Fill Pattern" Type Property (e.g. a wall type
-literally set to solid blue fill) INSTEAD of respecting this tool's View
-Filter hatch override — this is a real, general Revit behavior (also why
-_apply_coordination_categories forces the HOST template/view to
-DB.ViewDetailLevel.Fine, which is unrelated and unaffected by this).
-DEAD END for changing the LINK's/LINKED VIEW's own Detail Level from a
-host-side script — two independent attempts confirmed this, for good
-reasons: (1) opening a Transaction directly against the linked document
-(a separate Document from the host) to set the view's own DetailLevel —
-live testing hit a hard Revit exception: "Document is a linked file.
-Transactions can only be used in primary documents." Unconditional, not a
-permissions/worksharing edge case — Revit bans Transaction(link_doc, ...)
-for ANY document from RevitLinkInstance.GetLinkDocument(), always.
-(2) RevitLinkGraphicsSettings.DetailLevel/.SetDetailLevel — reflected the
-installed RevitAPI.dll four separate times across four rounds (the fourth
-by actually instantiating the class and attempting the exact call live,
-not just reading a member list) and gotten the identical answer every
-time: that class has exactly three members, IsValidObject/
-LinkVisibilityType/LinkedViewId, nothing else, ever, in this Revit
-version — confirmed neither a settable property nor a callable method
-exists.
+TRAFFIC: a chosen view IS applied to the link, via
+RevitLinkGraphicsSettings.LinkVisibilityType=ByLinkView + LinkedViewId
+(_apply_link_display_settings) — safe, because Traffic's own coloring is
+host-view-only halftone (_set_traffic_halftone) plus element-level
+HideElements (_restrict_traffic_link_visibility), both independent of
+link display mode; it never depended on View Filters.
 
-THE ACTUAL FIX, found one property class over: OverrideGraphicSettings
-(a completely different, much older class — available since Revit 2014,
-not gated to 2024+ like RevitLinkGraphicsSettings) ALSO has
-SetDetailLevel(ViewDetailLevel) — and this is the override object already
-being applied to the Structure/Architecture filters via
-View.SetFilterOverrides (see apply_filter_to_target). Calling it forces
-elements matched by that filter to render as if the detail level were
-Fine, independent of the link's or the linked view's actual detail level
-— no linked document involved at all. Wired into build_colored_override.
+ARCHITECTURE/STRUCTURE: a chosen view is deliberately NEVER applied to
+the link (_apply_smart_linked_view no longer calls
+_apply_link_display_settings at all for these roles) — confirmed, not
+just suspected: RevitLinkGraphicsSettings.LinkVisibilityType=Custom does
+NOT accept a real LinkedViewId at all; a live test hit the exact
+exception "The LinkedViewId of linkDisplaySettings has incorrect value
+for the specified LinkVisibilityType." The only LinkVisibilityType that
+DOES accept one is ByLinkView, which (per Revit's own UI docs for the
+same "Linked view" picker) makes the link display using THAT view's own
+filters/overrides instead of the host's — i.e. it would silently break
+this tool's red/blue View Filter coloring on that link, the one thing
+this whole tool exists to do. Asked the user directly which tradeoff to
+take; the answer, applied here: always keep Filters correct, never chase
+the linked view's exact cut plane for Architecture/Structure. The chosen
+view still has real value — it identifies the right level/view for
+reference and its Detail Level still gets checked (see next paragraph) —
+it's just never pushed into RevitLinkGraphicsSettings for these two
+roles. Both links stay on ByHostView, the default, regardless of what's
+picked.
+
+Prior, now-corrected history in this same spot: a previous version looked
+up getattr(DB, "LinkVisibilityType", None) as a top-level enum type — it
+isn't, that name only exists as a *property* on RevitLinkGraphicsSettings;
+the real enum type is DB.LinkVisibility (ByHostView/ByLinkView/Custom).
+That bug silently no-opped SetLinkOverrides on every run before it was
+found via reflection.
+
+COARSE SCALE FILL PATTERN (separate issue, same neighborhood): at Coarse
+effective detail level, Revit shows a linked element's own hardcoded
+"Coarse Scale Fill Pattern" Type Property (e.g. a wall type literally set
+to solid blue fill) INSTEAD of respecting this tool's View Filter hatch —
+root-caused by the user from a screenshot of a wall type's Type
+Properties. DEAD END for changing a linked view's own Detail Level from a
+host-side script — two independent, fully confirmed attempts: (1) a
+Transaction directly against the linked document (a separate Document
+from the host) — live testing hit a hard, unconditional Revit exception:
+"Document is a linked file. Transactions can only be used in primary
+documents." (2) RevitLinkGraphicsSettings.DetailLevel/.SetDetailLevel —
+reflected the installed RevitAPI.dll four times across four rounds (the
+fourth by actually instantiating the class and calling it live, not just
+reading a member list); that class has exactly three members,
+IsValidObject/LinkVisibilityType/LinkedViewId, nothing else, ever. THE
+ACTUAL FIX, found one property class over: OverrideGraphicSettings (a
+completely different, much older class — since Revit 2014, not gated to
+2024+) ALSO has SetDetailLevel(ViewDetailLevel) — and this is the
+override object already applied to the Structure/Architecture filters
+via View.SetFilterOverrides (see apply_filter_to_target). Calling it
+forces elements matched by that filter to render as if the detail level
+were Fine, independent of the link's or the linked view's actual detail
+level, entirely on the host side. Wired into build_colored_override.
 _ensure_linked_view_detail_level's warning (naming the exact Coarse
-linked view, for the case where the source model's owner still needs to
-know) and _find_matching_link_views/_populate_linked_view_combo's
+linked view) and _find_matching_link_views/_populate_linked_view_combo's
 Coarse-last sorting/labeling are left in place as belt-and-suspenders —
 harmless now, and still correct if this override is ever unavailable.
 """
@@ -794,8 +792,9 @@ class LinkPickerDialog(object):
                u"template — confirm you're on the right view before continuing.",
             2: u"Pick one or more Architecture links and one or more Structure links. Pre-checked "
                u"from your last run or auto-detected by keyword — change either if needed. Each "
-               u"card also offers a matching linked view (by level elevation) to drive that "
-               u"link's view range and cut plane — leave it on \"None\" to use the host view's.",
+               u"card also shows a matching linked view (by level elevation) for reference — it "
+               u"does not change that link's cut plane, so this tool's red/blue coloring always "
+               u"stays correct.",
             3: u"Optional: also restrict a Traffic link to Parking, Spot Elevations and Spot "
                u"Slopes only, shown in halftone.",
             4: u"Review your choices, then click Apply to set up coordination graphics and "
@@ -1565,35 +1564,34 @@ def _apply_link_display_settings(target, link_id, linked_view_id, warnings, labe
     (uncontrolled, defaulted-to-ByHostView) value wins. Setting it directly
     on `target` is correct whether that's the template or the fallback view.
 
-    BUG FIXED (found by reflecting the installed RevitAPI.dll directly —
-    2026-08-27): the enum for LinkVisibilityType's VALUE is a type called
+    BUG FIXED (found by reflecting the installed RevitAPI.dll directly):
+    the enum for LinkVisibilityType's VALUE is a type called
     Autodesk.Revit.DB.LinkVisibility, NOT "LinkVisibilityType" — that name
     only exists as the *property* on RevitLinkGraphicsSettings, there is no
-    top-level DB.LinkVisibilityType type at all. The previous code looked
-    up getattr(DB, "LinkVisibilityType", None), which is always None, so
-    this silently no-opped on every run (no exception — it hit `if vis_enum
-    is None: return` before ever calling SetLinkOverrides). Confirmed via
-    .NET reflection against Revit 2024/RevitAPI.dll: RevitLinkGraphicsSettings
-    has exactly {IsValidObject, LinkVisibilityType, LinkedViewId}; the
-    correct enum is DB.LinkVisibility with members ByHostView/ByLinkView/Custom.
+    top-level DB.LinkVisibilityType type at all.
 
-    UNVERIFIED RISK — flag on the next live test: Revit's own UI ("Custom
-    Display Settings for Linked Revit Models") has a SEPARATE "View filters"
-    control (By host view / By linked view / None) alongside the "Linked
-    view" picker used for cut-plane/view-range/detail-level/phase. The API's
-    RevitLinkGraphicsSettings class has NO property for that separate
-    control — confirmed via reflection, only LinkVisibilityType +
-    LinkedViewId exist. Whether setting LinkVisibilityType=Custom with a
-    LinkedViewId still evaluates the HOST's View Filters (this tool's red/
-    blue coloring, see module docstring) on that link, or silently behaves
-    like "by linked view" and uses the picked view's OWN filters instead,
-    is genuinely undocumented from the API side and cannot be confirmed
-    without testing in Revit. Lower risk for the Traffic link (it never
-    relied on View Filters — its coloring is host-view-only halftone and
-    its visibility restriction is element-level HideElements, both
-    independent of link display mode), higher risk for Architecture/
-    Structure specifically, since that's the one thing this whole tool
-    can't function without.
+    CONFIRMED (live exception, this round): Custom does NOT accept a
+    non-invalid LinkedViewId — SetLinkOverrides throws "The LinkedViewId
+    of linkDisplaySettings has incorrect value for the specified
+    LinkVisibilityType." The property setters themselves don't validate
+    this (confirmed via reflection — Custom + a fake ElementId sets
+    without error at the property level), so it's enforced inside
+    SetLinkOverrides itself, which needs a live View/link context outside
+    reflection's reach — matches the user's exact error text. The only
+    LinkVisibilityType that accepts a real LinkedViewId is ByLinkView —
+    which, per Revit's own UI docs for the same Basics-tab "Linked view"
+    picker, means the link displays exactly as that view displays,
+    INCLUDING that view's own filters/overrides instead of the host's.
+    That's a direct conflict with this tool's entire purpose for
+    Architecture/Structure (the user's own original requirement was "so
+    the host's View Filters still apply on top of the linked view's cut
+    plane" — proven not simultaneously achievable via this API), so by
+    explicit user decision, callers only ever pass a non-None
+    linked_view_id here for Traffic — see _apply_smart_linked_view, which
+    deliberately never does for Architecture/Structure. Traffic never
+    depended on View Filters for its own coloring (halftone + element-
+    level HideElements, both independent of link display mode), so
+    ByLinkView there costs nothing.
 
     Best-effort regardless: RevitLinkGraphicsSettings/View.GetLinkOverrides
     was only added in the Revit 2024 API (this extension targets 2023+).
@@ -1610,15 +1608,17 @@ def _apply_link_display_settings(target, link_id, linked_view_id, warnings, labe
         link_settings = target.GetLinkOverrides(link_id)
         if link_settings is None:
             link_settings = settings_cls()
-        link_settings.LinkVisibilityType = vis_enum.Custom
         if linked_view_id is not None:
+            link_settings.LinkVisibilityType = vis_enum.ByLinkView
             link_settings.LinkedViewId = linked_view_id
+        else:
+            link_settings.LinkVisibilityType = vis_enum.Custom
         target.SetLinkOverrides(link_id, link_settings)
     except Exception as ex:
         warnings.append(
-            u"Could not set the {} link's display mode to Custom (likely "
-            u"unavailable before Revit 2024) — informational only, category "
-            u"visibility inside the link was still applied directly: {}".format(label, ex))
+            u"Could not set the {} link's display mode (likely unavailable before "
+            u"Revit 2024) — informational only, category visibility inside the link "
+            u"was still applied directly: {}".format(label, ex))
 
 
 def _ensure_linked_view_detail_level(chosen, warnings, label):
@@ -1663,26 +1663,30 @@ def _ensure_linked_view_detail_level(chosen, warnings, label):
         u"Detail Level to Medium/Fine.".format(label, chosen[u"name"]))
 
 
-def _apply_smart_linked_view(target, role_links, chosen, warnings, label):
+def _apply_smart_linked_view(chosen, warnings, label):
     """chosen: None, or {'view':, 'link':} from the wizard's linked-view
-    combo for this role. Only the ONE underlying link the chosen view
-    actually belongs to gets switched to Custom + LinkedViewId — Architecture
-    and Structure support selecting more than one link, and there's no
-    chosen view for any other link of the same role, so those are left
-    exactly as they were (ByHostView, the default — View Filters keep
-    applying to them without question, see module docstring).
+    combo for this role (Architecture or Structure — Traffic goes through
+    _apply_link_display_settings directly at its own call site instead,
+    since it doesn't have this function's conflict at all).
 
-    Warns (does not attempt to fix — see _ensure_linked_view_detail_level)
-    when the chosen view's own Detail Level is Coarse."""
+    DELIBERATELY DOES NOT apply the chosen view's cut plane/view range to
+    the link. Confirmed via a live exception this round + reflection: the
+    only Revit link-display mode that accepts a specific LinkedViewId
+    (ByLinkView) also makes the link use THAT view's own filters instead
+    of the host's — silently breaking this tool's red/blue View Filter
+    coloring for whichever Architecture/Structure link it's applied to.
+    Asked the user directly which tradeoff to take (Filters vs. matching
+    cut plane); the answer was to always keep Filters correct. So this
+    function only surfaces the Coarse-detail-level warning (see
+    _ensure_linked_view_detail_level) and otherwise leaves the link on
+    ByHostView, the default — View Filters keep applying to it without
+    question, see module docstring. The chosen view still has real value:
+    it identified the right level/view for reference, and its own Detail
+    Level was checked; it's just never pushed into RevitLinkGraphicsSettings
+    for this role."""
     if chosen is None:
         return
     _ensure_linked_view_detail_level(chosen, warnings, label)
-    chosen_link_int_id = chosen[u"link"][u"id"].IntegerValue
-    for li in role_links:
-        if li[u"id"].IntegerValue == chosen_link_int_id:
-            _apply_link_display_settings(target, li[u"id"], chosen[u"view"].Id, warnings, label)
-            return
-    warnings.append(u"The selected {} linked view no longer matches a selected link — skipped.".format(label))
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -2671,16 +2675,16 @@ def run():
             _set_traffic_halftone(view, traffic_link, warnings)
 
         # ── Smart Linked View: Architecture/Structure (optional, per role) ─────
-        # Only the one link a chosen view actually belongs to switches to
-        # Custom + LinkedViewId; every other selected link of the same role
-        # stays on the default ByHostView (View Filters keep applying to it
-        # without question). See _apply_link_display_settings' docstring for
-        # the unverified interaction between Custom+LinkedViewId and this
-        # tool's own View Filters on Architecture/Structure — needs a live
-        # test to confirm red/blue coloring survives on the specific link
-        # that gets a linked view assigned.
-        _apply_smart_linked_view(template, arch_links, arch_linked_view, warnings, u"Architecture")
-        _apply_smart_linked_view(template, struct_links, struct_linked_view, warnings, u"Structure")
+        # By explicit user decision, the chosen view's cut plane is NOT
+        # applied to these links — only ByLinkView mode can carry a
+        # LinkedViewId at all (confirmed via a live exception), and
+        # ByLinkView replaces the host's View Filters with that view's own
+        # for the link, which would silently break this tool's red/blue
+        # coloring. See _apply_smart_linked_view's docstring. Both links
+        # stay on ByHostView (the default) regardless of what was picked —
+        # only the Coarse-detail-level warning still fires from here.
+        _apply_smart_linked_view(arch_linked_view, warnings, u"Architecture")
+        _apply_smart_linked_view(struct_linked_view, warnings, u"Structure")
 
         # ── Step 8: deep-scan (every selected link, per role) + View Filters ───
         arch_names = set()
