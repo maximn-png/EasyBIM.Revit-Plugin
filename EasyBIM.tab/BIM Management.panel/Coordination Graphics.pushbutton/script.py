@@ -3072,6 +3072,19 @@ def run():
                          u"No linked Revit models were found in this project.")
         return
 
+    # DIAGNOSTIC (added 2026-08-30, chasing a live "link reports hidden but
+    # still visible/pickable after the tool runs" report): a linked FILE can
+    # be placed as more than one separate RevitLinkInstance (e.g. once per
+    # placement/location) — get_all_link_instances() already handles each
+    # instance independently, but if only SOME instances of a duplicated
+    # file end up hidden, the file still looks "on" overall. Surfaced in the
+    # result dialog unconditionally so this is checkable without opening
+    # Manage Links and counting positions by hand.
+    _link_name_counts = {}
+    for _li in links:
+        _link_name_counts[_li[u"name"]] = _link_name_counts.get(_li[u"name"], 0) + 1
+    duplicate_link_names = sorted(n for n, c in _link_name_counts.items() if c > 1)
+
     memory = cfgmod.load_link_memory(doc)
     # Back-compat: older memory files (before multi-select) stored a single
     # 'arch_uid'/'struct_uid' — treat that as a one-item list if the new
@@ -3258,6 +3271,13 @@ def run():
             newly_hidden_count + len(already_hidden_names))
         if unhideable_names:
             other_links_summary += u" — COULD NOT HIDE: {}".format(u", ".join(unhideable_names))
+        if duplicate_link_names:
+            other_links_summary += (
+                u"\nNOTE: these linked file(s) are placed as MORE THAN ONE separate "
+                u"instance in this model: {} — each instance is hidden/verified "
+                u"independently, so if the file still looks visible after this run, "
+                u"check whether every one of its instances actually got hidden.".format(
+                    u", ".join(duplicate_link_names)))
 
         # ── Refinement 1: host Grids hidden (element-level — see docstring) ────
         _hide_host_grids(view, warnings)
@@ -3404,6 +3424,35 @@ def run():
             if view_for_sheet is not None:
                 sheet = _create_and_place_sheet(view_for_sheet, _elem_name(view_for_sheet),
                                                  titleblock_symbol, warnings)
+
+        # FINAL re-verification, right before commit (added 2026-08-30) —
+        # Step 5's own "still_visible_after" check only proves a link hide
+        # stuck AT THAT MOMENT, right after HideElements was called. If a
+        # LATER step in this same transaction (template reassignment, Step
+        # 8's filters, sheet duplication above) silently undoes it, that
+        # earlier check can't see it. This re-checks every non-selected,
+        # non-unhideable link one more time, right before commit, so "it
+        # broke DURING this run" and "it broke AFTER commit / on reopen"
+        # are distinguishable from the result dialog alone.
+        final_still_visible = []
+        for li in links:
+            if li[u"id"].IntegerValue in chosen_ids:
+                continue
+            if li[u"name"] in unhideable_names:
+                continue
+            try:
+                if not li[u"instance"].IsHidden(view):
+                    final_still_visible.append(li[u"name"])
+            except Exception:
+                pass
+        if final_still_visible:
+            warnings.append(
+                u"FINAL CHECK (right before commit): these non-selected link(s) show as "
+                u"NOT hidden even though Step 5 reported success earlier in this same "
+                u"run: {} — something later in this transaction undid the hide. If this "
+                u"warning is ABSENT on a run where the link is still visible after "
+                u"closing this dialog, the hide is being lost after commit instead, not "
+                u"during it.".format(u", ".join(sorted(set(final_still_visible)))))
 
         t.Commit()
     except Exception:
