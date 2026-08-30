@@ -1483,17 +1483,23 @@ def _apply_coordination_categories(target, host_clutter_bics, link_model_bics, w
 
     # REMOVED, by explicit request: the gray fallback override for
     # non-concrete elements in override_bics (Walls/Columns/Structural*).
-    # Elements NOT classified as concrete now get NO override at all here —
-    # their own native Type Properties appearance shows, same as any
-    # ordinary, un-overridden element. Explicit tradeoff understood and
-    # accepted: an element with its own hardcoded Type Property color (e.g.
-    # "15_BLOCK"'s Coarse Scale Fill Color = Red, see the round that
-    # diagnosed it) will show that native color again — this is not a bug,
-    # it's outside this tool's control once no override is applied at all.
-    # _override_category_safe/GRAY_COLOR/get_solid_fill_pattern_id are left
-    # defined (unused) rather than deleted, in case a fallback treatment is
-    # wanted again later.
-    pass
+    # Elements NOT classified as concrete get NO override here — their own
+    # native Type Properties appearance shows, same as any ordinary,
+    # un-overridden element.
+    #
+    # BUG FOUND immediately after removing it: live-testing showed walls
+    # STILL rendering gray on the very next run. Root cause: simply no
+    # longer CALLING SetCategoryOverrides does not undo what an EARLIER run
+    # already set — the template is a REUSED, PERSISTENT object (found by
+    # name, not recreated), so the gray override from a prior run's
+    # SetCategoryOverrides call was still sitting on it. Stopping the call
+    # only stops changing it going forward; it doesn't reset it. Explicitly
+    # clearing every override_bics category to a fresh, empty
+    # OverrideGraphicSettings() undoes it for real, on every run, whether
+    # or not a prior run ever set the gray override at all.
+    reset_ogs = DB.OverrideGraphicSettings()
+    for bic in override_bics:
+        _override_category_safe(target, bic, reset_ogs, warnings)
 
 
 def ensure_view_template(view, host_clutter_bics, link_model_bics, wallnoncore_bics,
