@@ -24,9 +24,30 @@ element the view can see, host or linked, as long as the link's display is
 "By Host View" (the default) — which is standard, well-documented Revit
 behavior, not a workaround. The trade-off: a filter can't distinguish WHICH
 link an element came from, only its own parameter values — hence the deep
-Type-Name scan per link and two separate filters (Structure vs Architecture),
-which works as long as the two disciplines don't reuse the exact same type
-name (a acceptable, disclosed edge case).
+Type-Name scan per link and two separate filters (Structure vs Architecture).
+
+SHARED TYPE NAME ACROSS DISCIPLINES — MOSTLY SOLVED via Type IfcGUID: if
+both links happen to use a type with the exact same Type Name (e.g. a round
+column called "Ø70" in both the Architecture and Structure files), a plain
+"Type Name equals" rule matches BOTH links' elements, and whichever filter
+is AddFilter'd to the template first wins for all of them (confirmed live —
+Structure's filter is added before Architecture's in run(), so Structure
+"won" and an Architecture "Ø70" column rendered red instead of blue).
+FIXED for this case by disambiguating via BuiltInParameter.IFC_TYPE_GUID
+("Type IfcGUID" in Type Properties) instead of Type Name, for any name
+found in BOTH arch_names and struct_names only — confirmed via reflecting
+the installed RevitAPI.dll that IFC_TYPE_GUID is a real BuiltInParameter,
+and confirmed EMPIRICALLY (2026-08-30, this exact "Ø70" case) that its
+value differs between two identically-named types in two different linked
+documents, because Revit derives it from the type's own persistent
+identity, not from anything a modeler can freely choose (unlike Type Name).
+See _collect_concrete_type_names' guids_by_name param and run()'s
+ambiguous_names handling. Residual limitation, disclosed not fixed: if a
+type's Type IfcGUID is ever blank in one of the links (never observed, but
+not provably impossible), that name is excluded from BOTH filters for that
+link with an explicit warning naming it, rather than guessing — the only
+real fix in that case is renaming the type distinctly in one of the two
+source files.
 
 WHY MOST CATEGORY VISIBILITY LIVES ON THE TEMPLATE, NOT THE VIEW: the View
 Template "include/exclude" list groups ALL model categories under one toggle
@@ -2211,7 +2232,30 @@ def _type_is_concrete(link_doc, elem_type, bic, cfg):
     return True
 
 
-def _collect_concrete_type_names(link_doc, categories, cfg, warnings, label, _depth=0):
+def _type_ifc_guid(elem_type):
+    """Type IfcGUID (BuiltInParameter.IFC_TYPE_GUID) as a string, or None.
+    Confirmed via reflecting the installed RevitAPI.dll that this
+    BuiltInParameter is real, and confirmed EMPIRICALLY (2026-08-30) that
+    its value differs between two identically-NAMED type elements in two
+    different linked documents — Revit derives it from the type's own
+    persistent identity, unlike a Type Name, which a modeler can name
+    however they like with zero cross-file uniqueness guarantee. Used only
+    to disambiguate a Type Name shared by both the Architecture and
+    Structure links — see run()'s ambiguous_names handling."""
+    try:
+        bip = getattr(DB.BuiltInParameter, "IFC_TYPE_GUID", None)
+        if bip is None:
+            return None
+        p = elem_type.get_Parameter(bip)
+        if p is None or not p.HasValue:
+            return None
+        return p.AsString() or None
+    except Exception:
+        return None
+
+
+def _collect_concrete_type_names(link_doc, categories, cfg, warnings, label, _depth=0,
+                                  guids_by_name=None):
     """Iterate INSTANCES (not just types) because an instance-level Material
     override (_instance_material_texts) can vary between instances of the
     same type — a type only counts as concrete via the type cache if at
@@ -2248,7 +2292,7 @@ def _collect_concrete_type_names(link_doc, categories, cfg, warnings, label, _de
     matching gap downstream (classification looked right, element still
     didn't get colored)."""
     names = set()
-    type_cache = {}  # type_id (int) -> (is_concrete, type_name)
+    type_cache = {}  # type_id (int) -> (is_concrete, type_name, ifc_guid)
     per_category = {}  # category display name -> [scanned, matched]
 
     if link_doc is None:
@@ -2285,6 +2329,7 @@ def _collect_concrete_type_names(link_doc, categories, cfg, warnings, label, _de
                 elem_type = link_doc.GetElement(type_id)
                 is_conc = False
                 type_name = None
+                ifc_guid = None
                 if elem_type is not None:
                     type_name = _elem_name(elem_type)
                     try:
@@ -2292,9 +2337,11 @@ def _collect_concrete_type_names(link_doc, categories, cfg, warnings, label, _de
                     except Exception as ex:
                         warnings.append(u"{}: could not classify type '{}': {}".format(
                             label, type_name, ex))
-                type_cache[key] = (is_conc, type_name)
+                    if guids_by_name is not None:
+                        ifc_guid = _type_ifc_guid(elem_type)
+                type_cache[key] = (is_conc, type_name, ifc_guid)
 
-            is_conc, type_name = type_cache[key]
+            is_conc, type_name, ifc_guid = type_cache[key]
 
             if not is_conc and type_name and not is_wall:
                 try:
@@ -2310,6 +2357,8 @@ def _collect_concrete_type_names(link_doc, categories, cfg, warnings, label, _de
             if is_conc and type_name:
                 names.add(type_name)
                 counts[1] += 1
+                if guids_by_name is not None and ifc_guid:
+                    guids_by_name.setdefault(type_name, set()).add(ifc_guid)
 
     try:
         breakdown = u", ".join(
@@ -2332,7 +2381,8 @@ def _collect_concrete_type_names(link_doc, categories, cfg, warnings, label, _de
                 continue
             names |= _collect_concrete_type_names(
                 ndoc, categories, cfg, warnings,
-                u"{} > nested link".format(label), _depth=_depth + 1)
+                u"{} > nested link".format(label), _depth=_depth + 1,
+                guids_by_name=guids_by_name)
 
     return names
 
@@ -2487,28 +2537,51 @@ def _cleanup_stale_whitelist_filters(warnings):
             warnings.append(u"Could not remove the stale filter '{}': {}".format(name, ex))
 
 
-def build_or_update_type_name_filter(filter_name, category_bics, type_names, warnings):
-    if not type_names:
+def build_or_update_type_name_filter(filter_name, category_bics, type_names, warnings,
+                                      guid_values=None):
+    """type_names: matched via 'Type Name equals' rules (the normal case).
+    guid_values: matched via 'Type IfcGUID equals' rules instead — used only
+    for a type name shared by BOTH the Architecture and Structure links,
+    where a Type Name rule alone can't tell the two links' elements apart
+    (see the module docstring's "SHARED TYPE NAME ACROSS DISCIPLINES" note
+    and run()'s ambiguous_names handling)."""
+    if not type_names and not guid_values:
         warnings.append(u"No concrete type names detected for '{}' — filter left "
                          u"unchanged.".format(filter_name))
         return _find_existing_filter(filter_name)
 
     cat_ids = SCG.List[DB.ElementId]([DB.ElementId(b) for b in category_bics])
 
-    bip = getattr(DB.BuiltInParameter, "ALL_MODEL_TYPE_NAME", None)
-    if bip is None:
-        warnings.append(u"ALL_MODEL_TYPE_NAME is not available in this Revit version — "
-                         u"could not build filter '{}'.".format(filter_name))
-        return None
-    provider = DB.ParameterValueProvider(DB.ElementId(bip))
-
     rules = []
-    for name in sorted(type_names):
-        try:
-            rule = DB.FilterStringRule(provider, DB.FilterStringEquals(), name)
-            rules.append(DB.ElementParameterFilter(rule))
-        except Exception as ex:
-            warnings.append(u"Could not build a filter rule for type '{}': {}".format(name, ex))
+
+    if type_names:
+        bip_name = getattr(DB.BuiltInParameter, "ALL_MODEL_TYPE_NAME", None)
+        if bip_name is None:
+            warnings.append(u"ALL_MODEL_TYPE_NAME is not available in this Revit version — "
+                             u"could not build filter '{}'.".format(filter_name))
+        else:
+            name_provider = DB.ParameterValueProvider(DB.ElementId(bip_name))
+            for name in sorted(type_names):
+                try:
+                    rule = DB.FilterStringRule(name_provider, DB.FilterStringEquals(), name)
+                    rules.append(DB.ElementParameterFilter(rule))
+                except Exception as ex:
+                    warnings.append(u"Could not build a filter rule for type '{}': {}".format(name, ex))
+
+    if guid_values:
+        bip_guid = getattr(DB.BuiltInParameter, "IFC_TYPE_GUID", None)
+        if bip_guid is None:
+            warnings.append(u"IFC_TYPE_GUID is not available in this Revit version — could not "
+                             u"disambiguate shared type name(s) for '{}'.".format(filter_name))
+        else:
+            guid_provider = DB.ParameterValueProvider(DB.ElementId(bip_guid))
+            for guid in sorted(guid_values):
+                try:
+                    rule = DB.FilterStringRule(guid_provider, DB.FilterStringEquals(), guid)
+                    rules.append(DB.ElementParameterFilter(rule))
+                except Exception as ex:
+                    warnings.append(u"Could not build a Type IfcGUID filter rule for '{}': {}".format(
+                        filter_name, ex))
 
     if not rules:
         warnings.append(u"No usable filter rules for '{}'.".format(filter_name))
@@ -3245,22 +3318,62 @@ def run():
 
         # ── Step 8: deep-scan (every selected link, per role) + View Filters ───
         arch_names = set()
+        arch_guids = {}
         for li in arch_links:
             arch_names |= _collect_concrete_type_names(
                 li[u"doc"], override_bics, settings, warnings,
-                u"Architecture ({})".format(li[u"name"]))
+                u"Architecture ({})".format(li[u"name"]), guids_by_name=arch_guids)
         struct_names = set()
+        struct_guids = {}
         for li in struct_links:
             struct_names |= _collect_concrete_type_names(
                 li[u"doc"], override_bics, settings, warnings,
-                u"Structure ({})".format(li[u"name"]))
+                u"Structure ({})".format(li[u"name"]), guids_by_name=struct_guids)
 
         _cleanup_stale_column_filters(warnings)
 
+        # A type name found in BOTH links' scans can't be told apart by a
+        # plain "Type Name equals" rule (a Filter Rule never sees which
+        # linked document an element came from) — disambiguate via each
+        # type's own Type IfcGUID instead, which reliably differs between
+        # the two links even for identically-named types (see module
+        # docstring "SHARED TYPE NAME ACROSS DISCIPLINES").
+        ambiguous_names = arch_names & struct_names
+        arch_safe_names, struct_safe_names = arch_names, struct_names
+        arch_guid_values = struct_guid_values = None
+        if ambiguous_names:
+            arch_safe_names = arch_names - ambiguous_names
+            struct_safe_names = struct_names - ambiguous_names
+
+            def _guids_for(names, guids_by_name, side):
+                out = set()
+                missing = []
+                for n in names:
+                    g = set(x for x in (guids_by_name.get(n) or set()) if x)
+                    if g:
+                        out |= g
+                    else:
+                        missing.append(n)
+                if missing:
+                    warnings.append(
+                        u"{}: could not read Type IfcGUID for shared type name(s) {} — "
+                        u"excluded from coloring on this side to avoid mis-coloring. "
+                        u"Rename the type distinctly in the source file to resolve "
+                        u"permanently.".format(side, u", ".join(sorted(missing))))
+                return out
+
+            arch_guid_values = _guids_for(ambiguous_names, arch_guids, u"Architecture")
+            struct_guid_values = _guids_for(ambiguous_names, struct_guids, u"Structure")
+            warnings.append(
+                u"Type name(s) shared by both Architecture and Structure links: {} — "
+                u"disambiguated via each type's own Type IfcGUID instead of Type Name. "
+                u"Consider renaming one side's type distinctly to remove the ambiguity "
+                u"permanently.".format(u", ".join(sorted(ambiguous_names))))
+
         struct_pfe = build_or_update_type_name_filter(
-            FILTER_NAME_STRUCT, override_bics, struct_names, warnings)
+            FILTER_NAME_STRUCT, override_bics, struct_safe_names, warnings, struct_guid_values)
         arch_pfe   = build_or_update_type_name_filter(
-            FILTER_NAME_ARCH, override_bics, arch_names, warnings)
+            FILTER_NAME_ARCH, override_bics, arch_safe_names, warnings, arch_guid_values)
 
         struct_color = _settings_color(settings, u"StructColor", DB.Color(200, 30, 30))
         arch_color   = _settings_color(settings, u"ArchColor", DB.Color(0, 70, 200))
