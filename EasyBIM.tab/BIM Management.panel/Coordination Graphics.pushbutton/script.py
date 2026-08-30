@@ -1593,21 +1593,33 @@ def _hide_dwg_imports_in_link(view, link_info, basement_view, warnings):
 
 
 def _restrict_traffic_link_visibility(view, traffic_link, keep_bics, warnings):
-    """Best-effort element-level hide (see module docstring — same class of
-    cross-document uncertainty as the DWG-import hide above, same defensive
-    handling).
+    """Best-effort element-level hide — CONFIRMED UNRELIABLE for cross-
+    document elements by live testing, not just suspected (see module
+    docstring): a real run reported ~99% of candidate Model/Annotation
+    elements as CanBeHidden()==False. This is why _apply_annotation_hide_
+    filter/_apply_model_whitelist_filter (View Filters, applied on the
+    template) exist as the ACTUAL working mechanism for hiding Traffic's
+    non-Parking content — Filters reach linked elements the same way this
+    tool's Structure/Architecture coloring already relies on, unlike
+    element-level HideElements. This function is kept as a defensive,
+    lower-priority second layer (harmless if it does nothing; free if a
+    future Revit version happens to fix the underlying limitation) rather
+    than the primary mechanism it originally was.
 
     Single pass over every instance in the link, grouped by each element's
     own resolved .Category (rather than one FilteredElementCollector pass
     per category via ElementCategoryFilter) -- fewer collector passes on a
     large civil/traffic model, and it can't disagree with an element about
-    its own category. Per-category counts are logged (pyRevit output) AND
-    returned as a short summary string the caller can put directly in the
-    final TaskDialog -- not just buried in the log -- so a test run gives
-    a definite yes/no on whether View.HideElements actually took effect
-    for elements that live in a linked document, checkable from the result
-    dialog itself (there is no API way to confirm this ahead of time -- see
-    module docstring)."""
+    its own category. Restricted to CategoryType.Model/Annotation (see
+    inline comment below) -- an earlier version counted EVERY non-type
+    element in the document, including Materials/Phases/Views/Sheets/
+    Schedules/etc (CategoryType.Internal) that were never going to be
+    visible in a view at all, which drowned the real signal in ~2800
+    expected, benign non-matches. Per-category counts are logged (pyRevit
+    output) AND returned as a short summary string the caller can put
+    directly in the final TaskDialog -- not just buried in the log -- so a
+    test run gives a definite yes/no on whether View.HideElements actually
+    took effect, checkable from the result dialog itself."""
     link_doc = traffic_link[u"doc"]
     if link_doc is None:
         warnings.append(u"Traffic link is unloaded — could not restrict its categories.")
@@ -1622,7 +1634,8 @@ def _restrict_traffic_link_visibility(view, traffic_link, keep_bics, warnings):
     to_hide = SCG.List[DB.ElementId]()
     per_category = {}   # category name -> [seen, hidden]
     no_category = 0
-    candidate_count = 0   # non-kept elements seen, before HideElements even runs
+    non_graphical_count = 0   # skipped: CategoryType.Internal etc, see below
+    candidate_count = 0   # non-kept Model/Annotation elements seen, before HideElements even runs
 
     for e in all_elems:
         try:
@@ -1631,6 +1644,30 @@ def _restrict_traffic_link_visibility(view, traffic_link, keep_bics, warnings):
             cat = None
         if cat is None:
             no_category += 1
+            continue
+
+        # WhereElementIsNotElementType() collects EVERY non-type element in
+        # the document, including plenty that were never going to be
+        # visible in a view at all -- Materials, Phases, Views, Sheets,
+        # Schedules, Project Information, Survey Point, Internal Origin,
+        # Legend Components, etc. Those categories are CategoryType.Internal
+        # (confirmed live-testing: a first pass reported 2784/2802 "could
+        # not be hidden," but the overwhelming majority were exactly this
+        # kind of non-graphical, non-placed element -- CanBeHidden is
+        # correctly False for them because "hidden in view X" isn't a
+        # meaningful concept for a Material definition or a Phase setting,
+        # not because of any real limitation). Restricting to Model/
+        # Annotation (the only CategoryTypes that can actually appear in a
+        # view — matches the same distinction _apply_annotation_hide_filter/
+        # _apply_model_whitelist_filter already use) makes the remaining
+        # count and per-category breakdown mean something concrete instead
+        # of being drowned in expected, benign non-matches.
+        try:
+            cat_type = cat.CategoryType
+        except Exception:
+            cat_type = None
+        if cat_type not in (DB.CategoryType.Model, DB.CategoryType.Annotation):
+            non_graphical_count += 1
             continue
 
         try:
@@ -1670,18 +1707,23 @@ def _restrict_traffic_link_visibility(view, traffic_link, keep_bics, warnings):
         u"{}: {}/{} hidden".format(k, v[1], v[0]) for k, v in sorted(per_category.items()))
     try:
         logger.info(u"Traffic link — element visibility restriction: {} total hidden "
-                    u"(kept categories: {}). {}{}".format(
+                    u"(kept categories: {}). {}{}{}".format(
                         hidden_count,
                         u", ".join(sorted(b.ToString() for b in keep_bics)),
                         breakdown or u"no elements found",
-                        u"; {} element(s) with no category".format(no_category) if no_category else u""))
+                        u"; {} element(s) with no category".format(no_category) if no_category else u"",
+                        u"; {} non-graphical element(s) skipped (Materials/Phases/Views/"
+                        u"Sheets/etc — CategoryType.Internal, never visible in a view "
+                        u"regardless)".format(non_graphical_count) if non_graphical_count else u""))
     except Exception:
         pass
 
     unhidden_note = (u" — {} could not be hidden (CanBeHidden=False, an exception, or "
-                      u"HideElements itself failed)".format(candidate_count - hidden_count)
+                      u"HideElements itself failed — see module docstring: this is a "
+                      u"confirmed, not just suspected, cross-document HideElements "
+                      u"limitation)".format(candidate_count - hidden_count)
                       if hidden_count < candidate_count else u"")
-    return u"Traffic link: {} of {} non-kept element(s) hidden ({}){}".format(
+    return u"Traffic link: {} of {} non-kept Model/Annotation element(s) hidden ({}){}".format(
         hidden_count, candidate_count, breakdown or u"no elements found", unhidden_note)
 
 
