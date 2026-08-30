@@ -1465,13 +1465,21 @@ def _apply_coordination_categories(target, host_clutter_bics, link_model_bics, w
     if grids_bic is not None:
         _hide_category_safe(target, grids_bic, warnings, hide=False)
 
-    # Bulletproof View-Filter-based sweep, by explicit request after
-    # SetCategoryHidden/RevitLinkGraphicsSettings both hit real limitations
-    # for hiding link content by category — see FILTER_NAME_HIDE_ANNOTATIONS/
-    # WHITELIST_MODEL_CATEGORY_NAMES above for exactly what's kept visible
-    # and why (including two deliberate deviations from the literal request).
-    _apply_annotation_hide_filter(target, warnings)
-    _apply_model_whitelist_filter(target, warnings)
+    # REMOVED — the View-Filter-based "hide all Annotations" / "whitelist
+    # Model categories" sweep (_apply_annotation_hide_filter/
+    # _apply_model_whitelist_filter, still defined below but no longer
+    # called from here) is CONFIRMED to crash Revit outright when the user
+    # opens the Filters tab of a View/View Template Properties dialog —
+    # live-tested, a hard application crash. Both filters were created with
+    # NO ElementFilter rule at all (matches every element in their category
+    # scope by category membership alone) — an unusual configuration a
+    # normal user would never produce through Revit's own UI, and very
+    # likely what Revit's own Filters-tab rendering code doesn't handle
+    # safely. See _cleanup_stale_whitelist_filters (called from run()),
+    # which actively deletes any of these filters a prior run already
+    # created. Do not re-add these calls without confirming what
+    # specifically crashes and a real fix, given the cost of being wrong
+    # here is a full application crash, not a warning.
 
     # Live-testing finding: a non-concrete wall (e.g. "15_BLOCK", correctly
     # excluded from the Structure/Architecture Filters by name) still
@@ -2416,6 +2424,37 @@ def _cleanup_stale_column_filters(warnings):
             warnings.append(u"Could not remove the stale filter '{}': {}".format(name, ex))
 
 
+_STALE_WHITELIST_FILTER_NAMES = (
+    FILTER_NAME_HIDE_ANNOTATIONS,
+    FILTER_NAME_WHITELIST_MODEL,
+)
+
+
+def _cleanup_stale_whitelist_filters(warnings):
+    """URGENT — the View-Filter-based category whitelist (a
+    ParameterFilterElement created with NO ElementFilter rule at all, an
+    unusual configuration a normal user would never produce through
+    Revit's own UI) is CONFIRMED to crash Revit outright when the user
+    opens the Filters tab of a View/View Template Properties dialog —
+    live-tested, a hard application crash, not a catchable exception.
+    Removes both filters this tool ever created that way, same pattern as
+    _cleanup_stale_column_filters — deleting a ParameterFilterElement
+    removes its association from any view/template using it too, so
+    there's nothing to unapply from `target` first. Do not recreate these
+    filters (see _apply_coordination_categories — the calls that used to
+    build them are removed, not just commented out) without confirming
+    what specifically about a no-rule filter crashes Revit's UI, and a
+    real fix, first."""
+    for name in _STALE_WHITELIST_FILTER_NAMES:
+        pfe = _find_existing_filter(name)
+        if pfe is None:
+            continue
+        try:
+            doc.Delete(pfe.Id)
+        except Exception as ex:
+            warnings.append(u"Could not remove the stale filter '{}': {}".format(name, ex))
+
+
 def build_or_update_type_name_filter(filter_name, category_bics, type_names, warnings):
     if not type_names:
         warnings.append(u"No concrete type names detected for '{}' — filter left "
@@ -2975,6 +3014,14 @@ def run():
     t = DB.Transaction(doc, u"EasyBIM: Coordination Graphics")
     t.Start()
     try:
+        # URGENT, runs first, before anything else: delete any
+        # crash-causing whitelist filters a prior run already created (see
+        # _cleanup_stale_whitelist_filters) — confirmed to crash Revit when
+        # the user opens the Filters tab of a View/Template Properties
+        # dialog. Placed at the very top so this cleanup happens even if
+        # something later in this transaction fails.
+        _cleanup_stale_whitelist_filters(warnings)
+
         # Unassign any template already active on this view FIRST. Two
         # reasons: (1) the original spec requirement — an active template
         # blocks manual per-view overrides; (2) View.CreateViewTemplate()
