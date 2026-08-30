@@ -85,26 +85,31 @@ Level.Elevation — see _find_matching_link_views), then collecting that
 level's non-template, non-dependent ViewPlans, sorted non-Coarse-detail
 first, then '#'-prefixed, then genuine Floor Plans, then alphabetical.
 
-TRAFFIC: REVERSED after live-testing (persistent "dimensions still
-visible" reports) — a chosen view is now ALSO never applied to the link,
-same as Architecture/Structure. Originally implemented as ByLinkView +
-LinkedViewId, reasoned to be safe because Traffic's own coloring is host-
-view-only halftone (_set_traffic_halftone) plus element-level
-HideElements (_restrict_traffic_link_visibility) — both independent of
-link display mode, so it never depended on View Filters. That reasoning
-missed a DIFFERENT dependency: a link in ByLinkView mode displays using
-THAT VIEW's own settings entirely, including its own dimensions/
-annotations — confirmed via research (Autodesk's own docs: "if you would
-like to display a view from a linked file exactly as it appears in that
-file," that's what ByLinkView is for) — which bypasses BOTH the host
-template's category visibility AND, likely, this tool's own element-level
-hides, since the whole point of ByLinkView is to render independently of
-the host's settings. Traffic's linked-view combo still helps find/preview
-a matching view and its Detail Level is still checked
-(_ensure_linked_view_detail_level); it's just never pushed into
-RevitLinkGraphicsSettings — Traffic always stays on plain Custom mode
-(LinkedViewId always None), matching Architecture/Structure's reasoning
-exactly, just arrived at one round later.
+TRAFFIC: flip-flopped twice now — settled, with an explicit condition.
+Originally ByLinkView + LinkedViewId, reasoned safe because Traffic's own
+coloring is host-view-only halftone (_set_traffic_halftone) plus element-
+level HideElements (_restrict_traffic_link_visibility), both independent
+of link display mode. Then reversed to always-Custom/never-LinkedViewId
+after persistent "dimensions still visible" reports, since a link in
+ByLinkView mode displays using THAT VIEW's own settings entirely,
+including its own dimensions/annotations, bypassing both the host
+template's category visibility and this tool's own element-level hides.
+Then reversed BACK to ByLinkView + LinkedViewId (current state), on
+explicit confirmation from the user that the traffic/civil consultant's
+own file has a dedicated view with EVERYTHING non-Parking hidden —
+model AND annotation categories both, not model-only. Given that,
+ByLinkView pointed at that view is more reliable than this tool guessing
+categories from the host side, not a regression. THE CONDITION THAT
+MAKES THIS SAFE: the picked view must genuinely have every non-Parking
+category hidden, annotations included — if it's a partially-prepared view
+(model categories cleaned up but dimensions/text left on default), this
+reopens the exact "dimensions bleed through" bug this flip-flop started
+with. This is why Architecture/Structure are NOT symmetric with Traffic
+here and never get ByLinkView regardless of how clean a picked view might
+be — they need the HOST's own red/blue View Filters to keep applying,
+which ByLinkView always replaces with the picked view's own filters, and
+there's no "trust the consultant's view" escape hatch for that the way
+there is for Traffic's much simpler halftone+hide requirement.
 
 ARCHITECTURE/STRUCTURE: a chosen view is deliberately NEVER applied to
 the link (_apply_smart_linked_view no longer calls
@@ -892,8 +897,10 @@ class LinkPickerDialog(object):
                u"card also shows a matching linked view (by level elevation) for reference — it "
                u"does not change that link's cut plane, so this tool's red/blue coloring always "
                u"stays correct.",
-            3: u"Optional: also restrict a Traffic link to Parking, Spot Elevations and Spot "
-               u"Slopes only, shown in halftone.",
+            3: u"Optional: also restrict a Traffic link to Parking only, shown in halftone. If "
+               u"you pick a linked view here, unlike Architecture/Structure, it DOES drive that "
+               u"link's display — only pick one you know shows nothing but Parking, including "
+               u"annotations.",
             4: u"Review your choices, then click Apply to set up coordination graphics and "
                u"create the sheet.",
         }
@@ -1783,20 +1790,19 @@ def _apply_link_display_settings(target, link_id, linked_view_id, warnings, labe
     the host's View Filters still apply on top of the linked view's cut
     plane" — proven not simultaneously achievable via this API).
 
-    UPDATE (reversed after further live-testing — see module docstring's
-    TRAFFIC paragraph): Traffic was originally the one caller that DID pass
-    a real linked_view_id here, reasoned to be safe since its own coloring
-    never depended on View Filters. That missed a DIFFERENT risk: ByLinkView
-    mode means the link displays using that view's own dimensions/
-    annotations too, which was very likely the actual cause of persistent
-    "Traffic dimensions still visible" reports — bypassing both the host
-    template's category visibility and this tool's own element-level hides,
-    since ByLinkView renders independently of the host's settings entirely.
-    No caller passes a real linked_view_id here anymore — every call site
-    always passes None, so LinkVisibilityType is always Custom in practice.
-    The ByLinkView branch below is kept (correct, dead code) rather than
-    deleted, in case a future need for it re-emerges with this tradeoff
-    understood up front instead of rediscovered the hard way.
+    UPDATE (see module docstring's TRAFFIC paragraph for the full history —
+    this specific point flip-flopped twice): Architecture/Structure NEVER
+    pass a real linked_view_id here — always None, always plain Custom.
+    Traffic DOES pass one again (current state), when a Smart Linked View
+    is chosen, ON THE CONDITION that the picked view is confirmed to have
+    everything non-Parking hidden, including annotations, not just model
+    content — otherwise ByLinkView's "renders independently of the host's
+    settings entirely" reopens the exact dimensions-bleed-through bug this
+    went through a full reversal over already. This asymmetry is
+    deliberate: Traffic's own requirement (halftone + hide, no coloring)
+    has no dependency on the host's Filters the way Architecture/Structure
+    do, so trusting a well-prepared linked view is a legitimate tradeoff
+    for Traffic specifically that it can never be for the other two roles.
 
     Best-effort regardless: RevitLinkGraphicsSettings/View.GetLinkOverrides
     was only added in the Revit 2024 API (this extension targets 2023+).
@@ -3102,20 +3108,25 @@ def run():
             traffic_summary = _restrict_traffic_link_visibility(
                 view, traffic_link, traffic_keep_bics, warnings)
             _ensure_linked_view_detail_level(traffic_linked_view, warnings, u"Traffic")
-            # NEVER pass a real linked_view_id here (i.e. never switch
-            # Traffic to ByLinkView) -- confirmed via research that a link
-            # in ByLinkView mode displays using THAT VIEW's own settings,
-            # including its own dimensions/annotations, which would show in
-            # the host regardless of anything this tool hides at the
-            # element or category level (ByLinkView mode bypasses both).
-            # This exactly matches why Architecture/Structure never get
-            # ByLinkView either (see _apply_smart_linked_view) -- same
-            # class of "the picked view's own state leaks through" risk,
-            # just surfacing as dimensions instead of Filter coloring.
-            # Traffic's linked-view combo still helps find/preview a
-            # matching view and its own Detail Level is still checked
-            # above; it's just never pushed into RevitLinkGraphicsSettings.
-            _apply_link_display_settings(template, traffic_link[u"id"], None, warnings, u"Traffic")
+            # REVERSED AGAIN, by explicit informed decision: two rounds ago
+            # this was hardcoded to None because ByLinkView mode shows that
+            # view's own dimensions/annotations, which was very likely
+            # causing "Traffic dimensions still visible." That risk only
+            # applies if the picked view ISN'T actually clean. Confirmed
+            # directly with the user this time: the traffic/civil
+            # consultant's own file has a dedicated view with EVERYTHING
+            # except Parking hidden — model AND annotation categories both,
+            # not just 3D content. Given that, ByLinkView pointed at THAT
+            # view is the more reliable mechanism (relies on the
+            # consultant's own validated setup instead of this tool
+            # guessing categories from the host side), not a regression.
+            # This does NOT apply to Architecture/Structure — those still
+            # never get ByLinkView (see _apply_smart_linked_view), because
+            # ByLinkView would replace this tool's own red/blue View
+            # Filters with that view's filters, which Traffic never had in
+            # the first place (its coloring is host-view-only halftone).
+            traffic_view_id = traffic_linked_view[u"view"].Id if traffic_linked_view else None
+            _apply_link_display_settings(template, traffic_link[u"id"], traffic_view_id, warnings, u"Traffic")
             _set_traffic_halftone(view, traffic_link, warnings)
 
         # ── Smart Linked View: Architecture/Structure (optional, per role) ─────
