@@ -9,6 +9,9 @@ every other link, deep-scans the Arch/Struct links' Walls/Columns/Structural
 Framing/Foundations for concrete-material types, and colors those types red
 (Structure) / blue (Architecture) via two View Filters — driven by
 Settings.json (see "Coordination Settings" and lib/easybim/coordination_settings.py).
+Every other visible Model category (Stairs, Doors, Furniture, Plumbing
+Fixtures, etc. — see _apply_coordination_categories) gets a plain gray
+line-color override, so only the red/blue concrete coloring stands out.
 
 Engine: IronPython 2.7 (no "#! python3" shebang) — matches the tab's other
 WPF+Transaction buttons.
@@ -1588,6 +1591,40 @@ def _apply_coordination_categories(target, host_clutter_bics, link_model_bics, w
             u"those elements may still show their own native Type Properties fill.")
     for bic in override_bics:
         _override_category_safe(target, bic, fallback_ogs, warnings)
+
+    # Every OTHER visible Model category — Stairs, Doors, Windows,
+    # Furniture, Plumbing Fixtures, Railings, Curtain Walls, etc. — gets a
+    # plain gray line-color override instead of its own native (often
+    # black) line color, per explicit request. Only Cut/Projection line
+    # color is touched, no fill pattern, since most of these categories
+    # have no meaningful Cut fill in a floor plan anyway. Deliberately NOT
+    # a fixed hardcoded category list (the ask was "stairs, furniture,
+    # doors, sanitary, etc." — an open-ended "everything else"): every
+    # Model category in the document is walked, skipping only what's
+    # already specially handled above (concrete-classified structural
+    # categories, host clutter already hidden, Step 6 link-model hides,
+    # wall non-core, annotation). Same category-level limitation as
+    # everything else in this file: this can't distinguish host content
+    # from linked content, so it applies wherever `target` governs.
+    already_handled_bics = (set(override_bics) | set(host_clutter_bics)
+                             | set(link_model_bics) | set(wallnoncore_bics)
+                             | set(annotation_bics))
+    gray_line_ogs = DB.OverrideGraphicSettings()
+    try:
+        gray_line_ogs.SetCutLineColor(GRAY_COLOR)
+        gray_line_ogs.SetProjectionLineColor(GRAY_COLOR)
+    except Exception as ex:
+        warnings.append(u"Could not set the generic gray line-color override: {}".format(ex))
+    for cat in doc.Settings.Categories:
+        try:
+            if cat.CategoryType != DB.CategoryType.Model:
+                continue
+            bic = DB.BuiltInCategory(cat.Id.IntegerValue)
+        except Exception:
+            continue
+        if bic in already_handled_bics:
+            continue
+        _override_category_safe(target, bic, gray_line_ogs, warnings)
 
 
 def ensure_view_template(view, host_clutter_bics, link_model_bics, wallnoncore_bics,
