@@ -1625,6 +1625,26 @@ def _apply_coordination_categories(target, host_clutter_bics, link_model_bics, w
         if bic in already_handled_bics:
             continue
         _override_category_safe(target, bic, gray_line_ogs, warnings)
+        # Door/window swing arcs (and similar family-internal symbolic
+        # lines) are commonly drawn on a SUBCATEGORY of their parent
+        # category, not the parent category's own Cut/Projection geometry
+        # directly — confirmed live: Doors/Windows kept showing black
+        # swing lines even after this loop's override, while Plumbing
+        # Fixtures (no such subcategory split in this project's families)
+        # correctly turned gray. A category override only affects geometry
+        # NOT assigned to a subcategory, so every subcategory needs the
+        # same override too, or it keeps its native color regardless of
+        # what the parent category is set to.
+        try:
+            for subcat in cat.SubCategories:
+                try:
+                    target.SetCategoryOverrides(subcat.Id, gray_line_ogs)
+                except Exception as ex:
+                    warnings.append(
+                        u"Could not set the generic gray override for subcategory "
+                        u"'{}': {}".format(_elem_name(subcat), ex))
+        except Exception:
+            pass
 
 
 def ensure_view_template(view, host_clutter_bics, link_model_bics, wallnoncore_bics,
