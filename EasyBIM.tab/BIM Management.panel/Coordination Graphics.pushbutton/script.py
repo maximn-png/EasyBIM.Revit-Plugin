@@ -1481,66 +1481,19 @@ def _apply_coordination_categories(target, host_clutter_bics, link_model_bics, w
     # specifically crashes and a real fix, given the cost of being wrong
     # here is a full application crash, not a warning.
 
-    # Live-testing finding, root-caused precisely via a Type Properties
-    # screenshot: "15_BLOCK" (Structural Material "Block", correctly
-    # excluded from the Structure/Architecture Filters by keyword) has its
-    # own Type Property "Coarse Scale Fill Pattern: <Solid fill>" /
-    # "Coarse Scale Fill Color: Red" — a hardcoded native appearance,
-    # independent of anything this tool's Filters do. SetDetailLevel(Fine)
-    # alone did NOT fix this for the gray fallback, and now we know why:
-    # this override never set any Cut/Surface PATTERN at all, only a
-    # projection line color — "force Fine" has nothing to force when
-    # there's no pattern override in place for it to apply to, so the
-    # element's own native Cut/Surface fill (Solid, Red, in this case)
-    # shows through completely unchallenged, regardless of Detail Level.
-    # Fixed by giving the gray fallback an explicit Cut+Surface Foreground
-    # solid-gray fill of its own — the same class of fix already applied
-    # to Structure/Architecture's OWN colored elements in
-    # build_colored_override, just solid instead of hatched (gray is
-    # meant to be a quiet, de-emphasized "not classified as concrete"
-    # signal, not a second highlighted category).
-    gray_ogs = DB.OverrideGraphicSettings()
-    try:
-        gray_ogs.SetDetailLevel(DB.ViewDetailLevel.Fine)
-    except Exception as ex:
-        warnings.append(u"Could not force the gray fallback's detail level to Fine: {}".format(ex))
-    try:
-        gray_ogs.SetProjectionLineColor(GRAY_COLOR)
-    except Exception as ex:
-        warnings.append(u"Could not set the gray fallback projection color: {}".format(ex))
-
-    solid_fill_id = get_solid_fill_pattern_id()
-    for setter_name, args in (
-        ("SetCutBackgroundPatternVisible", (False,)),
-        ("SetSurfaceBackgroundPatternVisible", (False,)),
-    ):
-        try:
-            getattr(gray_ogs, setter_name)(*args)
-        except Exception as ex:
-            warnings.append(u"Could not disable the gray fallback's {}: {}".format(setter_name, ex))
-    try:
-        gray_ogs.SetCutBackgroundPatternId(DB.ElementId.InvalidElementId)
-        gray_ogs.SetSurfaceBackgroundPatternId(DB.ElementId.InvalidElementId)
-    except Exception:
-        pass
-    if solid_fill_id != DB.ElementId.InvalidElementId:
-        try:
-            gray_ogs.SetCutForegroundPatternVisible(True)
-            gray_ogs.SetCutForegroundPatternId(solid_fill_id)
-            gray_ogs.SetCutForegroundPatternColor(GRAY_COLOR)
-            gray_ogs.SetSurfaceForegroundPatternVisible(True)
-            gray_ogs.SetSurfaceForegroundPatternId(solid_fill_id)
-            gray_ogs.SetSurfaceForegroundPatternColor(GRAY_COLOR)
-        except Exception as ex:
-            warnings.append(u"Could not set the gray fallback's solid fill pattern: {}".format(ex))
-    else:
-        warnings.append(
-            u"No solid fill pattern could be resolved for the gray fallback — non-concrete "
-            u"elements may still show their own native Type Properties fill (e.g. a "
-            u"hardcoded Coarse Scale Fill Color).")
-
-    for bic in override_bics:
-        _override_category_safe(target, bic, gray_ogs, warnings)
+    # REMOVED, by explicit request: the gray fallback override for
+    # non-concrete elements in override_bics (Walls/Columns/Structural*).
+    # Elements NOT classified as concrete now get NO override at all here —
+    # their own native Type Properties appearance shows, same as any
+    # ordinary, un-overridden element. Explicit tradeoff understood and
+    # accepted: an element with its own hardcoded Type Property color (e.g.
+    # "15_BLOCK"'s Coarse Scale Fill Color = Red, see the round that
+    # diagnosed it) will show that native color again — this is not a bug,
+    # it's outside this tool's control once no override is applied at all.
+    # _override_category_safe/GRAY_COLOR/get_solid_fill_pattern_id are left
+    # defined (unused) rather than deleted, in case a fallback treatment is
+    # wanted again later.
+    pass
 
 
 def ensure_view_template(view, host_clutter_bics, link_model_bics, wallnoncore_bics,
