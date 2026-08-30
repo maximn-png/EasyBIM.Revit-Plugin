@@ -58,28 +58,39 @@ place. They're set on the template. Individual RevitLinkInstance visibility
 (Step 5) and halftone (Step 7) are element-level view overrides, which are
 NEVER template-controlled regardless — those stay on the active view.
 
-WHY "V/G OVERRIDES RVT LINKS" IS NOW KEPT TEMPLATE-CONTROLLED (reversed a
-prior design decision): earlier rounds deliberately EXCLUDED this row
-from template control (added its parameter Id to
-NonControlledTemplateParameterIds, unchecking "Include" for it), reasoned
-at the time to be harmless since link visibility/halftone (Steps 5 & 7)
-don't depend on this template row. That missed something: when the row
-is NOT template-controlled, each VIEW using the template gets its OWN
-independent value for it instead of inheriting the template's —
-confirmed by the user from an actual screenshot of the template's Include
-column showing it unchecked. Since _apply_link_display_settings calls
-SetLinkOverrides against `target` (the template itself, in the success
-path), excluding this row meant that call was setting a value that
-doesn't propagate to any real view using the template — including a
-sheet's duplicated view (_get_view_for_sheet), which could then diverge
-from the working view's own link display state. Now actively ENSURED
-included instead (_ensure_rvt_links_template_controlled removes the
-parameter Id from the non-controlled list if present, the opposite of
-the old exclusion function) — Autodesk's own API docs still note this row
-had "No API access (Revit 2020)" and a direct
+WHY "V/G OVERRIDES RVT LINKS" IS NOW KEPT *NOT* TEMPLATE-CONTROLLED (a
+second reversal, 2026-08-30 — read the whole history, it matters): the
+ORIGINAL design excluded this row from template control (added its
+parameter Id to NonControlledTemplateParameterIds), reasoned to be
+harmless since link visibility/halftone (Steps 5 & 7) don't depend on
+this template row. A later round found that when the row is NOT
+template-controlled, _apply_link_display_settings' Traffic call — which
+targeted `template`, not `view`, at the time — set a value that never
+propagated to any real view using the template, including a sheet's
+duplicated view. That round REVERSED it: actively ENSURED the row was
+template-CONTROLLED instead. That fix then caused something much worse,
+found via live testing: once this row was template-controlled, Step 5's
+own view-level HideElements calls for OTHER (non-selected) links stopped
+sticking through to commit — a FINAL CHECK added right before commit
+caught almost every non-selected link reverting to NOT-hidden by the end
+of the same transaction, despite Step 5's own immediate self-check
+passing. Moving Step 5 to run LAST (after every template write) fixed
+THAT, but then a SELECTED link (Architecture, never in Step 5's own
+target list) started getting hidden too — proof the row being
+template-controlled and per-view HideElements on links simply do not
+coexist safely, regardless of ordering. Fixed at the root instead:
+_ensure_rvt_links_not_template_controlled now ENSURES the row is
+EXCLUDED again (the ORIGINAL behavior), and _apply_link_display_settings'
+Traffic call now targets `view` directly instead of `template` — solving
+the original sheet-divergence concern a different way: Duplicate
+(WithDetailing), used for the sheet's copy (_get_view_for_sheet), already
+carries view-specific overrides (both HideElements AND per-link display
+settings) onto the duplicate on its own, so no template inheritance is
+needed for this at all. Autodesk's own API docs still note this row had
+"No API access (Revit 2020)" and a direct
 BuiltInParameter.VIS_GRAPHICS_RVT_LINKS lookup still returns null on the
-versions checked, so this is still attempted by parameter *name*, wrapped
-so a failure only adds a warning.
+versions checked, so it's still located by parameter *name*, wrapped so a
+failure only adds a warning either way.
 
 WHY GRID COLORING USES PER-ELEMENT OVERRIDES, NOT A THIRD VIEW FILTER (V3):
 Walls/Columns/Framing/Foundations can be told apart per-link by Type Name
@@ -1422,14 +1433,29 @@ def _find_view_template_by_name(name):
     return None
 
 
-def _ensure_rvt_links_template_controlled(template, warnings):
-    """See module docstring ("WHY 'V/G OVERRIDES RVT LINKS' IS NOW KEPT
-    TEMPLATE-CONTROLLED") for why this actively ENSURES the row is
-    included (removes its parameter Id from the template's non-controlled
-    list if present) rather than excluding it — the opposite of an
-    earlier version of this function. Best-effort regardless: a failure
-    here is informational only, it doesn't block anything else this tool
-    does."""
+def _ensure_rvt_links_not_template_controlled(template, warnings):
+    """REVERSED AGAIN (2026-08-30) — see module docstring ("WHY 'V/G
+    OVERRIDES RVT LINKS' IS NOW KEPT TEMPLATE-CONTROLLED" / its follow-up
+    note). A prior round made this row template-CONTROLLED (removed its
+    parameter Id from the non-controlled list) so a value written to the
+    template's own link settings would propagate to every view using it,
+    including a sheet's duplicated view. Live testing then found something
+    much worse: once this row was template-controlled, Step 5's own
+    view-level HideElements calls for OTHER (non-selected) links stopped
+    sticking through to commit, and — after Step 5 was moved to run last
+    to compensate — a SELECTED link (Architecture) started getting hidden
+    that was never in Step 5's own target list at all. Whatever the exact
+    mechanism, template control over this row and view-level per-link
+    HideElements do not coexist safely. Fixed at the root instead: this
+    function now ENSURES the row is EXCLUDED (added to the non-controlled
+    list) so link visibility/display-mode are always plain view-specific
+    state, same as Step 5's hides always were — and _apply_link_display_
+    settings for Traffic now targets `view` directly (not `template`), so
+    the original propagation concern is solved a different way: Duplicate
+    (WithDetailing) already carries view-specific overrides (hides AND
+    link display settings) onto a sheet's duplicated view, no template
+    inheritance needed. Best-effort regardless: a failure here is
+    informational only, it doesn't block anything else this tool does."""
     try:
         param_id = None
         for p in template.Parameters:
@@ -1443,12 +1469,12 @@ def _ensure_rvt_links_template_controlled(template, warnings):
                 u"view-specific regardless of this setting.")
             return
         current_ids = list(template.GetNonControlledTemplateParameterIds())
-        kept_ids = [i for i in current_ids if i.IntegerValue != param_id.IntegerValue]
-        if len(kept_ids) != len(current_ids):
-            template.SetNonControlledTemplateParameterIds(SCG.List[DB.ElementId](kept_ids))
+        if not any(i.IntegerValue == param_id.IntegerValue for i in current_ids):
+            current_ids.append(param_id)
+            template.SetNonControlledTemplateParameterIds(SCG.List[DB.ElementId](current_ids))
     except Exception as ex:
         warnings.append(
-            u"Could not include 'V/G Overrides RVT Links' in template control: {} "
+            u"Could not exclude 'V/G Overrides RVT Links' from template control: {} "
             u"(informational only).".format(ex))
 
 
@@ -1613,7 +1639,7 @@ def ensure_view_template(view, host_clutter_bics, link_model_bics, wallnoncore_b
 
     _apply_coordination_categories(template, host_clutter_bics, link_model_bics,
                                     wallnoncore_bics, annotation_bics, override_bics, warnings)
-    _ensure_rvt_links_template_controlled(template, warnings)
+    _ensure_rvt_links_not_template_controlled(template, warnings)
 
     try:
         view.ViewTemplateId = template.Id
@@ -3205,89 +3231,6 @@ def run():
                                          wallnoncore_bics, annotation_bics,
                                          override_bics, warnings)
 
-        # ── Step 5: hide every other link (e.g. MEP) ────────────────────────────
-        # other_link_ids is ALREADY a typed .NET List[ElementId] (SCG.List),
-        # not a plain Python list -- that's been true since this step was
-        # first written, not something this round changed. Every outcome
-        # (hidden / already-hidden / un-hideable / exception) is now named
-        # explicitly and folded into other_links_summary below, which the
-        # final TaskDialog prints unconditionally -- not just on failure --
-        # so "still visible" is checkable directly from the result dialog
-        # instead of needing to dig through warnings or guess.
-        other_link_ids = SCG.List[DB.ElementId]()
-        already_hidden_names = []
-        unhideable_names = []
-        for li in links:
-            if li[u"id"].IntegerValue in chosen_ids:
-                continue
-            try:
-                if li[u"instance"].IsHidden(view):
-                    already_hidden_names.append(li[u"name"])
-                    continue
-                if li[u"instance"].CanBeHidden(view):
-                    other_link_ids.Add(li[u"id"])
-                else:
-                    unhideable_names.append(li[u"name"])
-                    warnings.append(
-                        u"Link '{}' could not be hidden — Revit reports it as "
-                        u"un-hideable in this view (CanBeHidden=False), so it "
-                        u"remains visible.".format(li[u"name"]))
-            except Exception as ex:
-                unhideable_names.append(li[u"name"])
-                warnings.append(u"Could not hide link '{}': {}".format(li[u"name"], ex))
-
-        newly_hidden_count = 0
-        if other_link_ids.Count:
-            try:
-                view.HideElements(other_link_ids)
-                newly_hidden_count = other_link_ids.Count
-            except Exception as ex:
-                unhideable_names.extend(li[u"name"] for li in links
-                                         if li[u"id"].IntegerValue in
-                                         set(i.IntegerValue for i in other_link_ids))
-                warnings.append(u"Could not hide {} other link(s): {}".format(
-                    other_link_ids.Count, ex))
-
-            # Re-check IsHidden right after the call, per-link, instead of
-            # trusting "HideElements didn't throw" as proof it stuck — this
-            # is the one thing that can actually distinguish "the API call
-            # itself silently failed" from "it worked here, but you're
-            # looking at a different view/sheet than this tool ran on"
-            # (element hides are always per-view, never template-controlled
-            # — that's not fixable by any HideElements variant).
-            still_visible_after = []
-            for li in links:
-                if li[u"id"].IntegerValue in chosen_ids:
-                    continue
-                if li[u"name"] in already_hidden_names or li[u"name"] in unhideable_names:
-                    continue
-                try:
-                    if not li[u"instance"].IsHidden(view):
-                        still_visible_after.append(li[u"name"])
-                except Exception:
-                    pass
-            if still_visible_after:
-                newly_hidden_count -= len(still_visible_after)
-                warnings.append(
-                    u"HideElements reported success but IsHidden still shows FALSE right "
-                    u"after, for: {} — this points at a genuine API/Revit-version quirk, "
-                    u"not a 'wrong view' explanation, since this check runs against the "
-                    u"exact same view object the hide was just applied to.".format(
-                        u", ".join(still_visible_after)))
-
-        other_links_summary = u"Other links hidden: {} newly + {} already ({} total)".format(
-            newly_hidden_count, len(already_hidden_names),
-            newly_hidden_count + len(already_hidden_names))
-        if unhideable_names:
-            other_links_summary += u" — COULD NOT HIDE: {}".format(u", ".join(unhideable_names))
-        if duplicate_link_names:
-            other_links_summary += (
-                u"\nNOTE: these linked file(s) are placed as MORE THAN ONE separate "
-                u"instance in this model: {} — each instance is hidden/verified "
-                u"independently, so if the file still looks visible after this run, "
-                u"check whether every one of its instances actually got hidden.".format(
-                    u", ".join(duplicate_link_names)))
-
         # ── Refinement 1: host Grids hidden (element-level — see docstring) ────
         _hide_host_grids(view, warnings)
 
@@ -3330,7 +3273,14 @@ def run():
             # Filters with that view's filters, which Traffic never had in
             # the first place (its coloring is host-view-only halftone).
             traffic_view_id = traffic_linked_view[u"view"].Id if traffic_linked_view else None
-            _apply_link_display_settings(template, traffic_link[u"id"], traffic_view_id, warnings, u"Traffic")
+            # Targets `view` directly, NOT `template` (changed 2026-08-30) —
+            # see _ensure_rvt_links_not_template_controlled's docstring:
+            # writing link display settings to the template while "V/G
+            # Overrides RVT Links" was template-controlled is what broke
+            # Step 5's per-view link hides. Duplicate(WithDetailing), used
+            # for a sheet's copy (_get_view_for_sheet), already carries this
+            # view-specific setting over on its own — no template needed.
+            _apply_link_display_settings(view, traffic_link[u"id"], traffic_view_id, warnings, u"Traffic")
             _set_traffic_halftone(view, traffic_link, warnings)
 
         # ── Smart Linked View: Architecture/Structure (optional, per role) ─────
@@ -3434,15 +3384,113 @@ def run():
                 sheet = _create_and_place_sheet(view_for_sheet, _elem_name(view_for_sheet),
                                                  titleblock_symbol, warnings)
 
+        # ── Step 5: hide every other link (e.g. MEP) ────────────────────────────
+        # MOVED HERE, to run LAST (2026-08-30) — was originally right after
+        # Step 3 (template setup). ROOT CAUSE now understood and fixed at
+        # the source too (see _ensure_rvt_links_not_template_controlled and
+        # the module docstring's "WHY 'V/G OVERRIDES RVT LINKS' IS NOW KEPT
+        # *NOT* TEMPLATE-CONTROLLED"): that row being template-controlled
+        # made view-level per-link HideElements unreliable regardless of
+        # ordering — first "other" links silently came back visible by
+        # commit time, then (after moving this step to run last as a first
+        # attempted fix) a SELECTED link started getting hidden that was
+        # never even in this step's own target list. Both symptoms went
+        # away once the row was put back to NOT-template-controlled and
+        # Traffic's display settings were retargeted from `template` to
+        # `view`. Left running LAST anyway rather than moved back to its
+        # original spot — it already works here, the FINAL CHECK right
+        # before commit confirms it every run, and there's no real reason
+        # left to move it, only risk in doing so without a concrete benefit.
+        #
+        # other_link_ids is ALREADY a typed .NET List[ElementId] (SCG.List),
+        # not a plain Python list -- that's been true since this step was
+        # first written, not something this round changed. Every outcome
+        # (hidden / already-hidden / un-hideable / exception) is now named
+        # explicitly and folded into other_links_summary below, which the
+        # final TaskDialog prints unconditionally -- not just on failure --
+        # so "still visible" is checkable directly from the result dialog
+        # instead of needing to dig through warnings or guess.
+        other_link_ids = SCG.List[DB.ElementId]()
+        already_hidden_names = []
+        unhideable_names = []
+        for li in links:
+            if li[u"id"].IntegerValue in chosen_ids:
+                continue
+            try:
+                if li[u"instance"].IsHidden(view):
+                    already_hidden_names.append(li[u"name"])
+                    continue
+                if li[u"instance"].CanBeHidden(view):
+                    other_link_ids.Add(li[u"id"])
+                else:
+                    unhideable_names.append(li[u"name"])
+                    warnings.append(
+                        u"Link '{}' could not be hidden — Revit reports it as "
+                        u"un-hideable in this view (CanBeHidden=False), so it "
+                        u"remains visible.".format(li[u"name"]))
+            except Exception as ex:
+                unhideable_names.append(li[u"name"])
+                warnings.append(u"Could not hide link '{}': {}".format(li[u"name"], ex))
+
+        newly_hidden_count = 0
+        if other_link_ids.Count:
+            try:
+                view.HideElements(other_link_ids)
+                newly_hidden_count = other_link_ids.Count
+            except Exception as ex:
+                unhideable_names.extend(li[u"name"] for li in links
+                                         if li[u"id"].IntegerValue in
+                                         set(i.IntegerValue for i in other_link_ids))
+                warnings.append(u"Could not hide {} other link(s): {}".format(
+                    other_link_ids.Count, ex))
+
+            # Re-check IsHidden right after the call, per-link, instead of
+            # trusting "HideElements didn't throw" as proof it stuck — this
+            # is the one thing that can actually distinguish "the API call
+            # itself silently failed" from "it worked here, but you're
+            # looking at a different view/sheet than this tool ran on"
+            # (element hides are always per-view, never template-controlled
+            # — that's not fixable by any HideElements variant).
+            still_visible_after = []
+            for li in links:
+                if li[u"id"].IntegerValue in chosen_ids:
+                    continue
+                if li[u"name"] in already_hidden_names or li[u"name"] in unhideable_names:
+                    continue
+                try:
+                    if not li[u"instance"].IsHidden(view):
+                        still_visible_after.append(li[u"name"])
+                except Exception:
+                    pass
+            if still_visible_after:
+                newly_hidden_count -= len(still_visible_after)
+                warnings.append(
+                    u"HideElements reported success but IsHidden still shows FALSE right "
+                    u"after, for: {} — this points at a genuine API/Revit-version quirk, "
+                    u"not a 'wrong view' explanation, since this check runs against the "
+                    u"exact same view object the hide was just applied to.".format(
+                        u", ".join(still_visible_after)))
+
+        other_links_summary = u"Other links hidden: {} newly + {} already ({} total)".format(
+            newly_hidden_count, len(already_hidden_names),
+            newly_hidden_count + len(already_hidden_names))
+        if unhideable_names:
+            other_links_summary += u" — COULD NOT HIDE: {}".format(u", ".join(unhideable_names))
+        if duplicate_link_names:
+            other_links_summary += (
+                u"\nNOTE: these linked file(s) are placed as MORE THAN ONE separate "
+                u"instance in this model: {} — each instance is hidden/verified "
+                u"independently, so if the file still looks visible after this run, "
+                u"check whether every one of its instances actually got hidden.".format(
+                    u", ".join(duplicate_link_names)))
+
         # FINAL re-verification, right before commit (added 2026-08-30) —
-        # Step 5's own "still_visible_after" check only proves a link hide
-        # stuck AT THAT MOMENT, right after HideElements was called. If a
-        # LATER step in this same transaction (template reassignment, Step
-        # 8's filters, sheet duplication above) silently undoes it, that
-        # earlier check can't see it. This re-checks every non-selected,
-        # non-unhideable link one more time, right before commit, so "it
-        # broke DURING this run" and "it broke AFTER commit / on reopen"
-        # are distinguishable from the result dialog alone.
+        # Step 5 now runs LAST (see its own comment above, right after this
+        # was moved), specifically so nothing after it can still undo the
+        # hide before commit. This re-check is what proves that theory
+        # right or wrong on the very next run: empty here means the reorder
+        # fixed it; non-empty here means something UNRELATED to template
+        # writes is the real cause and the reorder didn't help.
         final_still_visible = []
         for li in links:
             if li[u"id"].IntegerValue in chosen_ids:
