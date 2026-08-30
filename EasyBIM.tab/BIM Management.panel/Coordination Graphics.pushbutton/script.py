@@ -3303,16 +3303,31 @@ def run():
     sheet_line = (u"Sheet: {} — {}".format(sheet.SheetNumber, _elem_name(sheet))
                   if sheet is not None else u"Sheet: not created (see warnings)")
 
+    def _names_preview(names, limit=15):
+        # Named directly in the result dialog, not just a count — so
+        # "N types found but nothing colored on this floor" is directly
+        # checkable (search for these exact type names in the model)
+        # instead of needing to dig into the pyRevit log.
+        names = sorted(names)
+        if not names:
+            return u"(none)"
+        shown = u", ".join(names[:limit])
+        if len(names) > limit:
+            shown += u", +{} more (see pyRevit log for the full list)".format(len(names) - limit)
+        return shown
+
     summary = (
         u"Coordination graphics applied.\n\n"
         u"Architecture link(s): {}\nStructure link(s): {}\nTraffic link: {}\n\n"
-        u"Architecture concrete types found: {}\nStructure concrete types found: {}\n\n"
+        u"Architecture concrete types found: {} — {}\n"
+        u"Structure concrete types found: {} — {}\n\n"
         u"{}\n{}\n\n"
         u"{}".format(
             u", ".join(li[u"name"] for li in arch_links),
             u", ".join(li[u"name"] for li in struct_links),
             traffic_link[u"name"] if (use_traffic and traffic_link) else u"(not used)",
-            len(arch_names), len(struct_names),
+            len(arch_names), _names_preview(arch_names),
+            len(struct_names), _names_preview(struct_names),
             other_links_summary,
             traffic_summary or u"Traffic link: (not used)",
             sheet_line)
