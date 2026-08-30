@@ -1481,19 +1481,24 @@ def _apply_coordination_categories(target, host_clutter_bics, link_model_bics, w
     # specifically crashes and a real fix, given the cost of being wrong
     # here is a full application crash, not a warning.
 
-    # Live-testing finding: a non-concrete wall (e.g. "15_BLOCK", correctly
-    # excluded from the Structure/Architecture Filters by name) still
-    # showed its own hardcoded Type Properties "Coarse Scale Fill Color"
-    # as a solid fill. build_colored_override's OverrideGraphicSettings.
-    # SetDetailLevel(Fine) only forces Fine for elements the two concrete
-    # FILTERS actually match — it never touches anything outside those
-    # matches, and this gray fallback (below) is the CATEGORY-level
-    # override applied to every OTHER element in these 5 categories, which
-    # never had its own DetailLevel forced. Fixed here, so every element
-    # in override_bics gets Fine forced one way or another — either via
-    # the Structure/Architecture Filter (if classified concrete) or via
-    # this gray fallback (if not) — closing the gap for every non-concrete
-    # wall/column/etc. in the Arch/Struct links, not just the colored ones.
+    # Live-testing finding, root-caused precisely via a Type Properties
+    # screenshot: "15_BLOCK" (Structural Material "Block", correctly
+    # excluded from the Structure/Architecture Filters by keyword) has its
+    # own Type Property "Coarse Scale Fill Pattern: <Solid fill>" /
+    # "Coarse Scale Fill Color: Red" — a hardcoded native appearance,
+    # independent of anything this tool's Filters do. SetDetailLevel(Fine)
+    # alone did NOT fix this for the gray fallback, and now we know why:
+    # this override never set any Cut/Surface PATTERN at all, only a
+    # projection line color — "force Fine" has nothing to force when
+    # there's no pattern override in place for it to apply to, so the
+    # element's own native Cut/Surface fill (Solid, Red, in this case)
+    # shows through completely unchallenged, regardless of Detail Level.
+    # Fixed by giving the gray fallback an explicit Cut+Surface Foreground
+    # solid-gray fill of its own — the same class of fix already applied
+    # to Structure/Architecture's OWN colored elements in
+    # build_colored_override, just solid instead of hatched (gray is
+    # meant to be a quiet, de-emphasized "not classified as concrete"
+    # signal, not a second highlighted category).
     gray_ogs = DB.OverrideGraphicSettings()
     try:
         gray_ogs.SetDetailLevel(DB.ViewDetailLevel.Fine)
@@ -1503,6 +1508,37 @@ def _apply_coordination_categories(target, host_clutter_bics, link_model_bics, w
         gray_ogs.SetProjectionLineColor(GRAY_COLOR)
     except Exception as ex:
         warnings.append(u"Could not set the gray fallback projection color: {}".format(ex))
+
+    solid_fill_id = get_solid_fill_pattern_id()
+    for setter_name, args in (
+        ("SetCutBackgroundPatternVisible", (False,)),
+        ("SetSurfaceBackgroundPatternVisible", (False,)),
+    ):
+        try:
+            getattr(gray_ogs, setter_name)(*args)
+        except Exception as ex:
+            warnings.append(u"Could not disable the gray fallback's {}: {}".format(setter_name, ex))
+    try:
+        gray_ogs.SetCutBackgroundPatternId(DB.ElementId.InvalidElementId)
+        gray_ogs.SetSurfaceBackgroundPatternId(DB.ElementId.InvalidElementId)
+    except Exception:
+        pass
+    if solid_fill_id != DB.ElementId.InvalidElementId:
+        try:
+            gray_ogs.SetCutForegroundPatternVisible(True)
+            gray_ogs.SetCutForegroundPatternId(solid_fill_id)
+            gray_ogs.SetCutForegroundPatternColor(GRAY_COLOR)
+            gray_ogs.SetSurfaceForegroundPatternVisible(True)
+            gray_ogs.SetSurfaceForegroundPatternId(solid_fill_id)
+            gray_ogs.SetSurfaceForegroundPatternColor(GRAY_COLOR)
+        except Exception as ex:
+            warnings.append(u"Could not set the gray fallback's solid fill pattern: {}".format(ex))
+    else:
+        warnings.append(
+            u"No solid fill pattern could be resolved for the gray fallback — non-concrete "
+            u"elements may still show their own native Type Properties fill (e.g. a "
+            u"hardcoded Coarse Scale Fill Color).")
+
     for bic in override_bics:
         _override_category_safe(target, bic, gray_ogs, warnings)
 
@@ -2519,6 +2555,29 @@ def get_solid_line_pattern_id():
         return DB.LinePatternElement.GetSolidPatternId()
     except Exception:
         return DB.ElementId.InvalidElementId
+
+
+def get_solid_fill_pattern_id():
+    """First Drafting-target FillPatternElement whose FillPattern.IsSolidFill
+    is True (a real, distinct property from pattern *name* — confirmed via
+    reflecting the installed RevitAPI.dll — so this works regardless of
+    locale/naming and doesn't depend on a pattern literally being named
+    "Solid fill"). Used by the gray fallback override so it can explicitly
+    win over a linked type's own hardcoded Type Properties fill (see
+    _apply_coordination_categories' gray_ogs) — a plain color/DetailLevel
+    override with no Cut/Surface pattern set at all has nothing for
+    "Fine" to apply to, and lets the element's own native fill through."""
+    try:
+        for fpe in DB.FilteredElementCollector(doc).OfClass(DB.FillPatternElement):
+            try:
+                fp = fpe.GetFillPattern()
+                if fp is not None and fp.Target == DB.FillPatternTarget.Drafting and fp.IsSolidFill:
+                    return fpe.Id
+            except Exception:
+                continue
+    except Exception:
+        pass
+    return DB.ElementId.InvalidElementId
 
 
 def _fuzzy_tokens_from_pattern_name(name):
