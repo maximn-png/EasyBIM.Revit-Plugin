@@ -1204,6 +1204,15 @@ def _find_matching_link_views(link_infos, host_level):
                     continue
                 if vp.GetPrimaryViewId() != DB.ElementId.InvalidElementId:
                     continue  # dependent view
+                # ViewPlan also covers Ceiling Plans and Area Plans, which
+                # are never sensible candidates for "how this link displays"
+                # (a ceiling plan shows reflected content, an area plan shows
+                # almost nothing structural) — excluded outright rather than
+                # just deprioritized. FloorPlan/EngineeringPlan only — the
+                # latter is what Revit's own "Structural Plan" template
+                # produces, so Structure links need it included too.
+                if vp.ViewType not in (DB.ViewType.FloorPlan, DB.ViewType.EngineeringPlan):
+                    continue
                 is_floor_plan = (vp.ViewType == DB.ViewType.FloorPlan)
                 is_coarse = (vp.DetailLevel == DB.ViewDetailLevel.Coarse)
             except Exception:
