@@ -2212,13 +2212,27 @@ def _type_is_concrete(link_doc, elem_type, bic, cfg):
 
 
 def _collect_concrete_type_names(link_doc, categories, cfg, warnings, label, _depth=0):
-    """Iterate INSTANCES (not just types) because Wall Structural Usage
-    (Bearing/Shear) is an instance property, and because an instance-level
-    Material override (_instance_material_texts) can vary between instances
-    of the same type — a type only counts as concrete via the type cache if
-    at least one qualifying instance uses it, but any single instance whose
+    """Iterate INSTANCES (not just types) because an instance-level Material
+    override (_instance_material_texts) can vary between instances of the
+    same type — a type only counts as concrete via the type cache if at
+    least one qualifying instance uses it, but any single instance whose
     own Material override reads as concrete adds its type name too, even if
     the type's own default classification came back negative.
+
+    BUG FOUND AND FIXED (root-caused precisely via live testing — a wall
+    named "50_CONC" with a Type Properties compound-structure core layer
+    literally named "Concrete" was still not being classified as concrete,
+    while "30_CONC"/"40_CONC" were): an earlier version of this loop
+    skipped any WALL instance whose Structural Usage wasn't Bearing or
+    Shear, BEFORE _type_is_concrete was ever called on it — "50_CONC" was
+    Non-bearing, so it was silently discarded regardless of its actual
+    material. That check conflated two unrelated things: whether a wall is
+    MATERIALLY concrete (what this tool colors) and whether it's
+    STRUCTURALLY load-bearing (an unrelated property — plenty of walls are
+    architecturally modeled in concrete without being marked Bearing/Shear
+    at all, e.g. non-load-bearing concrete partitions or facade panels).
+    Removed entirely; walls are now classified purely on
+    name/material, same as every other category here.
 
     Recurses one level into any RevitLinkInstance found inside `link_doc`
     itself (a link nested inside the Arch/Struct link, e.g. a separately-
@@ -2258,15 +2272,6 @@ def _collect_concrete_type_names(link_doc, categories, cfg, warnings, label, _de
 
         for elem in elems:
             counts[0] += 1
-
-            if is_wall:
-                try:
-                    usage = elem.StructuralUsage
-                except Exception:
-                    usage = None
-                if usage not in (Structure.StructuralWallUsage.Bearing,
-                                  Structure.StructuralWallUsage.Shear):
-                    continue
 
             try:
                 type_id = elem.GetTypeId()
