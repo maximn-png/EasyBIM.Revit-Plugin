@@ -229,6 +229,7 @@ OVERRIDE_CATEGORY_NAMES = [
 ]
 
 GRAY_COLOR = DB.Color(190, 190, 190)
+WHITE_COLOR = DB.Color(255, 255, 255)
 
 # Host-model categories hidden on the template to declutter (Step 3). Not
 # exhaustive — edit freely.
@@ -1481,25 +1482,56 @@ def _apply_coordination_categories(target, host_clutter_bics, link_model_bics, w
     # specifically crashes and a real fix, given the cost of being wrong
     # here is a full application crash, not a warning.
 
-    # REMOVED, by explicit request: the gray fallback override for
-    # non-concrete elements in override_bics (Walls/Columns/Structural*).
-    # Elements NOT classified as concrete get NO override here — their own
-    # native Type Properties appearance shows, same as any ordinary,
-    # un-overridden element.
+    # Non-concrete fallback for override_bics (Walls/Columns/Structural*) —
+    # EXPLICIT white fill + gray line, by explicit request (reversing the
+    # "zero override" decision from one round earlier on purpose): a wall
+    # with NO override shows whatever its own Type Properties say, which
+    # can be a hardcoded native color (e.g. "15_BLOCK"'s Coarse Scale Fill
+    # Color = Red, diagnosed a few rounds back) — forcing white here makes
+    # every non-concrete element look consistent regardless of what its
+    # own file happens to have set. Same category-level mechanism
+    # (SetCategoryOverrides) already used and proven safe for many rounds
+    # — NOT a new View Filter, given the crash history with those; a
+    # category override only applies to elements a Filter doesn't already
+    # match (Filters always win), so this correctly leaves Structure/
+    # Architecture's own colored elements alone.
     #
-    # BUG FOUND immediately after removing it: live-testing showed walls
-    # STILL rendering gray on the very next run. Root cause: simply no
-    # longer CALLING SetCategoryOverrides does not undo what an EARLIER run
-    # already set — the template is a REUSED, PERSISTENT object (found by
-    # name, not recreated), so the gray override from a prior run's
-    # SetCategoryOverrides call was still sitting on it. Stopping the call
-    # only stops changing it going forward; it doesn't reset it. Explicitly
-    # clearing every override_bics category to a fresh, empty
-    # OverrideGraphicSettings() undoes it for real, on every run, whether
-    # or not a prior run ever set the gray override at all.
-    reset_ogs = DB.OverrideGraphicSettings()
+    # IMPORTANT: this must be set EVERY run, not just when non-empty —
+    # the shared template is a REUSED, PERSISTENT object (found by name,
+    # not recreated), so whatever a PRIOR run set here (gray, or nothing)
+    # stays until something explicitly overwrites it. Confirmed live: just
+    # removing the code that used to set gray did NOT clear it from a
+    # template a prior run had already touched.
+    fallback_ogs = DB.OverrideGraphicSettings()
+    try:
+        fallback_ogs.SetCutLineColor(GRAY_COLOR)
+        fallback_ogs.SetProjectionLineColor(GRAY_COLOR)
+    except Exception as ex:
+        warnings.append(u"Could not set the non-concrete fallback's line color: {}".format(ex))
+    try:
+        fallback_ogs.SetCutBackgroundPatternVisible(False)
+        fallback_ogs.SetSurfaceBackgroundPatternVisible(False)
+        fallback_ogs.SetCutBackgroundPatternId(DB.ElementId.InvalidElementId)
+        fallback_ogs.SetSurfaceBackgroundPatternId(DB.ElementId.InvalidElementId)
+    except Exception:
+        pass
+    solid_fill_id = get_solid_fill_pattern_id()
+    if solid_fill_id != DB.ElementId.InvalidElementId:
+        try:
+            fallback_ogs.SetCutForegroundPatternVisible(True)
+            fallback_ogs.SetCutForegroundPatternId(solid_fill_id)
+            fallback_ogs.SetCutForegroundPatternColor(WHITE_COLOR)
+            fallback_ogs.SetSurfaceForegroundPatternVisible(True)
+            fallback_ogs.SetSurfaceForegroundPatternId(solid_fill_id)
+            fallback_ogs.SetSurfaceForegroundPatternColor(WHITE_COLOR)
+        except Exception as ex:
+            warnings.append(u"Could not set the non-concrete fallback's white fill: {}".format(ex))
+    else:
+        warnings.append(
+            u"No solid fill pattern could be resolved for the non-concrete fallback — "
+            u"those elements may still show their own native Type Properties fill.")
     for bic in override_bics:
-        _override_category_safe(target, bic, reset_ogs, warnings)
+        _override_category_safe(target, bic, fallback_ogs, warnings)
 
 
 def ensure_view_template(view, host_clutter_bics, link_model_bics, wallnoncore_bics,
