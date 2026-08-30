@@ -1430,6 +1430,25 @@ def _apply_coordination_categories(target, host_clutter_bics, link_model_bics, w
     except Exception as ex:
         warnings.append(u"Could not set detail level to Fine: {}".format(ex))
 
+    # Live-testing finding (a zoomed screenshot showing a diagonal crosshatch
+    # pattern correctly rendering, but layered on top of a still-solid
+    # background fill): Cut/Surface Pattern overrides (Foreground/
+    # Background, what build_colored_override sets) are a 2D drafting
+    # concept — they say nothing about 3D MATERIAL SHADING, which is a
+    # completely separate rendering pipeline. In any Shaded/Realistic-
+    # family Visual Style, Revit renders the element's assigned material's
+    # own shaded color as a solid fill regardless of any 2D pattern
+    # override, with the pattern drawn as an extra overlay on top — exactly
+    # this symptom. Forcing DisplayStyle to HLR ("Hidden Line" in the UI)
+    # takes 3D material shading out of the picture entirely for this
+    # template/view, so the 2D Cut/Surface Pattern overrides are the only
+    # thing determining fill appearance, regardless of what visual style
+    # the user's view happened to be in before this tool ran.
+    try:
+        target.DisplayStyle = DB.DisplayStyle.HLR
+    except Exception as ex:
+        warnings.append(u"Could not set the visual style to Hidden Line: {}".format(ex))
+
     for bic in host_clutter_bics:
         _hide_category_safe(target, bic, warnings)
     for bic in link_model_bics:
