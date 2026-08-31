@@ -21,9 +21,15 @@ clr.AddReference('PresentationCore')
 clr.AddReference('WindowsBase')
 clr.AddReference('System.Xml')
 clr.AddReference('System')
+clr.AddReference('RevitAPI')
+clr.AddReference('RevitAPIUI')
 
 import System
 import System.Windows.Media as WM
+
+from Autodesk.Revit import DB
+import Autodesk.Revit.Exceptions as RevitExceptions
+from Autodesk.Revit.UI.Selection import ObjectType
 
 from System.Windows.Markup import XamlReader
 from System.IO import StringReader
@@ -220,6 +226,20 @@ XAML = u"""
 
         <Border Style="{StaticResource Card}">
           <StackPanel>
+            <TextBlock Text="MANUAL EXCEPTIONS (BY TYPE NAME)" Style="{StaticResource SectionHeader}"/>
+            <TextBlock TextWrapping="Wrap" FontSize="10.5" Foreground="#8b93a7" Margin="0,2,0,0"
+                       Text="A Type Name listed here is ALWAYS treated as non-concrete, overriding every rule above -- for one specific type the keyword/material rules keep getting wrong."/>
+
+            <TextBlock Text="EXCLUDED TYPE NAMES" Style="{StaticResource FieldLabel}"/>
+            <TextBox x:Name="ManualExcludeTypes" Style="{StaticResource FieldBox}"/>
+
+            <Button x:Name="BtnPickException" Content="Add from Model..." Style="{StaticResource GhostBtn}"
+                    HorizontalAlignment="Left" Padding="14,0" Margin="0,10,0,0"/>
+          </StackPanel>
+        </Border>
+
+        <Border Style="{StaticResource Card}">
+          <StackPanel>
             <TextBlock Text="FILL PATTERNS" Style="{StaticResource SectionHeader}"/>
 
             <TextBlock Text="STRUCTURE CUT HATCH PATTERN NAME" Style="{StaticResource FieldLabel}"/>
@@ -300,6 +320,40 @@ def _split(text):
     return [p for p in parts if p]
 
 
+def _elem_name_safe(elem):
+    """Local copy of script.py's _elem_name safe-getter — kept independent
+    on purpose (see this module's docstring on staying independently
+    usable rather than importing from a pushbutton script). Plain .Name
+    access raises AttributeError for many *Type classes (WallType,
+    FamilySymbol, ...) on this Revit API binding, on both IronPython and
+    CPython3 pyRevit engines (pyrevitlabs/pyRevit#854) —
+    Element.Name.GetValue(elem) is the confirmed fix, tried first;
+    SYMBOL_NAME_PARAM is a second-tier fallback."""
+    if elem is None:
+        return u""
+    try:
+        return elem.Name or u""
+    except AttributeError:
+        pass
+    except Exception:
+        return u""
+    try:
+        v = DB.Element.Name.GetValue(elem)
+        if v:
+            return v
+    except Exception:
+        pass
+    try:
+        bip = getattr(DB.BuiltInParameter, "SYMBOL_NAME_PARAM", None)
+        if bip is not None:
+            p = elem.get_Parameter(bip)
+            if p is not None:
+                return p.AsString() or u""
+    except Exception:
+        pass
+    return u""
+
+
 class SettingsDialog(object):
     def __init__(self, settings):
         self.settings  = settings
@@ -318,6 +372,7 @@ class SettingsDialog(object):
         w.FindName(u"TrafficLinkKw").Text = _join(s.get(u"TrafficLinkKeywords"))
         w.FindName(u"ConcreteKw").Text    = _join(s.get(u"ConcreteKeywords"))
         w.FindName(u"ExcludeKw").Text     = _join(s.get(u"ExcludeKeywords"))
+        w.FindName(u"ManualExcludeTypes").Text = _join(s.get(u"ManualExcludeTypeNames"))
         w.FindName(u"StructPattern").Text = s.get(u"StructPatternName") or u""
         w.FindName(u"ArchPattern").Text   = s.get(u"ArchPatternName") or u""
 
@@ -341,6 +396,7 @@ class SettingsDialog(object):
         w.FindName(u"BtnCancel").Click += lambda s_, e: window.Close()
         w.FindName(u"BtnReset").Click  += self._on_reset
         w.FindName(u"BtnSave").Click   += self._on_save
+        w.FindName(u"BtnPickException").Click += self._on_pick_exception
 
         return window
 
@@ -376,6 +432,7 @@ class SettingsDialog(object):
         w.FindName(u"TrafficLinkKw").Text = _join(defaults[u"TrafficLinkKeywords"])
         w.FindName(u"ConcreteKw").Text    = _join(defaults[u"ConcreteKeywords"])
         w.FindName(u"ExcludeKw").Text     = _join(defaults[u"ExcludeKeywords"])
+        w.FindName(u"ManualExcludeTypes").Text = _join(defaults[u"ManualExcludeTypeNames"])
         w.FindName(u"StructPattern").Text = defaults[u"StructPatternName"]
         w.FindName(u"ArchPattern").Text   = defaults[u"ArchPatternName"]
         sc = defaults[u"StructColor"]
@@ -410,6 +467,7 @@ class SettingsDialog(object):
             u"TrafficLinkKeywords": _split(w.FindName(u"TrafficLinkKw").Text),
             u"ConcreteKeywords"   : _split(w.FindName(u"ConcreteKw").Text),
             u"ExcludeKeywords"    : _split(w.FindName(u"ExcludeKw").Text),
+            u"ManualExcludeTypeNames": _split(w.FindName(u"ManualExcludeTypes").Text),
             u"StructPatternName"  : struct_pattern,
             u"ArchPatternName"    : arch_pattern,
             u"StructColor"        : {u"R": struct_rgb[0], u"G": struct_rgb[1], u"B": struct_rgb[2]},
@@ -424,6 +482,71 @@ class SettingsDialog(object):
 
         self.saved = True
         w.Close()
+
+    def _on_pick_exception(self, sender, e):
+        """"Add from Model..." — pick a rogue linked element directly
+        instead of typing its Type Name blind. Hides this window (not
+        Close — Close would end the whole settings session and lose
+        unsaved edits in the other fields) for the duration of the pick,
+        since a modeless WPF window sitting on screen would otherwise
+        cover the Revit view the user needs to click into; PickObject
+        itself still runs correctly on this thread either way (this is
+        the same Revit API execution context the whole command runs on).
+        Re-shows the window afterward regardless of outcome (success,
+        cancel, or error) via `finally`."""
+        from pyrevit import revit
+        w = self._window
+        err_tb = w.FindName(u"ErrorText")
+        uidoc = revit.uidoc
+
+        w.Hide()
+        try:
+            try:
+                ref = uidoc.Selection.PickObject(
+                    ObjectType.LinkedElement,
+                    u"Select a wall/column/framing/foundation in a link to exclude "
+                    u"from concrete coloring (Esc to cancel)")
+            except RevitExceptions.OperationCanceledException:
+                return
+            except Exception as ex:
+                err_tb.Text = u"Selection failed: {}".format(ex)
+                return
+
+            try:
+                link_inst = uidoc.Document.GetElement(ref.ElementId)
+                link_doc  = link_inst.GetLinkDocument() if link_inst is not None else None
+            except Exception:
+                link_doc = None
+            if link_doc is None:
+                err_tb.Text = u"Could not read the picked link's document."
+                return
+
+            try:
+                elem = link_doc.GetElement(ref.LinkedElementId)
+            except Exception:
+                elem = None
+            if elem is None:
+                err_tb.Text = u"Could not resolve the picked element inside its link."
+                return
+
+            try:
+                elem_type = link_doc.GetElement(elem.GetTypeId())
+            except Exception:
+                elem_type = None
+            type_name = _elem_name_safe(elem_type)
+            if not type_name:
+                err_tb.Text = u"The picked element has no readable Type Name."
+                return
+
+            current = _split(w.FindName(u"ManualExcludeTypes").Text)
+            if type_name in current:
+                err_tb.Text = u"'{}' is already in the exception list.".format(type_name)
+            else:
+                current.append(type_name)
+                w.FindName(u"ManualExcludeTypes").Text = _join(current)
+                err_tb.Text = u"Added '{}' — click Save to keep it.".format(type_name)
+        finally:
+            w.Show()
 
     def show(self):
         from System.Windows.Threading import Dispatcher, DispatcherFrame

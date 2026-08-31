@@ -48,6 +48,13 @@ SETTINGS_DEFAULTS = {
                               u"B15", u"B20", u"B25", u"B30", u"B35",
                               u"B40", u"B45", u"B50", u"B60"],
     u"ExcludeKeywords"    : [u"Block", u"בלוק", u"Light", u"קל", u"מילוי"],
+    # Exact Type Name matches that ALWAYS classify as non-concrete,
+    # regardless of keyword/material matching — a manual escape hatch for
+    # a specific type the automatic rules keep getting wrong (see
+    # script.py's _type_is_concrete, and coordination_settings_ui's
+    # "Add from Model..." picker, which appends to this list by picking a
+    # linked element directly instead of typing a name blind).
+    u"ManualExcludeTypeNames": [],
     u"StructPatternName"  : u"Diagonal Up - 1.5mm",
     u"ArchPatternName"    : u"Diagonal Down - 1.5mm",
     u"StructColor"        : {u"R": 200, u"G": 30, u"B": 30},

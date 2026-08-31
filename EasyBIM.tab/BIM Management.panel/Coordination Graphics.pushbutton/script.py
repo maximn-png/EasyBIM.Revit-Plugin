@@ -2359,7 +2359,19 @@ def _type_is_concrete(link_doc, elem_type, bic, cfg):
     concrete_kw = cfg.get(u"ConcreteKeywords") or []
     exclude_kw  = cfg.get(u"ExcludeKeywords") or []
 
-    texts = [_elem_name(elem_type)]
+    type_name = _elem_name(elem_type)
+
+    # Manual, per-Type-Name override — set via "ARC/STR Settings" > "Add
+    # from Model..." (pick a rogue linked element instead of typing a name
+    # blind). Checked FIRST and unconditionally, ahead of even the
+    # MaterialClass fast-path below: this is a deliberate human decision
+    # about ONE specific type that keeps getting misclassified, so it must
+    # win over every automatic rule, not just the keyword ones.
+    manual_exclude = cfg.get(u"ManualExcludeTypeNames") or []
+    if type_name in manual_exclude:
+        return False
+
+    texts = [type_name]
     texts.append(_first_text(elem_type, "ALL_MODEL_DESCRIPTION", u"Description"))
     texts.append(_first_text(elem_type, "ALL_MODEL_TYPE_COMMENTS", u"Type Comments"))
     # Family Name — walls are a system family (no .Family the same way loaded
