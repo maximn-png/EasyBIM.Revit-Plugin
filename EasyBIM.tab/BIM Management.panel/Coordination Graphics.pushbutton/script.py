@@ -244,7 +244,13 @@ logger = script.get_logger()
 # CONSTANTS
 # ─────────────────────────────────────────────────────────────────────────────
 
-TEMPLATE_NAME = u"Coordination - Arch vs Str"
+TEMPLATE_NAME = u"EB_ARC/STR_CO_1-100"
+# Renamed 2026-08-31, by explicit request. Kept here (not deleted) so
+# ensure_view_template can find and RENAME a template already assigned to
+# views from before the rename, instead of leaving it orphaned and
+# silently creating a second, empty template under the new name — every
+# view already using the old-named template keeps working unchanged.
+_OLD_TEMPLATE_NAMES = (u"Coordination - Arch vs Str",)
 
 FILTER_NAME_STRUCT = u"EasyBIM - Structure Concrete"
 FILTER_NAME_ARCH   = u"EasyBIM - Architecture Concrete"
@@ -1840,8 +1846,8 @@ def _apply_coordination_categories(target, host_clutter_bics, link_model_bics, w
 def ensure_view_template(view, host_clutter_bics, link_model_bics, wallnoncore_bics,
                           annotation_bics, override_bics, warnings):
     """Returns a View-like target already configured with the coordination
-    categories/overrides. Normally that's the shared 'Coordination - Arch vs
-    Str' template (created once, refreshed on every run, reusable across any
+    categories/overrides. Normally that's the shared TEMPLATE_NAME
+    template (created once, refreshed on every run, reusable across any
     view). Finding/creating/assigning it can legitimately fail — e.g.
     View.IsViewValidForTemplateCreation() is False for some view types/
     states — so on ANY failure here this falls back to applying the exact
@@ -1852,6 +1858,19 @@ def ensure_view_template(view, host_clutter_bics, link_model_bics, wallnoncore_b
     exception is always logged to `warnings`, never swallowed to a generic
     message, so the real Revit API error is visible if this keeps failing."""
     template = _find_view_template_by_name(TEMPLATE_NAME)
+
+    if template is None:
+        for _old_name in _OLD_TEMPLATE_NAMES:
+            _old = _find_view_template_by_name(_old_name)
+            if _old is not None:
+                try:
+                    _old.Name = TEMPLATE_NAME
+                    template = _old
+                except Exception as ex:
+                    warnings.append(
+                        u"Found the old-named template '{}' but could not rename it "
+                        u"to '{}': {}".format(_old_name, TEMPLATE_NAME, ex))
+                break
 
     if template is None:
         try:
@@ -3496,8 +3515,8 @@ def run():
     # reads the SELECTED LINKS' own documents directly — completely
     # independent of which host view is being processed — and the two
     # colored View Filters (FILTER_NAME_STRUCT/FILTER_NAME_ARCH) are shared
-    # Document elements applied to the ONE shared "Coordination - Arch vs
-    # Str" template every selected view ends up using. So all of this is
+    # Document elements applied to the ONE shared TEMPLATE_NAME template
+    # every selected view ends up using. So all of this is
     # computed ONCE here, not once per view — running N redundant deep-
     # scans of the exact same links for N selected views would be pure
     # waste. Runs in its own transaction, committed before the per-view

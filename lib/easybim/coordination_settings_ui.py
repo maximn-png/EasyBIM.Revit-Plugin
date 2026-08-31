@@ -272,10 +272,10 @@ XAML = u"""
             <TextBlock Text="FILL PATTERNS" Style="{StaticResource SectionHeader}"/>
 
             <TextBlock Text="STRUCTURE CUT HATCH PATTERN NAME" Style="{StaticResource FieldLabel}"/>
-            <TextBox x:Name="StructPattern" Style="{StaticResource FieldBox}"/>
+            <ComboBox x:Name="StructPattern" Height="30" FontSize="12" IsEditable="True"/>
 
             <TextBlock Text="ARCHITECTURE CUT HATCH PATTERN NAME" Style="{StaticResource FieldLabel}"/>
-            <TextBox x:Name="ArchPattern" Style="{StaticResource FieldBox}"/>
+            <ComboBox x:Name="ArchPattern" Height="30" FontSize="12" IsEditable="True"/>
           </StackPanel>
         </Border>
 
@@ -296,12 +296,13 @@ XAML = u"""
                     <ColumnDefinition Width="*"/>
                     <ColumnDefinition Width="*"/>
                     <ColumnDefinition Width="*"/>
-                    <ColumnDefinition Width="26"/>
+                    <ColumnDefinition Width="30"/>
                   </Grid.ColumnDefinitions>
                   <TextBox x:Name="StructR" Grid.Column="0" Style="{StaticResource FieldBox}" Margin="0,0,4,0"/>
                   <TextBox x:Name="StructG" Grid.Column="1" Style="{StaticResource FieldBox}" Margin="0,0,4,0"/>
                   <TextBox x:Name="StructB" Grid.Column="2" Style="{StaticResource FieldBox}" Margin="0,0,4,0"/>
-                  <Border x:Name="StructSwatch" Grid.Column="3" CornerRadius="4" BorderBrush="#dcdfef" BorderThickness="1"/>
+                  <Border x:Name="StructSwatch" Grid.Column="3" CornerRadius="4" BorderBrush="#dcdfef"
+                          BorderThickness="1" Cursor="Hand" ToolTip="Click to pick a color"/>
                 </Grid>
               </StackPanel>
 
@@ -312,12 +313,13 @@ XAML = u"""
                     <ColumnDefinition Width="*"/>
                     <ColumnDefinition Width="*"/>
                     <ColumnDefinition Width="*"/>
-                    <ColumnDefinition Width="26"/>
+                    <ColumnDefinition Width="30"/>
                   </Grid.ColumnDefinitions>
                   <TextBox x:Name="ArchR" Grid.Column="0" Style="{StaticResource FieldBox}" Margin="0,0,4,0"/>
                   <TextBox x:Name="ArchG" Grid.Column="1" Style="{StaticResource FieldBox}" Margin="0,0,4,0"/>
                   <TextBox x:Name="ArchB" Grid.Column="2" Style="{StaticResource FieldBox}" Margin="0,0,4,0"/>
-                  <Border x:Name="ArchSwatch" Grid.Column="3" CornerRadius="4" BorderBrush="#dcdfef" BorderThickness="1"/>
+                  <Border x:Name="ArchSwatch" Grid.Column="3" CornerRadius="4" BorderBrush="#dcdfef"
+                          BorderThickness="1" Cursor="Hand" ToolTip="Click to pick a color"/>
                 </Grid>
               </StackPanel>
             </Grid>
@@ -504,6 +506,9 @@ class SettingsDialog(object):
         w.FindName(u"ManualIncludeTypes").Text = _join(s.get(u"ManualIncludeTypeNames"))
         w.FindName(u"ManualExcludeTypes").Text = _join(s.get(u"ManualExcludeTypeNames"))
         w.FindName(u"ManualHideTypes").Text    = _join(s.get(u"ManualHideTypeNames"))
+
+        self._populate_pattern_combo(u"StructPattern")
+        self._populate_pattern_combo(u"ArchPattern")
         w.FindName(u"StructPattern").Text = s.get(u"StructPatternName") or u""
         w.FindName(u"ArchPattern").Text   = s.get(u"ArchPatternName") or u""
 
@@ -522,6 +527,10 @@ class SettingsDialog(object):
         self._wire_swatch(u"ArchR", u"ArchG", u"ArchB", u"ArchSwatch")
         self._update_swatch(u"StructR", u"StructG", u"StructB", u"StructSwatch")
         self._update_swatch(u"ArchR", u"ArchG", u"ArchB", u"ArchSwatch")
+        w.FindName(u"StructSwatch").MouseLeftButtonUp += (
+            lambda s_, e: self._pick_color(u"StructR", u"StructG", u"StructB", u"StructSwatch"))
+        w.FindName(u"ArchSwatch").MouseLeftButtonUp += (
+            lambda s_, e: self._pick_color(u"ArchR", u"ArchG", u"ArchB", u"ArchSwatch"))
 
         w.FindName(u"BtnCloseX").Click += lambda s_, e: window.Close()
         w.FindName(u"BtnCancel").Click += lambda s_, e: window.Close()
@@ -533,6 +542,64 @@ class SettingsDialog(object):
         w.FindName(u"BtnCleanupSheets").Click += self._on_cleanup_sheets
 
         return window
+
+    def _pick_color(self, r_name, g_name, b_name, swatch_name):
+        """Click-the-swatch color picker, per explicit request ("choose
+        from the color palette"). WPF has no built-in color-picker control,
+        so this reuses the standard Windows one via WinForms interop
+        (System.Windows.Forms.ColorDialog — the native "Color" dialog with
+        both a basic-colors palette and a custom-color/RGB tab) rather than
+        building a custom WPF control. Only touches the R/G/B TextBoxes on
+        OK; Cancel leaves the current values untouched. FullOpen=True shows
+        the custom-color panel immediately instead of requiring an extra
+        click, since the whole point here is picking an arbitrary color,
+        not just one of the 48 basic swatches."""
+        clr.AddReference('System.Windows.Forms')
+        clr.AddReference('System.Drawing')
+        import System.Windows.Forms as WF
+        import System.Drawing as SD
+
+        current = self._read_rgb(r_name, g_name, b_name) or (200, 30, 30)
+        dlg = WF.ColorDialog()
+        dlg.FullOpen = True
+        dlg.Color = SD.Color.FromArgb(current[0], current[1], current[2])
+        if dlg.ShowDialog() != WF.DialogResult.OK:
+            return
+        picked = dlg.Color
+        w = self._window
+        w.FindName(r_name).Text = unicode(picked.R)
+        w.FindName(g_name).Text = unicode(picked.G)
+        w.FindName(b_name).Text = unicode(picked.B)
+        self._update_swatch(r_name, g_name, b_name, swatch_name)
+
+    def _populate_pattern_combo(self, combo_name):
+        """Every Drafting-target fill pattern in the current document, for
+        the Fill Patterns dropdowns — per explicit request ("dropdown of
+        all fill patterns that exist in the model"). IsEditable="True" on
+        the ComboBox (see XAML) means .Text keeps working exactly like the
+        plain TextBox this replaced, so the load/save/reset code below
+        didn't need to change at all — this only adds the dropdown list on
+        top of that, and a saved pattern name that no longer exists in the
+        model (e.g. a stale name from before) still just shows as typed
+        text instead of silently disappearing."""
+        from pyrevit import revit
+        combo = self._window.FindName(combo_name)
+        combo.Items.Clear()
+        try:
+            patterns = list(DB.FilteredElementCollector(revit.doc).OfClass(DB.FillPatternElement))
+        except Exception:
+            patterns = []
+        names = []
+        for fpe in patterns:
+            try:
+                fp = fpe.GetFillPattern()
+                if fp is None or fp.Target != DB.FillPatternTarget.Drafting:
+                    continue
+                names.append(_elem_name_safe(fpe))
+            except Exception:
+                continue
+        for name in sorted(set(n for n in names if n)):
+            combo.Items.Add(name)
 
     def _wire_swatch(self, r_name, g_name, b_name, swatch_name):
         handler = lambda s_, e: self._update_swatch(r_name, g_name, b_name, swatch_name)
