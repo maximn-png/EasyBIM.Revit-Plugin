@@ -1,17 +1,31 @@
 # -*- coding: utf-8 -*-
 """Coordination Graphics — EasyBIM BIM Management. (V2)
 
-Sets up a clash-coordination look in the active 2D plan view: identifies the
+Sets up a clash-coordination look in one or more selected Plan/Section views
+(batch mode — Step 1 of the wizard, see LinkPickerDialog): identifies the
 Architecture, Structure (and optional Traffic) Revit links (remembered choice
-> auto-detect by keyword > manual WPF pick), applies a shared "Coordination -
-Arch vs Str" view template for the host clutter/annotation clean-up, hides
-every other link, deep-scans the Arch/Struct links' Walls/Columns/Structural
-Framing/Foundations for concrete-material types, and colors those types red
-(Structure) / blue (Architecture) via two View Filters — driven by
-Settings.json (see "Coordination Settings" and lib/easybim/coordination_settings.py).
-Every other visible Model category (Stairs, Doors, Furniture, Plumbing
-Fixtures, etc. — see _apply_coordination_categories) gets a plain gray
-line-color override, so only the red/blue concrete coloring stands out.
+> auto-detect by keyword > manual WPF pick), applies a shared view template
+for the host clutter/annotation clean-up, hides every other link, deep-scans
+the Arch/Struct links' Walls/Columns/Structural Framing/Foundations for
+concrete-material types, and colors those types red (Structure) / blue
+(Architecture) via two View Filters — driven by Settings.json (see
+"Coordination Settings" and lib/easybim/coordination_settings.py). Every
+other visible Model category (Stairs, Doors, Furniture, Plumbing Fixtures,
+etc. — see _apply_coordination_categories) gets a plain gray line-color
+override, so only the red/blue concrete coloring stands out.
+
+SECTIONS (ViewType.Section specifically — see _is_section_view) get a
+SEPARATE template (SECTION_TEMPLATE_NAME) with three deliberate differences
+from Plans, confirmed directly with the user — full reasoning lives on the
+SECTION_TEMPLATE_NAME constant itself: Floors stay visible, Traffic is never
+shown at all (treated as just another hidden "other" link), and
+Architecture's CONCRETE elements are left with zero override so they render
+with their own native Material appearance instead of this tool's blue —
+non-concrete elements on both sides still get the same white/gray fallback
+Plans get, via two new per-link Type-Name filters instead of the blanket
+category override Plans use (which can't tell Architecture's elements apart
+from Structure's at all). A batch run can freely mix Plan and Section views;
+run()'s per-view loop branches on _is_section_view for all of this.
 
 Engine: IronPython 2.7 (no "#! python3" shebang) — matches the tab's other
 WPF+Transaction buttons.
@@ -266,6 +280,51 @@ FILTER_NAME_ARCH   = u"EasyBIM - Architecture Concrete"
 # rule, exactly like the two filters above, which have never crashed.
 FILTER_NAME_MANUAL_HIDE = u"EasyBIM - Manual Hide"
 
+# ── SECTIONS (added 2026-08-31, by explicit request) ────────────────────────
+# A dedicated second template/filter set for Section views specifically
+# (ViewType.Section, not Elevation/Detail — see _is_section_view), almost
+# identical to the plan template but with three deliberate differences,
+# confirmed directly with the user:
+#   1. Floors stay VISIBLE (removed from the hide list — see
+#      SECTION_LINK_MODEL_HIDE_CATEGORY_NAMES vs LINK_MODEL_HIDE_CATEGORY_
+#      NAMES). Stairs needed no change — OST_Stairs was never in any hide
+#      list to begin with, in plans OR sections.
+#   2. Traffic is never shown at all, regardless of whether a Traffic link
+#      is picked in the wizard — treated exactly like any other
+#      non-selected "other" link (fully hidden by Step 5), not given the
+#      Parking-only restriction plans get. See run()'s per-view chosen_ids.
+#   3. Structure's concrete hatch is UNCHANGED (still FILTER_NAME_STRUCT,
+#      red). Architecture's concrete is DELIBERATELY NOT touched by any
+#      filter or category override at all here, so it renders with
+#      whatever native Material appearance the Architecture link's own
+#      Type Properties define (confirmed by the user to typically be blue
+#      in their office's material library, but this doesn't hard-code that
+#      — it just gets out of the way and lets the source model's own
+#      graphics show through). Non-concrete elements (BOTH disciplines)
+#      still need the SAME white/gray fallback plans get — confirmed
+#      explicitly, not assumed — but the plan mechanism for that
+#      (_apply_coordination_categories' blanket override_bics CATEGORY
+#      override) can't be reused as-is: a category override can't tell
+#      Architecture's elements apart from Structure's at all (the same
+#      fundamental "Filters can discriminate by link, categories can't"
+#      limitation behind FILTER_NAME_STRUCT/ARCH existing in the first
+#      place), and it would blanket over Architecture's concrete elements
+#      too, defeating point 3. So for Sections, the blanket category
+#      fallback is skipped entirely (see apply_fallback=False in
+#      ensure_view_template/_apply_coordination_categories), and TWO NEW
+#      Type-Name filters take over that exact same white/gray job, scoped
+#      per-link like the concrete filters already are:
+#      FILTER_NAME_STRUCT_FALLBACK / FILTER_NAME_ARCH_FALLBACK, built from
+#      each link's own NON-concrete type names (all types found in
+#      OVERRIDE_CATEGORY_NAMES categories, minus the concrete ones — see
+#      _collect_concrete_type_names' all_names_out param). Architecture's
+#      CONCRETE names are the one deliberate gap: never added to ANY
+#      filter for Sections, so they fall through to Object Styles + native
+#      Material rendering, exactly as requested.
+SECTION_TEMPLATE_NAME = u"EB_ARC/STR_CO_SECTIONS"
+FILTER_NAME_STRUCT_FALLBACK = u"EasyBIM - Structure Non-Concrete (Sections)"
+FILTER_NAME_ARCH_FALLBACK   = u"EasyBIM - Architecture Non-Concrete (Sections)"
+
 # Column-specific dashed-line treatment (and its separate per-role filters,
 # FILTER_NAME_STRUCT_COLUMNS/FILTER_NAME_ARCH_COLUMNS) was tried and then
 # explicitly reversed per live-testing feedback — ALL boundary lines must be
@@ -364,6 +423,13 @@ WHITELIST_MODEL_CATEGORY_NAMES = [
 # from the 2024 API onward — resolved defensively at runtime.
 LINK_MODEL_HIDE_CATEGORY_NAMES = [
     "OST_Floors",
+    "OST_Topography",
+    "OST_Toposolid",
+]
+
+# Section template variant of the list above — Floors stay VISIBLE in
+# Sections (see the SECTIONS block's docstring), everything else the same.
+SECTION_LINK_MODEL_HIDE_CATEGORY_NAMES = [
     "OST_Topography",
     "OST_Toposolid",
 ]
@@ -1483,32 +1549,67 @@ def _role_default_multi(links, memory_uids, keywords):
 # VIEW HELPERS
 # ─────────────────────────────────────────────────────────────────────────────
 
+def _is_section_view(view):
+    """True for a genuine Section view specifically — NOT Elevation or
+    Detail, which share the same ViewSection class in the API but need a
+    ViewType check to tell apart. Sections get a different, dedicated
+    template (SECTION_TEMPLATE_NAME) with different category/filter
+    treatment — see run()'s per-view branch and the module docstring's
+    section on this."""
+    try:
+        return isinstance(view, DB.ViewSection) and view.ViewType == DB.ViewType.Section
+    except Exception:
+        return False
+
+
+def _is_eligible_coordination_view(view):
+    try:
+        if view is None or view.IsTemplate:
+            return False
+    except Exception:
+        return False
+    try:
+        if isinstance(view, DB.ViewPlan):
+            return True
+    except Exception:
+        pass
+    return _is_section_view(view)
+
+
 def get_view_and_validate():
     view = doc.ActiveView
-    if view is None or view.IsTemplate or not isinstance(view, DB.ViewPlan):
+    if not _is_eligible_coordination_view(view):
         TaskDialog.Show(
             u"EasyBIM — Coordination Graphics",
-            u"Open a 2D plan view (Floor Plan / Ceiling Plan / Area Plan) — not a "
-            u"view template, 3D view, section, elevation or sheet — then run this "
-            u"command again."
+            u"Open a 2D plan view (Floor Plan / Ceiling Plan / Area Plan) or a "
+            u"Section — not a view template, 3D view, elevation, detail or sheet — "
+            u"then run this command again."
         )
         return None
     return view
 
 
 def get_eligible_views_for_batch(active_view):
-    """Every non-template ViewPlan in the project (Floor/Ceiling/Area/
-    Engineering Plan — same eligibility as get_view_and_validate's single-
-    view check), for Step 1's multi-select batch checklist. One dict per
-    view: {'view':, 'name':}. active_view is always included even if, for
-    some reason, the general collector wouldn't otherwise surface it, so
-    the pre-checked default never comes up empty."""
+    """Every non-template ViewPlan or Section in the project (same
+    eligibility as get_view_and_validate's single-view check), for Step
+    1's multi-select batch checklist. One dict per view: {'view':,
+    'name':}. active_view is always included even if, for some reason,
+    the general collectors wouldn't otherwise surface it, so the
+    pre-checked default never comes up empty. Plans and Sections CAN be
+    mixed in the same batch selection — run() branches per-view on
+    _is_section_view for the categories/filters/Traffic differences (see
+    module docstring)."""
     seen_ids = set()
     out = []
     try:
         all_views = list(DB.FilteredElementCollector(doc).OfClass(DB.ViewPlan))
     except Exception:
         all_views = []
+    try:
+        all_views += [v for v in DB.FilteredElementCollector(doc).OfClass(DB.ViewSection)
+                      if _is_section_view(v)]
+    except Exception:
+        pass
     for v in all_views:
         try:
             if v.IsTemplate:
@@ -1672,8 +1773,47 @@ def _ensure_rvt_links_not_template_controlled(template, warnings):
             u"(informational only).".format(ex))
 
 
+def _build_nonconcrete_fallback_ogs(warnings):
+    """Explicit white Cut+Surface fill / gray line — the non-concrete
+    fallback appearance, extracted out of _apply_coordination_categories
+    so run() can ALSO build it for the two Section-only Type-Name fallback
+    filters (FILTER_NAME_STRUCT_FALLBACK/ARCH_FALLBACK), not just the
+    plan template's blanket category override. See that function's
+    docstring for why a wall with NO override at all isn't safe to rely
+    on (native hardcoded fills like "15_BLOCK"'s)."""
+    fallback_ogs = DB.OverrideGraphicSettings()
+    try:
+        fallback_ogs.SetCutLineColor(GRAY_COLOR)
+        fallback_ogs.SetProjectionLineColor(GRAY_COLOR)
+    except Exception as ex:
+        warnings.append(u"Could not set the non-concrete fallback's line color: {}".format(ex))
+    try:
+        fallback_ogs.SetCutBackgroundPatternVisible(False)
+        fallback_ogs.SetSurfaceBackgroundPatternVisible(False)
+        fallback_ogs.SetCutBackgroundPatternId(DB.ElementId.InvalidElementId)
+        fallback_ogs.SetSurfaceBackgroundPatternId(DB.ElementId.InvalidElementId)
+    except Exception:
+        pass
+    solid_fill_id = get_solid_fill_pattern_id()
+    if solid_fill_id != DB.ElementId.InvalidElementId:
+        try:
+            fallback_ogs.SetCutForegroundPatternVisible(True)
+            fallback_ogs.SetCutForegroundPatternId(solid_fill_id)
+            fallback_ogs.SetCutForegroundPatternColor(WHITE_COLOR)
+            fallback_ogs.SetSurfaceForegroundPatternVisible(True)
+            fallback_ogs.SetSurfaceForegroundPatternId(solid_fill_id)
+            fallback_ogs.SetSurfaceForegroundPatternColor(WHITE_COLOR)
+        except Exception as ex:
+            warnings.append(u"Could not set the non-concrete fallback's white fill: {}".format(ex))
+    else:
+        warnings.append(
+            u"No solid fill pattern could be resolved for the non-concrete fallback — "
+            u"those elements may still show their own native Type Properties fill.")
+    return fallback_ogs
+
+
 def _apply_coordination_categories(target, host_clutter_bics, link_model_bics, wallnoncore_bics,
-                                    annotation_bics, override_bics, warnings):
+                                    annotation_bics, override_bics, warnings, apply_fallback=True):
     """Category hides/overrides shared between the template path and the
     direct-to-view fallback below — SetCategoryHidden/SetCategoryOverrides
     (and, in the caller, AddFilter/SetFilterOverrides) all work identically
@@ -1752,36 +1892,20 @@ def _apply_coordination_categories(target, host_clutter_bics, link_model_bics, w
     # stays until something explicitly overwrites it. Confirmed live: just
     # removing the code that used to set gray did NOT clear it from a
     # template a prior run had already touched.
-    fallback_ogs = DB.OverrideGraphicSettings()
-    try:
-        fallback_ogs.SetCutLineColor(GRAY_COLOR)
-        fallback_ogs.SetProjectionLineColor(GRAY_COLOR)
-    except Exception as ex:
-        warnings.append(u"Could not set the non-concrete fallback's line color: {}".format(ex))
-    try:
-        fallback_ogs.SetCutBackgroundPatternVisible(False)
-        fallback_ogs.SetSurfaceBackgroundPatternVisible(False)
-        fallback_ogs.SetCutBackgroundPatternId(DB.ElementId.InvalidElementId)
-        fallback_ogs.SetSurfaceBackgroundPatternId(DB.ElementId.InvalidElementId)
-    except Exception:
-        pass
-    solid_fill_id = get_solid_fill_pattern_id()
-    if solid_fill_id != DB.ElementId.InvalidElementId:
-        try:
-            fallback_ogs.SetCutForegroundPatternVisible(True)
-            fallback_ogs.SetCutForegroundPatternId(solid_fill_id)
-            fallback_ogs.SetCutForegroundPatternColor(WHITE_COLOR)
-            fallback_ogs.SetSurfaceForegroundPatternVisible(True)
-            fallback_ogs.SetSurfaceForegroundPatternId(solid_fill_id)
-            fallback_ogs.SetSurfaceForegroundPatternColor(WHITE_COLOR)
-        except Exception as ex:
-            warnings.append(u"Could not set the non-concrete fallback's white fill: {}".format(ex))
-    else:
-        warnings.append(
-            u"No solid fill pattern could be resolved for the non-concrete fallback — "
-            u"those elements may still show their own native Type Properties fill.")
-    for bic in override_bics:
-        _override_category_safe(target, bic, fallback_ogs, warnings)
+    #
+    # apply_fallback=False (Sections only — see the SECTIONS constants
+    # block's docstring): skips this blanket CATEGORY-level fallback
+    # entirely, because it can't tell Architecture's elements apart from
+    # Structure's (the same limitation FILTER_NAME_STRUCT/ARCH exist to
+    # work around) and would blanket over Architecture's concrete elements
+    # too, which Sections need left untouched for native rendering. Two
+    # dedicated Type-Name FILTERS (FILTER_NAME_STRUCT_FALLBACK/ARCH_
+    # FALLBACK, built in run()) take over this exact job for Sections
+    # instead, scoped per-link like the concrete filters already are.
+    if apply_fallback:
+        fallback_ogs = _build_nonconcrete_fallback_ogs(warnings)
+        for bic in override_bics:
+            _override_category_safe(target, bic, fallback_ogs, warnings)
 
     # Every OTHER visible Model category — Stairs, Doors, Windows,
     # Furniture, Plumbing Fixtures, Railings, Curtain Walls, etc. — gets a
@@ -1844,11 +1968,15 @@ def _apply_coordination_categories(target, host_clutter_bics, link_model_bics, w
 
 
 def ensure_view_template(view, host_clutter_bics, link_model_bics, wallnoncore_bics,
-                          annotation_bics, override_bics, warnings):
+                          annotation_bics, override_bics, warnings,
+                          template_name=TEMPLATE_NAME, old_names=_OLD_TEMPLATE_NAMES,
+                          apply_fallback=True):
     """Returns a View-like target already configured with the coordination
-    categories/overrides. Normally that's the shared TEMPLATE_NAME
+    categories/overrides. Normally that's the shared `template_name`
     template (created once, refreshed on every run, reusable across any
-    view). Finding/creating/assigning it can legitimately fail — e.g.
+    view) — TEMPLATE_NAME for Plans by default, or SECTION_TEMPLATE_NAME
+    (with apply_fallback=False) for Sections, see run()'s per-view branch.
+    Finding/creating/assigning it can legitimately fail — e.g.
     View.IsViewValidForTemplateCreation() is False for some view types/
     states — so on ANY failure here this falls back to applying the exact
     same categories/overrides directly to the active view instead of
@@ -1857,19 +1985,19 @@ def ensure_view_template(view, host_clutter_bics, link_model_bics, wallnoncore_b
     reusable template for other views this run). The full underlying
     exception is always logged to `warnings`, never swallowed to a generic
     message, so the real Revit API error is visible if this keeps failing."""
-    template = _find_view_template_by_name(TEMPLATE_NAME)
+    template = _find_view_template_by_name(template_name)
 
     if template is None:
-        for _old_name in _OLD_TEMPLATE_NAMES:
+        for _old_name in old_names:
             _old = _find_view_template_by_name(_old_name)
             if _old is not None:
                 try:
-                    _old.Name = TEMPLATE_NAME
+                    _old.Name = template_name
                     template = _old
                 except Exception as ex:
                     warnings.append(
                         u"Found the old-named template '{}' but could not rename it "
-                        u"to '{}': {}".format(_old_name, TEMPLATE_NAME, ex))
+                        u"to '{}': {}".format(_old_name, template_name, ex))
                 break
 
     if template is None:
@@ -1890,21 +2018,22 @@ def ensure_view_template(view, host_clutter_bics, link_model_bics, wallnoncore_b
                 template = doc.GetElement(result)
             else:
                 template = result
-            template.Name = TEMPLATE_NAME
+            template.Name = template_name
         except Exception:
             warnings.append(
                 u"Could not create the '{}' view template — applying categories/"
                 u"overrides directly to the active view instead (link visibility, "
                 u"filters and colors still work; just not saved as a reusable "
                 u"template this run). Underlying error:\n{}".format(
-                    TEMPLATE_NAME, traceback.format_exc()))
+                    template_name, traceback.format_exc()))
             _apply_coordination_categories(view, host_clutter_bics, link_model_bics,
                                             wallnoncore_bics, annotation_bics,
-                                            override_bics, warnings)
+                                            override_bics, warnings, apply_fallback=apply_fallback)
             return view
 
     _apply_coordination_categories(template, host_clutter_bics, link_model_bics,
-                                    wallnoncore_bics, annotation_bics, override_bics, warnings)
+                                    wallnoncore_bics, annotation_bics, override_bics, warnings,
+                                    apply_fallback=apply_fallback)
     _ensure_rvt_links_not_template_controlled(template, warnings)
 
     try:
@@ -1913,10 +2042,10 @@ def ensure_view_template(view, host_clutter_bics, link_model_bics, wallnoncore_b
         warnings.append(
             u"Could not apply the '{}' template to the active view — applying "
             u"categories/overrides directly to the active view instead. Underlying "
-            u"error:\n{}".format(TEMPLATE_NAME, traceback.format_exc()))
+            u"error:\n{}".format(template_name, traceback.format_exc()))
         _apply_coordination_categories(view, host_clutter_bics, link_model_bics,
                                         wallnoncore_bics, annotation_bics,
-                                        override_bics, warnings)
+                                        override_bics, warnings, apply_fallback=apply_fallback)
         return view
 
     return template
@@ -2573,7 +2702,7 @@ def _type_ifc_guid(elem_type):
 
 
 def _collect_concrete_type_names(link_doc, categories, cfg, warnings, label, _depth=0,
-                                  guids_by_name=None):
+                                  guids_by_name=None, all_names_out=None):
     """Iterate INSTANCES (not just types) because an instance-level Material
     override (_instance_material_texts) can vary between instances of the
     same type — a type only counts as concrete via the type cache if at
@@ -2608,7 +2737,16 @@ def _collect_concrete_type_names(link_doc, categories, cfg, warnings, label, _de
     like it should qualify, the pyRevit output window immediately shows
     whether it's a classification gap (matched count too low) or a filter-
     matching gap downstream (classification looked right, element still
-    didn't get colored)."""
+    didn't get colored).
+
+    all_names_out (Sections only, see SECTION_TEMPLATE_NAME's docstring):
+    if given, gets every Type Name encountered in `categories` added to
+    it, concrete or not — one entry per distinct type, added the same
+    place is_concrete gets cached (once per type_id, not once per
+    instance). Subtracting the returned concrete-only `names` from this
+    gives each link's own NON-concrete type names, used to build the
+    Section-only fallback filters instead of the plan template's blanket
+    category override."""
     names = set()
     type_cache = {}  # type_id (int) -> (is_concrete, type_name, ifc_guid)
     per_category = {}  # category display name -> [scanned, matched]
@@ -2657,6 +2795,8 @@ def _collect_concrete_type_names(link_doc, categories, cfg, warnings, label, _de
                             label, type_name, ex))
                     if guids_by_name is not None:
                         ifc_guid = _type_ifc_guid(elem_type)
+                    if all_names_out is not None and type_name:
+                        all_names_out.add(type_name)
                 type_cache[key] = (is_conc, type_name, ifc_guid)
 
             is_conc, type_name, ifc_guid = type_cache[key]
@@ -2700,7 +2840,7 @@ def _collect_concrete_type_names(link_doc, categories, cfg, warnings, label, _de
             names |= _collect_concrete_type_names(
                 ndoc, categories, cfg, warnings,
                 u"{} > nested link".format(label), _depth=_depth + 1,
-                guids_by_name=guids_by_name)
+                guids_by_name=guids_by_name, all_names_out=all_names_out)
 
     return names
 
@@ -3506,6 +3646,7 @@ def run():
 
     host_clutter_bics = _resolve_categories(HOST_CLUTTER_CATEGORY_NAMES, global_warnings)
     link_model_bics   = _resolve_categories(LINK_MODEL_HIDE_CATEGORY_NAMES, global_warnings)
+    section_link_model_bics = _resolve_categories(SECTION_LINK_MODEL_HIDE_CATEGORY_NAMES, global_warnings)
     wallnoncore_bics  = _resolve_categories([WALL_NONCORE_CATEGORY_NAME], global_warnings)
     annotation_bics   = _resolve_categories(LINK_ANNOTATION_HIDE_CATEGORY_NAMES, global_warnings)
     override_bics     = _resolve_categories(OVERRIDE_CATEGORY_NAMES, global_warnings)
@@ -3544,18 +3685,27 @@ def run():
             _ensure_linked_view_detail_level(traffic_linked_view, global_warnings, u"Traffic")
 
         # ── Step 8: deep-scan (every selected link, per role) + View Filters ───
+        # arch_all_names/struct_all_names (every Type Name in override_bics
+        # categories, concrete or not) are only actually needed if a
+        # Section view is in this batch (see SECTION_TEMPLATE_NAME's
+        # docstring) -- collected unconditionally anyway since it's the
+        # same scan already running, at negligible extra cost.
         arch_names = set()
+        arch_all_names = set()
         arch_guids = {}
         for li in arch_links:
             arch_names |= _collect_concrete_type_names(
                 li[u"doc"], override_bics, settings, global_warnings,
-                u"Architecture ({})".format(li[u"name"]), guids_by_name=arch_guids)
+                u"Architecture ({})".format(li[u"name"]), guids_by_name=arch_guids,
+                all_names_out=arch_all_names)
         struct_names = set()
+        struct_all_names = set()
         struct_guids = {}
         for li in struct_links:
             struct_names |= _collect_concrete_type_names(
                 li[u"doc"], override_bics, settings, global_warnings,
-                u"Structure ({})".format(li[u"name"]), guids_by_name=struct_guids)
+                u"Structure ({})".format(li[u"name"]), guids_by_name=struct_guids,
+                all_names_out=struct_all_names)
 
         # A type name found in BOTH links' scans can't be told apart by a
         # plain "Type Name equals" rule (a Filter Rule never sees which
@@ -3609,6 +3759,29 @@ def run():
                                              global_warnings, u"Architecture")
         struct_grid_ogs = build_grid_line_override(struct_color, global_warnings, u"Structure")
         arch_grid_ogs   = build_grid_line_override(arch_color, global_warnings, u"Architecture")
+
+        # Section-only non-concrete fallback FILTERS (see SECTION_
+        # TEMPLATE_NAME's docstring for the full reasoning) — take over the
+        # plan template's blanket category-level white/gray fallback job,
+        # but per-link via Type Name like the concrete filters, so
+        # Architecture's CONCRETE names (never added to either filter
+        # below) can be left with zero override at all and render with
+        # their own native Material appearance, while non-concrete
+        # elements on BOTH sides still get the same white/gray look plans
+        # get. Built unconditionally (cheap set arithmetic) but only ever
+        # APPLIED to a view in the per-view loop below when that view is
+        # actually a Section.
+        struct_nonconcrete_names = struct_all_names - struct_names
+        arch_nonconcrete_names   = arch_all_names - arch_names
+        section_fallback_ogs = _build_nonconcrete_fallback_ogs(global_warnings)
+        struct_fallback_pfe = None
+        if struct_nonconcrete_names:
+            struct_fallback_pfe = build_or_update_type_name_filter(
+                FILTER_NAME_STRUCT_FALLBACK, override_bics, struct_nonconcrete_names, global_warnings)
+        arch_fallback_pfe = None
+        if arch_nonconcrete_names:
+            arch_fallback_pfe = build_or_update_type_name_filter(
+                FILTER_NAME_ARCH_FALLBACK, override_bics, arch_nonconcrete_names, global_warnings)
 
         # Manual per-Type-Name HIDE filter (Settings.json's
         # ManualHideTypeNames, set via ARC/STR Settings' "Add from
@@ -3710,6 +3883,16 @@ def run():
             u"other_links_summary": u"", u"traffic_summary": None, u"error": None,
         }
         w = vr[u"warnings"]
+        is_section = _is_section_view(view)
+        # Traffic is never shown in Sections regardless of the wizard's
+        # Traffic checkbox (see SECTION_TEMPLATE_NAME's docstring, point
+        # 2) — excluding its id here means Step 5 below treats it exactly
+        # like any other non-selected "other" link for this one view,
+        # fully hidden instead of restricted-to-Parking. Plan views are
+        # completely unaffected (view_chosen_ids == chosen_ids for them).
+        view_chosen_ids = chosen_ids
+        if is_section and use_traffic and traffic_link:
+            view_chosen_ids = chosen_ids - set([traffic_link[u"id"].IntegerValue])
         t = DB.Transaction(doc, u"EasyBIM: Coordination Graphics — {}".format(vr[u"name"]))
         t.Start()
         try:
@@ -3737,12 +3920,34 @@ def run():
             # aborting. Finds the SAME template by name on every call after
             # the first, so re-running the category setup per view is safe
             # (idempotent) even though it's mildly redundant.
-            template = ensure_view_template(view, host_clutter_bics, link_model_bics,
-                                             wallnoncore_bics, annotation_bics,
-                                             override_bics, w)
-
-            apply_filter_to_target(template, struct_pfe, struct_ogs, w, u"Structure")
-            apply_filter_to_target(template, arch_pfe, arch_ogs, w, u"Architecture")
+            #
+            # Sections get a SEPARATE template (SECTION_TEMPLATE_NAME),
+            # Floors left visible (section_link_model_bics), and
+            # apply_fallback=False — see that constant's docstring for the
+            # full reasoning. Structure's concrete filter/color is applied
+            # exactly like plans; Architecture's is DELIBERATELY skipped
+            # (no arch_pfe on this template at all) so its concrete
+            # elements render with zero override — native Material
+            # appearance. The two new fallback filters take over the
+            # white/gray job for non-concrete elements on BOTH sides,
+            # which the skipped blanket category override would otherwise
+            # have provided.
+            if is_section:
+                template = ensure_view_template(
+                    view, host_clutter_bics, section_link_model_bics,
+                    wallnoncore_bics, annotation_bics, override_bics, w,
+                    template_name=SECTION_TEMPLATE_NAME, old_names=(), apply_fallback=False)
+                apply_filter_to_target(template, struct_pfe, struct_ogs, w, u"Structure")
+                apply_filter_to_target(template, struct_fallback_pfe, section_fallback_ogs, w,
+                                        u"Structure non-concrete fallback")
+                apply_filter_to_target(template, arch_fallback_pfe, section_fallback_ogs, w,
+                                        u"Architecture non-concrete fallback")
+            else:
+                template = ensure_view_template(view, host_clutter_bics, link_model_bics,
+                                                 wallnoncore_bics, annotation_bics,
+                                                 override_bics, w)
+                apply_filter_to_target(template, struct_pfe, struct_ogs, w, u"Structure")
+                apply_filter_to_target(template, arch_pfe, arch_ogs, w, u"Architecture")
             apply_or_clear_hide_filter(template, manual_hide_pfe, w, u"Manual Hide")
 
             # ── Refinement 1: host Grids hidden (element-level — see docstring) ────
@@ -3756,7 +3961,11 @@ def run():
                 _hide_dwg_imports_in_link(view, li, basement, w)
 
             # ── Step 7: Traffic link ─────────────────────────────────────────────
-            if use_traffic and traffic_link:
+            # Skipped entirely for Sections (view_chosen_ids already
+            # excludes the Traffic link's id above, so Step 5 below hides
+            # it fully like any other non-selected link, instead of giving
+            # it the Parking-only restriction).
+            if use_traffic and traffic_link and not is_section:
                 vr[u"traffic_summary"] = _restrict_traffic_link_visibility(
                     view, traffic_link, traffic_keep_bics, w)
                 traffic_view_id = traffic_linked_view[u"view"].Id if traffic_linked_view else None
@@ -3802,7 +4011,7 @@ def run():
             already_hidden_names = []
             unhideable_names = []
             for li in links:
-                if li[u"id"].IntegerValue in chosen_ids:
+                if li[u"id"].IntegerValue in view_chosen_ids:
                     continue
                 try:
                     if li[u"instance"].IsHidden(view):
@@ -3834,7 +4043,7 @@ def run():
 
                 still_visible_after = []
                 for li in links:
-                    if li[u"id"].IntegerValue in chosen_ids:
+                    if li[u"id"].IntegerValue in view_chosen_ids:
                         continue
                     if li[u"name"] in already_hidden_names or li[u"name"] in unhideable_names:
                         continue
@@ -3871,7 +4080,7 @@ def run():
             # hide above.
             final_still_visible = []
             for li in links:
-                if li[u"id"].IntegerValue in chosen_ids:
+                if li[u"id"].IntegerValue in view_chosen_ids:
                     continue
                 if li[u"name"] in unhideable_names:
                     continue
