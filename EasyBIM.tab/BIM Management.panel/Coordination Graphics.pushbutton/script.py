@@ -3576,22 +3576,42 @@ def run():
         # Model..." picker) — an escape hatch for linked elements that
         # stay visible despite Step 5/6's automatic link- and DWG-hiding
         # (e.g. content inside a SELECTED Architecture/Structure link
-        # itself, which those steps never touch at all). Scoped to every
-        # Model category since a manually-picked rogue element could be
-        # anything, not just the structural categories in OVERRIDE_BICS.
+        # itself, which those steps never touch at all). Covers BOTH Model
+        # and Annotation categories, since a manually-picked rogue element
+        # could be either.
+        #
+        # BUG FOUND AND FIXED (root-caused via live testing: the filter
+        # never appeared in Revit's own Filters list at all, for ANY
+        # picked element): an earlier version of this collected every
+        # CategoryType.Model category from doc.Settings.Categories by
+        # hand. Not every category Revit shows in that list is actually
+        # usable in a ParameterFilterElement — ParameterFilterElement.
+        # Create THROWS if even ONE category in the list it's given isn't
+        # filterable, failing the ENTIRE filter creation, not just that
+        # one category (confirmed via reflecting the installed
+        # RevitAPI.dll: ParameterFilterUtilities.GetAllFilterableCategories
+        # /RemoveUnfilterableCategories exist specifically because of this
+        # constraint). Fixed by sourcing categories from
+        # GetAllFilterableCategories() directly instead of hand-rolling
+        # the list — Revit's own authoritative "these are safe to use in a
+        # Filter" source, which also naturally includes the Annotation
+        # categories the hand-rolled Model-only version excluded.
         manual_hide_names = set(settings.get(u"ManualHideTypeNames") or [])
-        all_model_bics = []
-        for _cat in doc.Settings.Categories:
+        try:
+            filterable_cat_ids = list(DB.ParameterFilterUtilities.GetAllFilterableCategories())
+        except Exception as ex:
+            filterable_cat_ids = []
+            global_warnings.append(u"Could not read Revit's filterable-category list: {}".format(ex))
+        manual_hide_bics = []
+        for _cid in filterable_cat_ids:
             try:
-                if _cat.CategoryType != DB.CategoryType.Model:
-                    continue
-                all_model_bics.append(DB.BuiltInCategory(_cat.Id.IntegerValue))
+                manual_hide_bics.append(DB.BuiltInCategory(_cid.IntegerValue))
             except Exception:
                 continue
         manual_hide_pfe = None
         if manual_hide_names:
             manual_hide_pfe = build_or_update_type_name_filter(
-                FILTER_NAME_MANUAL_HIDE, all_model_bics, manual_hide_names, global_warnings)
+                FILTER_NAME_MANUAL_HIDE, manual_hide_bics, manual_hide_names, global_warnings)
 
         t0.Commit()
     except Exception:
