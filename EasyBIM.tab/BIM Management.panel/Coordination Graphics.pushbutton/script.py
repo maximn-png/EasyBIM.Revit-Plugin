@@ -649,17 +649,32 @@ PICKER_XAML = u"""
     <ScrollViewer Grid.Row="3" VerticalScrollBarVisibility="Auto" Padding="20,6,20,6">
       <Grid>
 
-        <!-- STEP 1: ACTIVE VIEW -->
+        <!-- STEP 1: SELECT VIEWS (batch mode) -->
         <StackPanel x:Name="Step1Panel">
           <Border Style="{StaticResource Card}">
             <StackPanel>
-              <TextBlock Text="ACTIVE VIEW" Style="{StaticResource SectionLabel}"/>
-              <TextBlock x:Name="ViewNameText" FontSize="14" FontWeight="Bold" Foreground="#1e248c"/>
-              <TextBlock x:Name="ViewTypeText" FontSize="11.5" Foreground="#6b7280" Margin="0,4,0,0"/>
-              <TextBlock x:Name="ViewLevelText" FontSize="11.5" Foreground="#6b7280" Margin="0,2,0,0"/>
-              <TextBlock x:Name="ViewBasementText" FontSize="11.5" Foreground="#c8850d" Margin="0,8,0,0" TextWrapping="Wrap"/>
+              <Grid>
+                <Grid.ColumnDefinitions>
+                  <ColumnDefinition Width="*"/>
+                  <ColumnDefinition Width="Auto"/>
+                </Grid.ColumnDefinitions>
+                <TextBlock Grid.Column="0" Text="VIEWS TO PROCESS (SELECT ONE OR MORE)"
+                           Style="{StaticResource SectionLabel}" VerticalAlignment="Center"/>
+                <StackPanel Grid.Column="1" Orientation="Horizontal">
+                  <TextBlock x:Name="ViewSelectAll" Text="Select All" FontSize="10"
+                             Foreground="#1e248c" Cursor="Hand" TextDecorations="Underline" Margin="0,0,10,0"/>
+                  <TextBlock x:Name="ViewSelectNone" Text="Clear" FontSize="10"
+                             Foreground="#6b7280" Cursor="Hand" TextDecorations="Underline"/>
+                </StackPanel>
+              </Grid>
+              <TextBlock TextWrapping="Wrap" FontSize="10.5" Foreground="#8b93a7" Margin="0,4,0,8"
+                         Text="The active view is pre-checked. Every checked view is set up with the SAME Architecture/Structure/Traffic links chosen in the next step."/>
+              <ScrollViewer MaxHeight="280" VerticalScrollBarVisibility="Auto">
+                <StackPanel x:Name="ViewsPanel"/>
+              </ScrollViewer>
             </StackPanel>
           </Border>
+          <TextBlock x:Name="Step1Error" Foreground="#d64545" FontSize="11.5" TextWrapping="Wrap"/>
         </StackPanel>
 
         <!-- STEP 2: SELECT LINKS -->
@@ -779,32 +794,45 @@ def _brush(hex_color):
     return WM.BrushConverter().ConvertFromString(hex_color)
 
 
-STEP_LABELS = (u"Active View", u"Select Links", u"Options", u"Final Summary")
+STEP_LABELS = (u"Select Views", u"Select Links", u"Options", u"Final Summary")
 
 
 class LinkPickerDialog(object):
-    """4-step wizard: Active View -> Select Links -> Options/Traffic -> Summary.
-    Architecture and Structure each support selecting multiple links.
+    """4-step wizard: Select Views -> Select Links -> Options/Traffic -> Summary.
+    Architecture and Structure each support selecting multiple links, and
+    (added 2026-08-31, batch mode) Step 1 supports selecting multiple VIEWS
+    to process — every checked view shares the SAME Architecture/Structure/
+    Traffic link selection from Step 2/3. That's a deliberate simplification,
+    not an oversight: a project can have per-building link files (e.g.
+    BLD_5 vs BLD_7), so one global selection can be wrong for some of the
+    chosen views — accepted per explicit instruction ("worst case, re-run"
+    for whichever view needed different links) rather than building
+    per-view smart link matching.
     defaults = {'arch': (list_of_names, source_label), 'struct': (...),
     'traffic': (name_or_None, source_label), 'use_traffic': bool}"""
 
-    def __init__(self, links, defaults, view_info, scope_boxes):
+    def __init__(self, links, defaults, view_info, scope_boxes, batch_views, active_view):
         self.links         = links
         self.defaults      = defaults
         self.view_info     = view_info
         self.scope_boxes   = scope_boxes
+        self.batch_views   = batch_views
+        self.active_view   = active_view
         self.cancelled     = True
         self.arch_links    = []
         self.struct_links  = []
         self.traffic_link  = None
         self.use_traffic   = False
         self.scope_box     = None
+        self.selected_views      = []
         self.arch_linked_view    = None
         self.struct_linked_view  = None
         self.traffic_linked_view = None
         self._window       = None
         self._by_name      = {}
         self._scope_by_name = {}
+        self._view_by_name  = {}
+        self._view_checks   = []
         self._arch_checks  = []
         self._struct_checks = []
         self._arch_view_by_label    = {}
@@ -818,16 +846,22 @@ class LinkPickerDialog(object):
         self._window = window
         w = window
 
-        # Step 1 — active view summary
-        w.FindName(u"ViewNameText").Text  = self.view_info.get(u"name", u"")
-        w.FindName(u"ViewTypeText").Text  = u"Type: {}".format(self.view_info.get(u"view_type", u""))
-        w.FindName(u"ViewLevelText").Text = u"Level: {}".format(self.view_info.get(u"level", u"—"))
-        if self.view_info.get(u"basement"):
-            w.FindName(u"ViewBasementText").Text = (
-                u"Detected as a basement view — imported DWGs containing “TR” will "
-                u"stay visible inside the links.")
-        else:
-            w.FindName(u"ViewBasementText").Text = u""
+        # Step 1 — views to process (multi-select, batch mode). Only the
+        # active view is pre-checked, matching the tool's original
+        # single-view behavior by default; checking more views applies the
+        # SAME Step 2/3 choices to every one of them.
+        view_names = sorted((bv[u"name"] for bv in self.batch_views), key=lambda n: n.upper())
+        view_by_name = {}
+        for bv in self.batch_views:
+            view_by_name.setdefault(bv[u"name"], bv)
+        self._view_by_name = view_by_name
+        active_name = self.view_info.get(u"name", u"")
+        self._view_checks = self._build_checklist(u"ViewsPanel", view_names, [active_name])
+
+        w.FindName(u"ViewSelectAll").MouseLeftButtonUp += (
+            lambda s, e: self._set_all_checked(self._view_checks, True))
+        w.FindName(u"ViewSelectNone").MouseLeftButtonUp += (
+            lambda s, e: self._set_all_checked(self._view_checks, False))
 
         # Step 2 — link checklists (multi-select). Nested links (see
         # get_all_link_instances' is_nested docstring) are excluded from
@@ -981,8 +1015,9 @@ class LinkPickerDialog(object):
                                             else System.Windows.Visibility.Collapsed)
 
         info = {
-            1: u"This tool modifies the ACTIVE view's visibility, categories, filters and view "
-               u"template — confirm you're on the right view before continuing.",
+            1: u"Check every view you want set up with the SAME Architecture/Structure/Traffic "
+               u"links chosen next — the active view is pre-checked. If one view actually needs "
+               u"different links, just run this tool again for that view alone afterward.",
             2: u"Pick one or more Architecture links and one or more Structure links. Pre-checked "
                u"from your last run or auto-detected by keyword — change either if needed. Each "
                u"card also shows a matching linked view (by level elevation) for reference — it "
@@ -1040,7 +1075,8 @@ class LinkPickerDialog(object):
         traffic_view = (w.FindName(u"TrafficLinkedViewCombo").SelectedItem or NONE_LINKED_VIEW_LABEL
                         if use_traffic else None)
 
-        w.FindName(u"SumView").Text    = u"Active view: {}".format(self.view_info.get(u"name", u""))
+        view_names_checked = self._checked_names(self._view_checks)
+        w.FindName(u"SumView").Text    = u"View(s): {}".format(u", ".join(view_names_checked) or u"—")
         w.FindName(u"SumArch").Text    = u"Architecture link(s): {} — linked view: {}".format(
             u", ".join(arch_names) or u"—", arch_view)
         w.FindName(u"SumStruct").Text  = u"Structure link(s): {} — linked view: {}".format(
@@ -1056,7 +1092,14 @@ class LinkPickerDialog(object):
     def _on_next(self, sender, e):
         w = self._window
 
-        if self._step == 2:
+        if self._step == 1:
+            err = w.FindName(u"Step1Error")
+            if not self._checked_names(self._view_checks):
+                err.Text = u"Select at least one view to process."
+                return
+            err.Text = u""
+
+        elif self._step == 2:
             err = w.FindName(u"Step2Error")
             arch_names   = self._checked_names(self._arch_checks)
             struct_names = self._checked_names(self._struct_checks)
@@ -1093,12 +1136,14 @@ class LinkPickerDialog(object):
 
     def _finish(self):
         w = self._window
+        view_names   = self._checked_names(self._view_checks)
         arch_names   = self._checked_names(self._arch_checks)
         struct_names = self._checked_names(self._struct_checks)
         use_traffic  = bool(w.FindName(u"TrafficCheck").IsChecked)
         traffic_name = w.FindName(u"TrafficCombo").SelectedItem if use_traffic else None
         scope_name   = w.FindName(u"ScopeBoxCombo").SelectedItem
 
+        self.selected_views = [self._view_by_name[n][u"view"] for n in view_names]
         self.arch_links    = [self._by_name[n] for n in arch_names]
         self.struct_links  = [self._by_name[n] for n in struct_names]
         self.traffic_link  = self._by_name[traffic_name] if (use_traffic and traffic_name) else None
@@ -1432,6 +1477,43 @@ def get_view_and_validate():
         )
         return None
     return view
+
+
+def get_eligible_views_for_batch(active_view):
+    """Every non-template ViewPlan in the project (Floor/Ceiling/Area/
+    Engineering Plan — same eligibility as get_view_and_validate's single-
+    view check), for Step 1's multi-select batch checklist. One dict per
+    view: {'view':, 'name':}. active_view is always included even if, for
+    some reason, the general collector wouldn't otherwise surface it, so
+    the pre-checked default never comes up empty."""
+    seen_ids = set()
+    out = []
+    try:
+        all_views = list(DB.FilteredElementCollector(doc).OfClass(DB.ViewPlan))
+    except Exception:
+        all_views = []
+    for v in all_views:
+        try:
+            if v.IsTemplate:
+                continue
+        except Exception:
+            continue
+        try:
+            vid = v.Id.IntegerValue
+        except Exception:
+            continue
+        if vid in seen_ids:
+            continue
+        seen_ids.add(vid)
+        out.append({u"view": v, u"name": _elem_name(v) or u"?"})
+    if active_view is not None:
+        try:
+            aid = active_view.Id.IntegerValue
+        except Exception:
+            aid = None
+        if aid is not None and aid not in seen_ids:
+            out.append({u"view": active_view, u"name": _elem_name(active_view) or u"?"})
+    return out
 
 
 def is_basement_view(view):
@@ -3246,8 +3328,8 @@ def _create_and_place_sheet(view_for_sheet, view_name, titleblock_symbol, warnin
 # ─────────────────────────────────────────────────────────────────────────────
 
 def run():
-    view = get_view_and_validate()
-    if view is None:
+    active_view = get_view_and_validate()
+    if active_view is None:
         return
 
     settings = cfgmod.load_settings()
@@ -3284,30 +3366,32 @@ def run():
     use_traffic_default = bool(memory.get(u"use_traffic")) and traffic_default[0] is not None
 
     try:
-        host_level_obj = view.GenLevel
+        host_level_obj = active_view.GenLevel
     except Exception:
         host_level_obj = None
     level_name = u"—"
     if host_level_obj is not None:
         level_name = _elem_name(host_level_obj) or u"—"
     view_info = {
-        u"name"     : _elem_name(view),
-        u"view_type": view.ViewType.ToString(),
+        u"name"     : _elem_name(active_view),
+        u"view_type": active_view.ViewType.ToString(),
         u"level"    : level_name,
         u"level_obj": host_level_obj,
-        u"basement" : is_basement_view(view),
+        u"basement" : is_basement_view(active_view),
     }
 
     scope_boxes = get_all_scope_boxes()
+    batch_views = get_eligible_views_for_batch(active_view)
 
     dlg = LinkPickerDialog(links, {
         u"arch": arch_default, u"struct": struct_default, u"traffic": traffic_default,
         u"use_traffic": use_traffic_default,
-    }, view_info, scope_boxes)
+    }, view_info, scope_boxes, batch_views, active_view)
     dlg.show()
     if dlg.cancelled:
         return
 
+    selected_views = dlg.selected_views or [active_view]
     arch_links, struct_links = dlg.arch_links, dlg.struct_links
     traffic_link, use_traffic = dlg.traffic_link, dlg.use_traffic
     scope_box = dlg.scope_box
@@ -3316,8 +3400,8 @@ def run():
     traffic_linked_view = dlg.traffic_linked_view
 
     # Settings may have been edited mid-wizard via the gear icon — reload so
-    # the transaction below (colors, patterns, concrete/exclude keywords)
-    # uses whatever is currently saved, not the snapshot from before dlg.show().
+    # the transactions below (colors, patterns, concrete/exclude keywords)
+    # use whatever is currently saved, not the snapshot from before dlg.show().
     settings = cfgmod.load_settings()
 
     cfgmod.save_link_memory(doc, {
@@ -3327,140 +3411,69 @@ def run():
         u"use_traffic": use_traffic,
     })
 
-    warnings = []
+    global_warnings = []
     chosen_ids = set(li[u"id"].IntegerValue for li in arch_links)
     chosen_ids |= set(li[u"id"].IntegerValue for li in struct_links)
     if use_traffic and traffic_link:
         chosen_ids.add(traffic_link[u"id"].IntegerValue)
 
-    # Resolved before the transaction (like the link picker) since it may
+    # Resolved before any transaction (like the link picker) since it may
     # show a forms.SelectFromList prompt. None just means sheet creation is
     # skipped later — it never blocks the graphics/template/filter work.
-    titleblock_symbol = find_title_block_symbol(warnings)
+    titleblock_symbol = find_title_block_symbol(global_warnings)
 
-    t = DB.Transaction(doc, u"EasyBIM: Coordination Graphics")
-    t.Start()
+    host_clutter_bics = _resolve_categories(HOST_CLUTTER_CATEGORY_NAMES, global_warnings)
+    link_model_bics   = _resolve_categories(LINK_MODEL_HIDE_CATEGORY_NAMES, global_warnings)
+    wallnoncore_bics  = _resolve_categories([WALL_NONCORE_CATEGORY_NAME], global_warnings)
+    annotation_bics   = _resolve_categories(LINK_ANNOTATION_HIDE_CATEGORY_NAMES, global_warnings)
+    override_bics     = _resolve_categories(OVERRIDE_CATEGORY_NAMES, global_warnings)
+    traffic_keep_bics = set(_resolve_categories(TRAFFIC_KEEP_CATEGORY_NAMES, global_warnings))
+
+    # ── Shared setup (batch mode, added 2026-08-31): the deep-scan (Step 8)
+    # reads the SELECTED LINKS' own documents directly — completely
+    # independent of which host view is being processed — and the two
+    # colored View Filters (FILTER_NAME_STRUCT/FILTER_NAME_ARCH) are shared
+    # Document elements applied to the ONE shared "Coordination - Arch vs
+    # Str" template every selected view ends up using. So all of this is
+    # computed ONCE here, not once per view — running N redundant deep-
+    # scans of the exact same links for N selected views would be pure
+    # waste. Runs in its own transaction, committed before the per-view
+    # loop, so a later per-view failure can never roll back this shared
+    # setup work.
+    t0 = DB.Transaction(doc, u"EasyBIM: Coordination Graphics — shared setup")
+    t0.Start()
     try:
         # URGENT, runs first, before anything else: delete any
         # crash-causing whitelist filters a prior run already created (see
         # _cleanup_stale_whitelist_filters) — confirmed to crash Revit when
         # the user opens the Filters tab of a View/Template Properties
-        # dialog. Placed at the very top so this cleanup happens even if
-        # something later in this transaction fails.
-        _cleanup_stale_whitelist_filters(warnings)
+        # dialog.
+        _cleanup_stale_whitelist_filters(global_warnings)
+        _cleanup_stale_column_filters(global_warnings)
 
-        # Unassign any template already active on this view FIRST. Two
-        # reasons: (1) the original spec requirement — an active template
-        # blocks manual per-view overrides; (2) View.CreateViewTemplate()
-        # can fail (View.IsViewValidForTemplateCreation() == False) when the
-        # view already has a template controlling it, which is the likely
-        # cause if template setup below ever needs its fallback path.
-        try:
-            if view.ViewTemplateId != DB.ElementId.InvalidElementId:
-                view.ViewTemplateId = DB.ElementId.InvalidElementId
-        except Exception as ex:
-            warnings.append(u"Could not clear the view's existing template: {}".format(ex))
-
-        # Scope box crop, if one was picked — applied directly to the working
-        # view (same place colors/hides get applied); if a duplicate is later
-        # needed for the sheet (view already on one), Duplicate(WithDetailing)
-        # carries the crop over the same way it carries everything else.
-        apply_scope_box(view, scope_box, warnings)
-
-        host_clutter_bics = _resolve_categories(HOST_CLUTTER_CATEGORY_NAMES, warnings)
-        link_model_bics   = _resolve_categories(LINK_MODEL_HIDE_CATEGORY_NAMES, warnings)
-        wallnoncore_bics  = _resolve_categories([WALL_NONCORE_CATEGORY_NAME], warnings)
-        annotation_bics   = _resolve_categories(LINK_ANNOTATION_HIDE_CATEGORY_NAMES, warnings)
-        override_bics     = _resolve_categories(OVERRIDE_CATEGORY_NAMES, warnings)
-        traffic_keep_bics = set(_resolve_categories(TRAFFIC_KEEP_CATEGORY_NAMES, warnings))
-
-        # ── Step 3: shared view template (host clutter + Step 6 categories) ────
-        # ensure_view_template() never returns None — on any failure it falls
-        # back to configuring the active view directly instead of aborting
-        # the whole command (see its docstring).
-        template = ensure_view_template(view, host_clutter_bics, link_model_bics,
-                                         wallnoncore_bics, annotation_bics,
-                                         override_bics, warnings)
-
-        # ── Refinement 1: host Grids hidden (element-level — see docstring) ────
-        _hide_host_grids(view, warnings)
-
-        # ── Step 6 (DWGs): hide imported DWG categories inside Arch/Struct ─────
-        basement = is_basement_view(view)
-        for li in arch_links:
-            _hide_dwg_imports_in_link(view, li, basement, warnings)
-        for li in struct_links:
-            _hide_dwg_imports_in_link(view, li, basement, warnings)
-
-        # ── Step 7: Traffic link ────────────────────────────────────────────────
-        # Element-level hide runs BEFORE the display-mode switch (Custom)
-        # now, not after — reordered to test a real possibility raised by a
-        # large "could not be hidden" count in live testing:
-        # CanBeHidden/HideElements for cross-document elements might behave
-        # differently once the link has already left ByHostView mode.
-        # Low-risk either way (doesn't change what ends up hidden if this
-        # wasn't the cause), and arguably more correct regardless: hide the
-        # elements while the link is still in its simplest, default state.
-        traffic_summary = None
+        # Smart Linked View: Architecture/Structure/Traffic Coarse-detail
+        # warnings only (see _apply_smart_linked_view's docstring) — these
+        # describe the LINKED view's own detail level, not anything about
+        # the host view(s), so they only need to run once regardless of
+        # how many views are selected.
+        _apply_smart_linked_view(arch_linked_view, global_warnings, u"Architecture")
+        _apply_smart_linked_view(struct_linked_view, global_warnings, u"Structure")
         if use_traffic and traffic_link:
-            traffic_summary = _restrict_traffic_link_visibility(
-                view, traffic_link, traffic_keep_bics, warnings)
-            _ensure_linked_view_detail_level(traffic_linked_view, warnings, u"Traffic")
-            # REVERSED AGAIN, by explicit informed decision: two rounds ago
-            # this was hardcoded to None because ByLinkView mode shows that
-            # view's own dimensions/annotations, which was very likely
-            # causing "Traffic dimensions still visible." That risk only
-            # applies if the picked view ISN'T actually clean. Confirmed
-            # directly with the user this time: the traffic/civil
-            # consultant's own file has a dedicated view with EVERYTHING
-            # except Parking hidden — model AND annotation categories both,
-            # not just 3D content. Given that, ByLinkView pointed at THAT
-            # view is the more reliable mechanism (relies on the
-            # consultant's own validated setup instead of this tool
-            # guessing categories from the host side), not a regression.
-            # This does NOT apply to Architecture/Structure — those still
-            # never get ByLinkView (see _apply_smart_linked_view), because
-            # ByLinkView would replace this tool's own red/blue View
-            # Filters with that view's filters, which Traffic never had in
-            # the first place (its coloring is host-view-only halftone).
-            traffic_view_id = traffic_linked_view[u"view"].Id if traffic_linked_view else None
-            # Targets `view` directly, NOT `template` (changed 2026-08-30) —
-            # see _ensure_rvt_links_not_template_controlled's docstring:
-            # writing link display settings to the template while "V/G
-            # Overrides RVT Links" was template-controlled is what broke
-            # Step 5's per-view link hides. Duplicate(WithDetailing), used
-            # for a sheet's copy (_get_view_for_sheet), already carries this
-            # view-specific setting over on its own — no template needed.
-            _apply_link_display_settings(view, traffic_link[u"id"], traffic_view_id, warnings, u"Traffic")
-            _set_traffic_halftone(view, traffic_link, warnings)
-
-        # ── Smart Linked View: Architecture/Structure (optional, per role) ─────
-        # By explicit user decision, the chosen view's cut plane is NOT
-        # applied to these links — only ByLinkView mode can carry a
-        # LinkedViewId at all (confirmed via a live exception), and
-        # ByLinkView replaces the host's View Filters with that view's own
-        # for the link, which would silently break this tool's red/blue
-        # coloring. See _apply_smart_linked_view's docstring. Both links
-        # stay on ByHostView (the default) regardless of what was picked —
-        # only the Coarse-detail-level warning still fires from here.
-        _apply_smart_linked_view(arch_linked_view, warnings, u"Architecture")
-        _apply_smart_linked_view(struct_linked_view, warnings, u"Structure")
+            _ensure_linked_view_detail_level(traffic_linked_view, global_warnings, u"Traffic")
 
         # ── Step 8: deep-scan (every selected link, per role) + View Filters ───
         arch_names = set()
         arch_guids = {}
         for li in arch_links:
             arch_names |= _collect_concrete_type_names(
-                li[u"doc"], override_bics, settings, warnings,
+                li[u"doc"], override_bics, settings, global_warnings,
                 u"Architecture ({})".format(li[u"name"]), guids_by_name=arch_guids)
         struct_names = set()
         struct_guids = {}
         for li in struct_links:
             struct_names |= _collect_concrete_type_names(
-                li[u"doc"], override_bics, settings, warnings,
+                li[u"doc"], override_bics, settings, global_warnings,
                 u"Structure ({})".format(li[u"name"]), guids_by_name=struct_guids)
-
-        _cleanup_stale_column_filters(warnings)
 
         # A type name found in BOTH links' scans can't be told apart by a
         # plain "Type Name equals" rule (a Filter Rule never sees which
@@ -3485,7 +3498,7 @@ def run():
                     else:
                         missing.append(n)
                 if missing:
-                    warnings.append(
+                    global_warnings.append(
                         u"{}: could not read Type IfcGUID for shared type name(s) {} — "
                         u"excluded from coloring on this side to avoid mis-coloring. "
                         u"Rename the type distinctly in the source file to resolve "
@@ -3494,189 +3507,239 @@ def run():
 
             arch_guid_values = _guids_for(ambiguous_names, arch_guids, u"Architecture")
             struct_guid_values = _guids_for(ambiguous_names, struct_guids, u"Structure")
-            warnings.append(
+            global_warnings.append(
                 u"Type name(s) shared by both Architecture and Structure links: {} — "
                 u"disambiguated via each type's own Type IfcGUID instead of Type Name. "
                 u"Consider renaming one side's type distinctly to remove the ambiguity "
                 u"permanently.".format(u", ".join(sorted(ambiguous_names))))
 
         struct_pfe = build_or_update_type_name_filter(
-            FILTER_NAME_STRUCT, override_bics, struct_safe_names, warnings, struct_guid_values)
+            FILTER_NAME_STRUCT, override_bics, struct_safe_names, global_warnings, struct_guid_values)
         arch_pfe   = build_or_update_type_name_filter(
-            FILTER_NAME_ARCH, override_bics, arch_safe_names, warnings, arch_guid_values)
+            FILTER_NAME_ARCH, override_bics, arch_safe_names, global_warnings, arch_guid_values)
 
         struct_color = _settings_color(settings, u"StructColor", DB.Color(200, 30, 30))
         arch_color   = _settings_color(settings, u"ArchColor", DB.Color(0, 70, 200))
 
         struct_ogs = build_colored_override(struct_color, settings.get(u"StructPatternName"),
-                                             warnings, u"Structure")
+                                             global_warnings, u"Structure")
         arch_ogs   = build_colored_override(arch_color, settings.get(u"ArchPatternName"),
-                                             warnings, u"Architecture")
+                                             global_warnings, u"Architecture")
+        struct_grid_ogs = build_grid_line_override(struct_color, global_warnings, u"Structure")
+        arch_grid_ogs   = build_grid_line_override(arch_color, global_warnings, u"Architecture")
 
-        apply_filter_to_target(template, struct_pfe, struct_ogs, warnings, u"Structure")
-        apply_filter_to_target(template, arch_pfe, arch_ogs, warnings, u"Architecture")
-
-        # ── Refinement 1: color Grids inside every selected Arch/Struct link ───
-        # struct_ogs/arch_ogs are Cut-only now (see build_colored_override) —
-        # Grids have no Cut representation, so they need their own minimal
-        # projection-line override instead (see build_grid_line_override).
-        struct_grid_ogs = build_grid_line_override(struct_color, warnings, u"Structure")
-        arch_grid_ogs   = build_grid_line_override(arch_color, warnings, u"Architecture")
-        for li in struct_links:
-            _color_link_grids(view, li, struct_grid_ogs, warnings, u"Structure")
-        for li in arch_links:
-            _color_link_grids(view, li, arch_grid_ogs, warnings, u"Architecture")
-
-        # ── Refinement 2: automatic sheet creation ──────────────────────────────
-        sheet = None
-        if titleblock_symbol is not None:
-            view_for_sheet = _get_view_for_sheet(view, template, warnings)
-            if view_for_sheet is not None:
-                sheet = _create_and_place_sheet(view_for_sheet, _elem_name(view_for_sheet),
-                                                 titleblock_symbol, warnings)
-
-        # ── Step 5: hide every other link (e.g. MEP) ────────────────────────────
-        # MOVED HERE, to run LAST (2026-08-30) — was originally right after
-        # Step 3 (template setup). ROOT CAUSE now understood and fixed at
-        # the source too (see _ensure_rvt_links_not_template_controlled and
-        # the module docstring's "WHY 'V/G OVERRIDES RVT LINKS' IS NOW KEPT
-        # *NOT* TEMPLATE-CONTROLLED"): that row being template-controlled
-        # made view-level per-link HideElements unreliable regardless of
-        # ordering — first "other" links silently came back visible by
-        # commit time, then (after moving this step to run last as a first
-        # attempted fix) a SELECTED link started getting hidden that was
-        # never even in this step's own target list. Both symptoms went
-        # away once the row was put back to NOT-template-controlled and
-        # Traffic's display settings were retargeted from `template` to
-        # `view`. Left running LAST anyway rather than moved back to its
-        # original spot — it already works here, the FINAL CHECK right
-        # before commit confirms it every run, and there's no real reason
-        # left to move it, only risk in doing so without a concrete benefit.
-        #
-        # other_link_ids is ALREADY a typed .NET List[ElementId] (SCG.List),
-        # not a plain Python list -- that's been true since this step was
-        # first written, not something this round changed. Every outcome
-        # (hidden / already-hidden / un-hideable / exception) is now named
-        # explicitly and folded into other_links_summary below, which the
-        # final TaskDialog prints unconditionally -- not just on failure --
-        # so "still visible" is checkable directly from the result dialog
-        # instead of needing to dig through warnings or guess.
-        other_link_ids = SCG.List[DB.ElementId]()
-        already_hidden_names = []
-        unhideable_names = []
-        for li in links:
-            if li[u"id"].IntegerValue in chosen_ids:
-                continue
-            try:
-                if li[u"instance"].IsHidden(view):
-                    already_hidden_names.append(li[u"name"])
-                    continue
-                if li[u"instance"].CanBeHidden(view):
-                    other_link_ids.Add(li[u"id"])
-                else:
-                    unhideable_names.append(li[u"name"])
-                    warnings.append(
-                        u"Link '{}' could not be hidden — Revit reports it as "
-                        u"un-hideable in this view (CanBeHidden=False), so it "
-                        u"remains visible.".format(li[u"name"]))
-            except Exception as ex:
-                unhideable_names.append(li[u"name"])
-                warnings.append(u"Could not hide link '{}': {}".format(li[u"name"], ex))
-
-        newly_hidden_count = 0
-        if other_link_ids.Count:
-            try:
-                view.HideElements(other_link_ids)
-                newly_hidden_count = other_link_ids.Count
-            except Exception as ex:
-                unhideable_names.extend(li[u"name"] for li in links
-                                         if li[u"id"].IntegerValue in
-                                         set(i.IntegerValue for i in other_link_ids))
-                warnings.append(u"Could not hide {} other link(s): {}".format(
-                    other_link_ids.Count, ex))
-
-            # Re-check IsHidden right after the call, per-link, instead of
-            # trusting "HideElements didn't throw" as proof it stuck — this
-            # is the one thing that can actually distinguish "the API call
-            # itself silently failed" from "it worked here, but you're
-            # looking at a different view/sheet than this tool ran on"
-            # (element hides are always per-view, never template-controlled
-            # — that's not fixable by any HideElements variant).
-            still_visible_after = []
-            for li in links:
-                if li[u"id"].IntegerValue in chosen_ids:
-                    continue
-                if li[u"name"] in already_hidden_names or li[u"name"] in unhideable_names:
-                    continue
-                try:
-                    if not li[u"instance"].IsHidden(view):
-                        still_visible_after.append(li[u"name"])
-                except Exception:
-                    pass
-            if still_visible_after:
-                newly_hidden_count -= len(still_visible_after)
-                warnings.append(
-                    u"HideElements reported success but IsHidden still shows FALSE right "
-                    u"after, for: {} — this points at a genuine API/Revit-version quirk, "
-                    u"not a 'wrong view' explanation, since this check runs against the "
-                    u"exact same view object the hide was just applied to.".format(
-                        u", ".join(still_visible_after)))
-
-        other_links_summary = u"Other links hidden: {} newly + {} already ({} total)".format(
-            newly_hidden_count, len(already_hidden_names),
-            newly_hidden_count + len(already_hidden_names))
-        if unhideable_names:
-            other_links_summary += u" — COULD NOT HIDE: {}".format(u", ".join(unhideable_names))
-        if duplicate_link_names:
-            other_links_summary += (
-                u"\nNOTE: these linked file(s) are placed as MORE THAN ONE separate "
-                u"instance in this model: {} — each instance is hidden/verified "
-                u"independently, so if the file still looks visible after this run, "
-                u"check whether every one of its instances actually got hidden.".format(
-                    u", ".join(duplicate_link_names)))
-
-        # FINAL re-verification, right before commit (added 2026-08-30) —
-        # Step 5 now runs LAST (see its own comment above, right after this
-        # was moved), specifically so nothing after it can still undo the
-        # hide before commit. This re-check is what proves that theory
-        # right or wrong on the very next run: empty here means the reorder
-        # fixed it; non-empty here means something UNRELATED to template
-        # writes is the real cause and the reorder didn't help.
-        final_still_visible = []
-        for li in links:
-            if li[u"id"].IntegerValue in chosen_ids:
-                continue
-            if li[u"name"] in unhideable_names:
-                continue
-            try:
-                if not li[u"instance"].IsHidden(view):
-                    final_still_visible.append(li[u"name"])
-            except Exception:
-                pass
-        if final_still_visible:
-            warnings.append(
-                u"FINAL CHECK (right before commit): these non-selected link(s) show as "
-                u"NOT hidden even though Step 5 reported success earlier in this same "
-                u"run: {} — something later in this transaction undid the hide. If this "
-                u"warning is ABSENT on a run where the link is still visible after "
-                u"closing this dialog, the hide is being lost after commit instead, not "
-                u"during it.".format(u", ".join(sorted(set(final_still_visible)))))
-
-        t.Commit()
+        t0.Commit()
     except Exception:
-        t.RollBack()
+        t0.RollBack()
         TaskDialog.Show(
             u"EasyBIM — Coordination Graphics — Error",
-            u"Coordination Graphics failed and no changes were made:\n\n{}".format(
+            u"Coordination Graphics failed during shared setup and no changes were made:\n\n{}".format(
                 traceback.format_exc())
         )
         return
 
-    # Deliberately NOT switching uidoc.ActiveView here — the sheet is created
-    # in the background and the user stays on whatever view they started on.
+    # ── Per-view processing (batch mode) ────────────────────────────────────
+    # Everything below is genuinely per-view: template assignment (each
+    # view needs its own ViewTemplateId set, even though the template
+    # ELEMENT itself is the same shared, reused object), scope box, host
+    # Grids hide, DWG-import hide, Traffic settings, grid coloring
+    # (View.SetElementOverrides is a per-view operation), sheet creation,
+    # and Step 5's hide-other-links + FINAL CHECK (both view-scoped). Each
+    # view gets its OWN Transaction, so one view's failure never rolls back
+    # another's already-committed results — matches the explicit "worst
+    # case, just re-run that one view" tolerance this batch mode was built
+    # around, instead of one giant all-or-nothing transaction.
+    view_results = []
+    for view in selected_views:
+        vr = {
+            u"name": _elem_name(view), u"warnings": [], u"sheet": None,
+            u"other_links_summary": u"", u"traffic_summary": None, u"error": None,
+        }
+        w = vr[u"warnings"]
+        t = DB.Transaction(doc, u"EasyBIM: Coordination Graphics — {}".format(vr[u"name"]))
+        t.Start()
+        try:
+            # Unassign any template already active on this view FIRST. Two
+            # reasons: (1) the original spec requirement — an active
+            # template blocks manual per-view overrides; (2)
+            # View.CreateViewTemplate() can fail when the view already has
+            # a template controlling it, which is the likely cause if
+            # template setup below ever needs its fallback path.
+            try:
+                if view.ViewTemplateId != DB.ElementId.InvalidElementId:
+                    view.ViewTemplateId = DB.ElementId.InvalidElementId
+            except Exception as ex:
+                w.append(u"Could not clear the view's existing template: {}".format(ex))
 
-    sheet_line = (u"Sheet: {} — {}".format(sheet.SheetNumber, _elem_name(sheet))
-                  if sheet is not None else u"Sheet: not created (see warnings)")
+            # Scope box crop, if one was picked — applied identically to
+            # every selected view. If different views need different crops
+            # (e.g. different buildings), pick no scope box here and crop
+            # manually afterward, or run this tool again per view.
+            apply_scope_box(view, scope_box, w)
+
+            # ── Step 3: shared view template (host clutter + Step 6 categories) ────
+            # ensure_view_template() never returns None — on any failure it
+            # falls back to configuring the active view directly instead of
+            # aborting. Finds the SAME template by name on every call after
+            # the first, so re-running the category setup per view is safe
+            # (idempotent) even though it's mildly redundant.
+            template = ensure_view_template(view, host_clutter_bics, link_model_bics,
+                                             wallnoncore_bics, annotation_bics,
+                                             override_bics, w)
+
+            apply_filter_to_target(template, struct_pfe, struct_ogs, w, u"Structure")
+            apply_filter_to_target(template, arch_pfe, arch_ogs, w, u"Architecture")
+
+            # ── Refinement 1: host Grids hidden (element-level — see docstring) ────
+            _hide_host_grids(view, w)
+
+            # ── Step 6 (DWGs): hide imported DWG categories inside Arch/Struct ─────
+            basement = is_basement_view(view)
+            for li in arch_links:
+                _hide_dwg_imports_in_link(view, li, basement, w)
+            for li in struct_links:
+                _hide_dwg_imports_in_link(view, li, basement, w)
+
+            # ── Step 7: Traffic link ─────────────────────────────────────────────
+            if use_traffic and traffic_link:
+                vr[u"traffic_summary"] = _restrict_traffic_link_visibility(
+                    view, traffic_link, traffic_keep_bics, w)
+                traffic_view_id = traffic_linked_view[u"view"].Id if traffic_linked_view else None
+                # Targets `view` directly, NOT `template` — see
+                # _ensure_rvt_links_not_template_controlled's docstring:
+                # writing link display settings to the template while
+                # "V/G Overrides RVT Links" was template-controlled is what
+                # broke Step 5's per-view link hides. Duplicate
+                # (WithDetailing), used for a sheet's copy
+                # (_get_view_for_sheet), already carries this view-specific
+                # setting over on its own — no template needed.
+                _apply_link_display_settings(view, traffic_link[u"id"], traffic_view_id, w, u"Traffic")
+                _set_traffic_halftone(view, traffic_link, w)
+
+            # ── Refinement 1: color Grids inside every selected Arch/Struct link ───
+            # View.SetElementOverrides is per-view, so this can't be hoisted
+            # into the shared setup above even though the OGS objects
+            # (struct_grid_ogs/arch_grid_ogs) themselves are.
+            for li in struct_links:
+                _color_link_grids(view, li, struct_grid_ogs, w, u"Structure")
+            for li in arch_links:
+                _color_link_grids(view, li, arch_grid_ogs, w, u"Architecture")
+
+            # ── Refinement 2: automatic sheet creation ──────────────────────────
+            if titleblock_symbol is not None:
+                view_for_sheet = _get_view_for_sheet(view, template, w)
+                if view_for_sheet is not None:
+                    vr[u"sheet"] = _create_and_place_sheet(
+                        view_for_sheet, _elem_name(view_for_sheet), titleblock_symbol, w)
+
+            # ── Step 5: hide every other link (e.g. MEP) ────────────────────────
+            # Runs LAST, after the template/filter work above — see the
+            # module docstring's "WHY 'V/G OVERRIDES RVT LINKS' IS NOW KEPT
+            # *NOT* TEMPLATE-CONTROLLED" for why order matters here.
+            # other_link_ids is ALREADY a typed .NET List[ElementId]
+            # (SCG.List), not a plain Python list. Every outcome (hidden /
+            # already-hidden / un-hideable / exception) is named explicitly
+            # and folded into other_links_summary below, which the final
+            # TaskDialog prints unconditionally -- not just on failure --
+            # so "still visible" is checkable directly from the result
+            # dialog instead of needing to dig through warnings or guess.
+            other_link_ids = SCG.List[DB.ElementId]()
+            already_hidden_names = []
+            unhideable_names = []
+            for li in links:
+                if li[u"id"].IntegerValue in chosen_ids:
+                    continue
+                try:
+                    if li[u"instance"].IsHidden(view):
+                        already_hidden_names.append(li[u"name"])
+                        continue
+                    if li[u"instance"].CanBeHidden(view):
+                        other_link_ids.Add(li[u"id"])
+                    else:
+                        unhideable_names.append(li[u"name"])
+                        w.append(
+                            u"Link '{}' could not be hidden — Revit reports it as "
+                            u"un-hideable in this view (CanBeHidden=False), so it "
+                            u"remains visible.".format(li[u"name"]))
+                except Exception as ex:
+                    unhideable_names.append(li[u"name"])
+                    w.append(u"Could not hide link '{}': {}".format(li[u"name"], ex))
+
+            newly_hidden_count = 0
+            if other_link_ids.Count:
+                try:
+                    view.HideElements(other_link_ids)
+                    newly_hidden_count = other_link_ids.Count
+                except Exception as ex:
+                    unhideable_names.extend(li[u"name"] for li in links
+                                             if li[u"id"].IntegerValue in
+                                             set(i.IntegerValue for i in other_link_ids))
+                    w.append(u"Could not hide {} other link(s): {}".format(
+                        other_link_ids.Count, ex))
+
+                still_visible_after = []
+                for li in links:
+                    if li[u"id"].IntegerValue in chosen_ids:
+                        continue
+                    if li[u"name"] in already_hidden_names or li[u"name"] in unhideable_names:
+                        continue
+                    try:
+                        if not li[u"instance"].IsHidden(view):
+                            still_visible_after.append(li[u"name"])
+                    except Exception:
+                        pass
+                if still_visible_after:
+                    newly_hidden_count -= len(still_visible_after)
+                    w.append(
+                        u"HideElements reported success but IsHidden still shows FALSE right "
+                        u"after, for: {} — this points at a genuine API/Revit-version quirk, "
+                        u"not a 'wrong view' explanation, since this check runs against the "
+                        u"exact same view object the hide was just applied to.".format(
+                            u", ".join(still_visible_after)))
+
+            other_links_summary = u"Other links hidden: {} newly + {} already ({} total)".format(
+                newly_hidden_count, len(already_hidden_names),
+                newly_hidden_count + len(already_hidden_names))
+            if unhideable_names:
+                other_links_summary += u" — COULD NOT HIDE: {}".format(u", ".join(unhideable_names))
+            if duplicate_link_names:
+                other_links_summary += (
+                    u"\nNOTE: these linked file(s) are placed as MORE THAN ONE separate "
+                    u"instance in this model: {} — each instance is hidden/verified "
+                    u"independently, so if the file still looks visible after this run, "
+                    u"check whether every one of its instances actually got hidden.".format(
+                        u", ".join(duplicate_link_names)))
+            vr[u"other_links_summary"] = other_links_summary
+
+            # FINAL re-verification, right before commit — proves whether
+            # something later in THIS view's own transaction undid the
+            # hide above.
+            final_still_visible = []
+            for li in links:
+                if li[u"id"].IntegerValue in chosen_ids:
+                    continue
+                if li[u"name"] in unhideable_names:
+                    continue
+                try:
+                    if not li[u"instance"].IsHidden(view):
+                        final_still_visible.append(li[u"name"])
+                except Exception:
+                    pass
+            if final_still_visible:
+                w.append(
+                    u"FINAL CHECK (right before commit): these non-selected link(s) show as "
+                    u"NOT hidden even though Step 5 reported success earlier in this same "
+                    u"run: {} — something later in this transaction undid the hide.".format(
+                        u", ".join(sorted(set(final_still_visible)))))
+
+            t.Commit()
+        except Exception:
+            t.RollBack()
+            vr[u"error"] = traceback.format_exc()
+        view_results.append(vr)
+
+    # Deliberately NOT switching uidoc.ActiveView here — sheets are created
+    # in the background and the user stays on whatever view they started on.
 
     def _names_preview(names, limit=15):
         # Named directly in the result dialog, not just a count — so
@@ -3691,30 +3754,51 @@ def run():
             shown += u", +{} more (see pyRevit log for the full list)".format(len(names) - limit)
         return shown
 
-    summary = (
-        u"Coordination graphics applied.\n\n"
+    header = (
+        u"Coordination graphics applied to {} view(s): {}.\n\n"
         u"Architecture link(s): {}\nStructure link(s): {}\nTraffic link: {}\n\n"
         u"Architecture concrete types found: {} — {}\n"
-        u"Structure concrete types found: {} — {}\n\n"
-        u"{}\n{}\n\n"
-        u"{}".format(
+        u"Structure concrete types found: {} — {}".format(
+            len(view_results), u", ".join(vr[u"name"] for vr in view_results),
             u", ".join(li[u"name"] for li in arch_links),
             u", ".join(li[u"name"] for li in struct_links),
             traffic_link[u"name"] if (use_traffic and traffic_link) else u"(not used)",
             len(arch_names), _names_preview(arch_names),
-            len(struct_names), _names_preview(struct_names),
-            other_links_summary,
-            traffic_summary or u"Traffic link: (not used)",
-            sheet_line)
+            len(struct_names), _names_preview(struct_names))
     )
-    if warnings:
-        TaskDialog.Show(
-            u"EasyBIM — Coordination Graphics — Done, with warnings",
-            u"{}\n\n{} warning(s):\n{}".format(
-                summary, len(warnings), u"\n".join(u"• {}".format(w) for w in warnings))
-        )
-    else:
-        TaskDialog.Show(u"EasyBIM — Coordination Graphics — Done", summary)
+
+    per_view_blocks = []
+    total_warnings = len(global_warnings)
+    any_errors = False
+    for vr in view_results:
+        if vr[u"error"] is not None:
+            any_errors = True
+            per_view_blocks.append(
+                u"— {} — FAILED, no changes made for this view:\n{}".format(
+                    vr[u"name"], vr[u"error"]))
+            continue
+        sheet_line = (u"Sheet: {} — {}".format(vr[u"sheet"].SheetNumber, _elem_name(vr[u"sheet"]))
+                      if vr[u"sheet"] is not None else u"Sheet: not created (see warnings)")
+        block = u"— {} —\n{}\n{}\n{}".format(
+            vr[u"name"], vr[u"other_links_summary"],
+            vr[u"traffic_summary"] or u"Traffic link: (not used)", sheet_line)
+        if vr[u"warnings"]:
+            total_warnings += len(vr[u"warnings"])
+            block += u"\n{} warning(s):\n{}".format(
+                len(vr[u"warnings"]), u"\n".join(u"  • {}".format(x) for x in vr[u"warnings"]))
+        per_view_blocks.append(block)
+
+    body = header + u"\n\n" + u"\n\n".join(per_view_blocks)
+    if global_warnings:
+        body += u"\n\nShared setup warning(s):\n{}".format(
+            u"\n".join(u"• {}".format(x) for x in global_warnings))
+
+    title = u"EasyBIM — Coordination Graphics — Done"
+    if any_errors:
+        title = u"EasyBIM — Coordination Graphics — Done, with errors"
+    elif total_warnings:
+        title = u"EasyBIM — Coordination Graphics — Done, with warnings"
+    TaskDialog.Show(title, body)
 
 
 def main():
