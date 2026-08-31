@@ -280,7 +280,7 @@ FILTER_NAME_ARCH   = u"EasyBIM - Architecture Concrete"
 # rule, exactly like the two filters above, which have never crashed.
 FILTER_NAME_MANUAL_HIDE = u"EasyBIM - Manual Hide"
 
-# ── SECTIONS (added 2026-08-31, by explicit request) ────────────────────────
+# ── SECTIONS (added 2026-08-31, revised same day by explicit follow-up) ─────
 # A dedicated second template/filter set for Section views specifically
 # (ViewType.Section, not Elevation/Detail — see _is_section_view), almost
 # identical to the plan template but with three deliberate differences,
@@ -294,36 +294,45 @@ FILTER_NAME_MANUAL_HIDE = u"EasyBIM - Manual Hide"
 #      non-selected "other" link (fully hidden by Step 5), not given the
 #      Parking-only restriction plans get. See run()'s per-view chosen_ids.
 #   3. Structure's concrete hatch is UNCHANGED (still FILTER_NAME_STRUCT,
-#      red). Architecture's concrete is DELIBERATELY NOT touched by any
-#      filter or category override at all here, so it renders with
-#      whatever native Material appearance the Architecture link's own
-#      Type Properties define (confirmed by the user to typically be blue
-#      in their office's material library, but this doesn't hard-code that
-#      — it just gets out of the way and lets the source model's own
-#      graphics show through). Non-concrete elements (BOTH disciplines)
-#      still need the SAME white/gray fallback plans get — confirmed
-#      explicitly, not assumed — but the plan mechanism for that
-#      (_apply_coordination_categories' blanket override_bics CATEGORY
-#      override) can't be reused as-is: a category override can't tell
-#      Architecture's elements apart from Structure's at all (the same
-#      fundamental "Filters can discriminate by link, categories can't"
-#      limitation behind FILTER_NAME_STRUCT/ARCH existing in the first
-#      place), and it would blanket over Architecture's concrete elements
-#      too, defeating point 3. So for Sections, the blanket category
-#      fallback is skipped entirely (see apply_fallback=False in
-#      ensure_view_template/_apply_coordination_categories), and TWO NEW
-#      Type-Name filters take over that exact same white/gray job, scoped
-#      per-link like the concrete filters already are:
-#      FILTER_NAME_STRUCT_FALLBACK / FILTER_NAME_ARCH_FALLBACK, built from
-#      each link's own NON-concrete type names (all types found in
-#      OVERRIDE_CATEGORY_NAMES categories, minus the concrete ones — see
-#      _collect_concrete_type_names' all_names_out param). Architecture's
-#      CONCRETE names are the one deliberate gap: never added to ANY
-#      filter for Sections, so they fall through to Object Styles + native
-#      Material rendering, exactly as requested.
+#      red hatch; non-concrete Structure content still gets the same
+#      white/gray fallback plans get, via FILTER_NAME_STRUCT_FALLBACK
+#      below — a category override can't tell Architecture's elements
+#      apart from Structure's at all, the same "Filters can discriminate
+#      by link, categories can't" limitation FILTER_NAME_STRUCT/ARCH exist
+#      to work around in the first place, so the blanket category
+#      fallback plans use is skipped for Sections — apply_fallback=False
+#      in ensure_view_template/_apply_coordination_categories — and this
+#      Type-Name filter takes over that job for Structure specifically).
+#
+#      ARCHITECTURE gets a COMPLETELY DIFFERENT treatment in Sections,
+#      REVISED from an earlier same-day version that left it with no
+#      override at all (native Material rendering) — the user then asked
+#      for actual coloring after all: solid (not hatch) blue fill,
+#      Halftone, AND 70% Surface Transparency, applied to EVERY relevant
+#      category uniformly — concrete or not, PLUS Floors and Stairs too
+#      (SECTION_ARCH_CATEGORY_NAMES = OVERRIDE_CATEGORY_NAMES + Floors +
+#      Stairs) — there's no concrete/non-concrete distinction for
+#      Architecture in Sections at all any more, unlike Structure or Plans.
+#      One filter (FILTER_NAME_ARCH_SECTION) built from ALL of
+#      Architecture's own Type Names in that wider category set (see
+#      _collect_all_type_names — a plain scan, no concrete classification
+#      needed since every one of these types gets the identical
+#      treatment), with build_section_arch_override's OGS.
+#
+#      IMPORTANT CAVEAT, confirmed earlier this exact project (see
+#      build_colored_override's docstring): OverrideGraphicSettings.
+#      SetSurfaceTransparency only has a VISIBLE effect in Shaded/
+#      Realistic visual styles — it does nothing visible in Hidden Line,
+#      the default (and by far the most common) style for a 2D
+#      coordination view. Still set here regardless (harmless either way,
+#      and correct if the section's Visual Style is ever Shaded), but if
+#      transparency doesn't visibly show, check the section view's Visual
+#      Style before assuming this is broken — Halftone alone still applies
+#      regardless of Visual Style and gives a similar de-emphasized look.
 SECTION_TEMPLATE_NAME = u"EB_ARC/STR_CO_SECTIONS"
 FILTER_NAME_STRUCT_FALLBACK = u"EasyBIM - Structure Non-Concrete (Sections)"
-FILTER_NAME_ARCH_FALLBACK   = u"EasyBIM - Architecture Non-Concrete (Sections)"
+FILTER_NAME_ARCH_SECTION    = u"EasyBIM - Architecture (Sections)"
+SECTION_ARCH_TRANSPARENCY = 70
 
 # Column-specific dashed-line treatment (and its separate per-role filters,
 # FILTER_NAME_STRUCT_COLUMNS/FILTER_NAME_ARCH_COLUMNS) was tried and then
@@ -338,6 +347,12 @@ OVERRIDE_CATEGORY_NAMES = [
     "OST_StructuralFoundation",
     "OST_StructuralFraming",
 ]
+
+# Architecture's category scope in Sections specifically — wider than
+# OVERRIDE_CATEGORY_NAMES by explicit request (Floors and Stairs included
+# under the same solid-blue/halftone/transparent treatment). See the
+# SECTIONS constants block above for the full reasoning.
+SECTION_ARCH_CATEGORY_NAMES = OVERRIDE_CATEGORY_NAMES + ["OST_Floors", "OST_Stairs"]
 
 GRAY_COLOR = DB.Color(190, 190, 190)
 WHITE_COLOR = DB.Color(255, 255, 255)
@@ -2701,6 +2716,58 @@ def _type_ifc_guid(elem_type):
         return None
 
 
+def _collect_all_type_names(link_doc, categories, warnings, label, _depth=0):
+    """Every Type Name found in `categories` for this link, no material/
+    keyword classification at all — used for Architecture's Section-only
+    filter (FILTER_NAME_ARCH_SECTION), which treats every type in its wider
+    category scope (SECTION_ARCH_CATEGORY_NAMES) identically regardless of
+    whether it's concrete, so there's no need for _collect_concrete_type_
+    names' classification machinery here. Same nested-link recursion (capped
+    at one level) as that function, for consistency."""
+    names = set()
+    if link_doc is None:
+        return names
+    for bic in categories:
+        try:
+            elems = (DB.FilteredElementCollector(link_doc)
+                       .OfCategory(bic)
+                       .WhereElementIsNotElementType()
+                       .ToElements())
+        except Exception:
+            continue
+        for elem in elems:
+            try:
+                type_id = elem.GetTypeId()
+            except Exception:
+                continue
+            if type_id is None or type_id == DB.ElementId.InvalidElementId:
+                continue
+            try:
+                elem_type = link_doc.GetElement(type_id)
+            except Exception:
+                elem_type = None
+            type_name = _elem_name(elem_type) if elem_type is not None else None
+            if type_name:
+                names.add(type_name)
+
+    if _depth < 1:
+        try:
+            nested = list(DB.FilteredElementCollector(link_doc).OfClass(DB.RevitLinkInstance))
+        except Exception:
+            nested = []
+        for ninst in nested:
+            try:
+                ndoc = ninst.GetLinkDocument()
+            except Exception:
+                ndoc = None
+            if ndoc is None:
+                continue
+            names |= _collect_all_type_names(
+                ndoc, categories, warnings, u"{} > nested link".format(label), _depth=_depth + 1)
+
+    return names
+
+
 def _collect_concrete_type_names(link_doc, categories, cfg, warnings, label, _depth=0,
                                   guids_by_name=None, all_names_out=None):
     """Iterate INSTANCES (not just types) because an instance-level Material
@@ -3384,6 +3451,57 @@ def build_grid_line_override(color, warnings, label):
     return ogs
 
 
+def build_section_arch_override(color, warnings):
+    """Architecture's Section-only treatment (FILTER_NAME_ARCH_SECTION) —
+    solid (not hatch) Cut+Surface fill in `color`, Halftone, and
+    SECTION_ARCH_TRANSPARENCY% Surface Transparency, applied uniformly to
+    every type this filter matches (no concrete/non-concrete split, unlike
+    Structure or Plans — see the SECTIONS constants block). SetHalftone
+    works regardless of Visual Style; SetSurfaceTransparency only has a
+    VISIBLE effect in Shaded/Realistic (confirmed earlier this project,
+    see build_colored_override's docstring) — set anyway since it's
+    harmless in Hidden Line and correct if the view ever uses Shaded."""
+    ogs = DB.OverrideGraphicSettings()
+    try:
+        ogs.SetHalftone(True)
+    except Exception as ex:
+        warnings.append(u"Architecture (section): could not set halftone: {}".format(ex))
+    try:
+        ogs.SetSurfaceTransparency(SECTION_ARCH_TRANSPARENCY)
+    except Exception as ex:
+        warnings.append(u"Architecture (section): could not set transparency: {}".format(ex))
+
+    line_id = get_solid_line_pattern_id()
+    if line_id != DB.ElementId.InvalidElementId:
+        try:
+            ogs.SetCutLinePatternId(line_id)
+            ogs.SetProjectionLinePatternId(line_id)
+        except Exception as ex:
+            warnings.append(u"Architecture (section): could not set the line pattern: {}".format(ex))
+    try:
+        ogs.SetCutLineColor(color)
+        ogs.SetProjectionLineColor(color)
+    except Exception as ex:
+        warnings.append(u"Architecture (section): could not set the line color: {}".format(ex))
+
+    solid_fill_id = get_solid_fill_pattern_id()
+    if solid_fill_id != DB.ElementId.InvalidElementId:
+        try:
+            ogs.SetCutForegroundPatternVisible(True)
+            ogs.SetCutForegroundPatternId(solid_fill_id)
+            ogs.SetCutForegroundPatternColor(color)
+            ogs.SetSurfaceForegroundPatternVisible(True)
+            ogs.SetSurfaceForegroundPatternId(solid_fill_id)
+            ogs.SetSurfaceForegroundPatternColor(color)
+        except Exception as ex:
+            warnings.append(u"Architecture (section): could not set the solid fill: {}".format(ex))
+    else:
+        warnings.append(
+            u"Architecture (section): no solid fill pattern could be resolved — those "
+            u"elements may show their own native Type Properties fill instead of solid blue.")
+    return ogs
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 # AUTOMATIC SHEET CREATION  (Refinement 2)
 # ─────────────────────────────────────────────────────────────────────────────
@@ -3685,19 +3803,22 @@ def run():
             _ensure_linked_view_detail_level(traffic_linked_view, global_warnings, u"Traffic")
 
         # ── Step 8: deep-scan (every selected link, per role) + View Filters ───
-        # arch_all_names/struct_all_names (every Type Name in override_bics
-        # categories, concrete or not) are only actually needed if a
-        # Section view is in this batch (see SECTION_TEMPLATE_NAME's
-        # docstring) -- collected unconditionally anyway since it's the
-        # same scan already running, at negligible extra cost.
+        # struct_all_names (every Type Name in override_bics categories,
+        # concrete or not) is only actually needed if a Section view is in
+        # this batch, to build Structure's non-concrete fallback filter
+        # below (see SECTION_TEMPLATE_NAME's docstring) -- collected
+        # unconditionally anyway since it's the same scan already running,
+        # at negligible extra cost. Architecture has no equivalent need any
+        # more (see FILTER_NAME_ARCH_SECTION below instead) -- it gets its
+        # own SEPARATE, WIDER scan further down, since Sections treat ALL
+        # of Architecture's relevant content identically regardless of
+        # concrete classification, unlike Structure.
         arch_names = set()
-        arch_all_names = set()
         arch_guids = {}
         for li in arch_links:
             arch_names |= _collect_concrete_type_names(
                 li[u"doc"], override_bics, settings, global_warnings,
-                u"Architecture ({})".format(li[u"name"]), guids_by_name=arch_guids,
-                all_names_out=arch_all_names)
+                u"Architecture ({})".format(li[u"name"]), guids_by_name=arch_guids)
         struct_names = set()
         struct_all_names = set()
         struct_guids = {}
@@ -3760,28 +3881,41 @@ def run():
         struct_grid_ogs = build_grid_line_override(struct_color, global_warnings, u"Structure")
         arch_grid_ogs   = build_grid_line_override(arch_color, global_warnings, u"Architecture")
 
-        # Section-only non-concrete fallback FILTERS (see SECTION_
-        # TEMPLATE_NAME's docstring for the full reasoning) — take over the
-        # plan template's blanket category-level white/gray fallback job,
-        # but per-link via Type Name like the concrete filters, so
-        # Architecture's CONCRETE names (never added to either filter
-        # below) can be left with zero override at all and render with
-        # their own native Material appearance, while non-concrete
-        # elements on BOTH sides still get the same white/gray look plans
-        # get. Built unconditionally (cheap set arithmetic) but only ever
-        # APPLIED to a view in the per-view loop below when that view is
-        # actually a Section.
+        # Section-only Structure non-concrete fallback FILTER (see SECTION_
+        # TEMPLATE_NAME's docstring) — takes over the plan template's
+        # blanket category-level white/gray fallback job for Structure's
+        # own non-concrete elements, per-link via Type Name like the
+        # concrete filter, since Sections skip that blanket fallback
+        # entirely (a category override can't tell Architecture's elements
+        # apart from Structure's). Built unconditionally (cheap set
+        # arithmetic) but only ever APPLIED to a view in the per-view loop
+        # below when that view is actually a Section.
         struct_nonconcrete_names = struct_all_names - struct_names
-        arch_nonconcrete_names   = arch_all_names - arch_names
         section_fallback_ogs = _build_nonconcrete_fallback_ogs(global_warnings)
         struct_fallback_pfe = None
         if struct_nonconcrete_names:
             struct_fallback_pfe = build_or_update_type_name_filter(
                 FILTER_NAME_STRUCT_FALLBACK, override_bics, struct_nonconcrete_names, global_warnings)
-        arch_fallback_pfe = None
-        if arch_nonconcrete_names:
-            arch_fallback_pfe = build_or_update_type_name_filter(
-                FILTER_NAME_ARCH_FALLBACK, override_bics, arch_nonconcrete_names, global_warnings)
+
+        # Architecture's Section-only filter — a SEPARATE, WIDER scan
+        # (SECTION_ARCH_CATEGORY_NAMES: OVERRIDE_CATEGORY_NAMES + Floors +
+        # Stairs) covering EVERY type Architecture has there, concrete or
+        # not — Sections give all of it the identical solid-blue/halftone/
+        # transparent treatment (build_section_arch_override), unlike
+        # Structure or Plans. No classification needed, hence
+        # _collect_all_type_names (a plain scan) instead of
+        # _collect_concrete_type_names.
+        section_arch_bics = _resolve_categories(SECTION_ARCH_CATEGORY_NAMES, global_warnings)
+        arch_section_names = set()
+        for li in arch_links:
+            arch_section_names |= _collect_all_type_names(
+                li[u"doc"], section_arch_bics, global_warnings,
+                u"Architecture section ({})".format(li[u"name"]))
+        arch_section_pfe = None
+        if arch_section_names:
+            arch_section_pfe = build_or_update_type_name_filter(
+                FILTER_NAME_ARCH_SECTION, section_arch_bics, arch_section_names, global_warnings)
+        arch_section_ogs = build_section_arch_override(arch_color, global_warnings)
 
         # Manual per-Type-Name HIDE filter (Settings.json's
         # ManualHideTypeNames, set via ARC/STR Settings' "Add from
@@ -3925,13 +4059,12 @@ def run():
             # Floors left visible (section_link_model_bics), and
             # apply_fallback=False — see that constant's docstring for the
             # full reasoning. Structure's concrete filter/color is applied
-            # exactly like plans; Architecture's is DELIBERATELY skipped
-            # (no arch_pfe on this template at all) so its concrete
-            # elements render with zero override — native Material
-            # appearance. The two new fallback filters take over the
-            # white/gray job for non-concrete elements on BOTH sides,
-            # which the skipped blanket category override would otherwise
-            # have provided.
+            # exactly like plans, plus its own non-concrete fallback filter
+            # (replacing the blanket category override Sections skip).
+            # Architecture gets ONE filter covering everything relevant
+            # (concrete or not, plus Floors/Stairs) with the solid-blue/
+            # halftone/transparent treatment — no arch_pfe/arch_ogs at all
+            # on this template.
             if is_section:
                 template = ensure_view_template(
                     view, host_clutter_bics, section_link_model_bics,
@@ -3940,8 +4073,8 @@ def run():
                 apply_filter_to_target(template, struct_pfe, struct_ogs, w, u"Structure")
                 apply_filter_to_target(template, struct_fallback_pfe, section_fallback_ogs, w,
                                         u"Structure non-concrete fallback")
-                apply_filter_to_target(template, arch_fallback_pfe, section_fallback_ogs, w,
-                                        u"Architecture non-concrete fallback")
+                apply_filter_to_target(template, arch_section_pfe, arch_section_ogs, w,
+                                        u"Architecture (section)")
             else:
                 template = ensure_view_template(view, host_clutter_bics, link_model_bics,
                                                  wallnoncore_bics, annotation_bics,
