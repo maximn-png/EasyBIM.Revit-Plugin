@@ -1315,6 +1315,109 @@ def apply_scope_box(view, scope_box, warnings):
         warnings.append(u"Could not apply scope box '{}': {}".format(scope_box[u"name"], ex))
 
 
+# Added above/below the lowest/highest Level found (see
+# _building_elevation_range) before cropping a Section to "the building's
+# height" — a bare level-to-level crop would clip roof parapets/mechanical
+# equipment above the top level and footings below the bottom one. ~1m,
+# Revit's internal units are always feet regardless of the project's
+# display units.
+SECTION_HEIGHT_CROP_MARGIN_FT = 3.28084
+
+
+def _building_elevation_range(arch_links, struct_links, warnings):
+    """Lowest and highest Level elevation found across EVERY selected
+    Architecture and Structure link, in HOST document coordinates (each
+    link's own Level.Elevation run through RevitLinkInstance.
+    GetTotalTransform(), same pattern _find_matching_link_views already
+    uses for level-elevation matching). Combines both roles deliberately
+    — "the building's height" per explicit request, and either discipline
+    can have a level the other doesn't (e.g. Structure's own foundation
+    level, or an Architecture-only roof/parapet level). Returns
+    (min_elev, max_elev), or (None, None) if no Level could be read at
+    all from any selected link."""
+    min_elev = None
+    max_elev = None
+    for li in (list(arch_links) + list(struct_links)):
+        link_doc = li.get(u"doc")
+        inst     = li.get(u"instance")
+        if link_doc is None or inst is None:
+            continue
+        try:
+            transform = inst.GetTotalTransform()
+        except Exception:
+            continue
+        try:
+            levels = list(DB.FilteredElementCollector(link_doc).OfClass(DB.Level))
+        except Exception:
+            levels = []
+        for lvl in levels:
+            try:
+                z = transform.OfPoint(DB.XYZ(0.0, 0.0, lvl.Elevation)).Z
+            except Exception:
+                continue
+            if min_elev is None or z < min_elev:
+                min_elev = z
+            if max_elev is None or z > max_elev:
+                max_elev = z
+    if min_elev is None or max_elev is None:
+        warnings.append(u"Could not read any Level from the selected Architecture/Structure "
+                         u"links — Section crop height left unchanged.")
+        return None, None
+    return min_elev, max_elev
+
+
+def _apply_section_height_crop(view, min_elev, max_elev, warnings):
+    """Sets a Section view's crop region's VERTICAL extent to span
+    min_elev..max_elev (HOST coordinates, plus SECTION_HEIGHT_CROP_MARGIN_
+    FT on each side) — the horizontal extent (view-local X) and view depth
+    (view-local Z, the far/near clip) are left exactly as they already
+    are, only the height changes, per explicit request ("just the
+    height").
+
+    A Section's CropBox.Transform maps VIEW-LOCAL coordinates to the
+    model: for a standard vertical building section (the overwhelming
+    majority — created via the plain Section tool, not an unusually
+    rotated/sloped one), BasisY is exactly the model's vertical axis
+    (0,0,1), which is what lets local Y be computed from model Z alone
+    via the inverse transform, independent of X/Y choice. Checked
+    explicitly before writing anything — a non-vertical section (BasisY
+    not aligned with global Z) is left untouched with a warning instead
+    of risking a nonsensical crop, since the simple "transform two points
+    at these Z values" approach only holds for that standard case."""
+    if min_elev is None or max_elev is None:
+        return
+    try:
+        crop_box = view.CropBox
+        transform = crop_box.Transform
+    except Exception as ex:
+        warnings.append(u"Could not read the section's crop box: {}".format(ex))
+        return
+
+    try:
+        basis_y = transform.BasisY
+        if abs(basis_y.Z) < 0.999:
+            warnings.append(
+                u"This section's crop isn't a standard vertical one (its 'up' direction "
+                u"isn't aligned with the model's vertical axis) — height-based cropping "
+                u"skipped for it to avoid producing a nonsensical crop region.")
+            return
+    except Exception as ex:
+        warnings.append(u"Could not check the section's crop orientation: {}".format(ex))
+        return
+
+    try:
+        inverse = transform.Inverse
+        low  = inverse.OfPoint(DB.XYZ(0.0, 0.0, min_elev - SECTION_HEIGHT_CROP_MARGIN_FT)).Y
+        high = inverse.OfPoint(DB.XYZ(0.0, 0.0, max_elev + SECTION_HEIGHT_CROP_MARGIN_FT)).Y
+        new_min_y, new_max_y = (low, high) if low <= high else (high, low)
+        crop_box.Min = DB.XYZ(crop_box.Min.X, new_min_y, crop_box.Min.Z)
+        crop_box.Max = DB.XYZ(crop_box.Max.X, new_max_y, crop_box.Max.Z)
+        view.CropBox = crop_box
+        view.CropBoxActive = True
+    except Exception as ex:
+        warnings.append(u"Could not set the section's crop height: {}".format(ex))
+
+
 def get_all_link_instances():
     """One dict per placed RevitLinkInstance (not de-duplicated by file —
     each placed instance is a distinct pickable candidate).
@@ -3917,6 +4020,15 @@ def run():
                 FILTER_NAME_ARCH_SECTION, section_arch_bics, arch_section_names, global_warnings)
         arch_section_ogs = build_section_arch_override(arch_color, global_warnings)
 
+        # Building elevation range (lowest/highest Level across every
+        # selected Architecture/Structure link) — computed once here since
+        # it only depends on the selected links, not on which view is
+        # being processed; applied per-view (Sections only) in the loop
+        # below via _apply_section_height_crop, per explicit request that
+        # a Section's crop height should span the building's full height.
+        section_min_elev, section_max_elev = _building_elevation_range(
+            arch_links, struct_links, global_warnings)
+
         # Manual per-Type-Name HIDE filter (Settings.json's
         # ManualHideTypeNames, set via ARC/STR Settings' "Add from
         # Model..." picker) — an escape hatch for linked elements that
@@ -4075,6 +4187,12 @@ def run():
                                         u"Structure non-concrete fallback")
                 apply_filter_to_target(template, arch_section_pfe, arch_section_ogs, w,
                                         u"Architecture (section)")
+                # Crop height = the building's own elevation range (see
+                # _building_elevation_range/_apply_section_height_crop),
+                # per explicit request — only the vertical extent changes,
+                # the section's existing horizontal cut width and depth
+                # are left exactly as they were.
+                _apply_section_height_crop(view, section_min_elev, section_max_elev, w)
             else:
                 template = ensure_view_template(view, host_clutter_bics, link_model_bics,
                                                  wallnoncore_bics, annotation_bics,
