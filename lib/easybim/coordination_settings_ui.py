@@ -244,6 +244,19 @@ XAML = u"""
 
         <Border Style="{StaticResource Card}">
           <StackPanel>
+            <TextBlock Text="MANUAL HIDE (BY TYPE NAME, ANY CATEGORY)" Style="{StaticResource SectionHeader}"/>
+            <TextBlock TextWrapping="Wrap" FontSize="10.5" Foreground="#8b93a7" Margin="0,2,0,0"
+                       Text="A Type Name listed here is hidden entirely (not just recolored) across every category, in every selected view -- for a linked element that stays visible despite the automatic other-link and DWG hiding."/>
+
+            <TextBlock Text="HIDDEN TYPE NAMES" Style="{StaticResource FieldLabel}"/>
+            <TextBox x:Name="ManualHideTypes" Style="{StaticResource FieldBox}"/>
+            <Button x:Name="BtnPickHide" Content="Add from Model..." Style="{StaticResource GhostBtn}"
+                    HorizontalAlignment="Left" Padding="14,0" Margin="0,8,0,0"/>
+          </StackPanel>
+        </Border>
+
+        <Border Style="{StaticResource Card}">
+          <StackPanel>
             <TextBlock Text="FILL PATTERNS" Style="{StaticResource SectionHeader}"/>
 
             <TextBlock Text="STRUCTURE CUT HATCH PATTERN NAME" Style="{StaticResource FieldLabel}"/>
@@ -378,6 +391,7 @@ class SettingsDialog(object):
         w.FindName(u"ExcludeKw").Text     = _join(s.get(u"ExcludeKeywords"))
         w.FindName(u"ManualIncludeTypes").Text = _join(s.get(u"ManualIncludeTypeNames"))
         w.FindName(u"ManualExcludeTypes").Text = _join(s.get(u"ManualExcludeTypeNames"))
+        w.FindName(u"ManualHideTypes").Text    = _join(s.get(u"ManualHideTypeNames"))
         w.FindName(u"StructPattern").Text = s.get(u"StructPatternName") or u""
         w.FindName(u"ArchPattern").Text   = s.get(u"ArchPatternName") or u""
 
@@ -403,6 +417,7 @@ class SettingsDialog(object):
         w.FindName(u"BtnSave").Click   += self._on_save
         w.FindName(u"BtnPickInclude").Click += self._on_pick_include
         w.FindName(u"BtnPickExclude").Click += self._on_pick_exclude
+        w.FindName(u"BtnPickHide").Click    += self._on_pick_hide
 
         return window
 
@@ -440,6 +455,7 @@ class SettingsDialog(object):
         w.FindName(u"ExcludeKw").Text     = _join(defaults[u"ExcludeKeywords"])
         w.FindName(u"ManualIncludeTypes").Text = _join(defaults[u"ManualIncludeTypeNames"])
         w.FindName(u"ManualExcludeTypes").Text = _join(defaults[u"ManualExcludeTypeNames"])
+        w.FindName(u"ManualHideTypes").Text    = _join(defaults[u"ManualHideTypeNames"])
         w.FindName(u"StructPattern").Text = defaults[u"StructPatternName"]
         w.FindName(u"ArchPattern").Text   = defaults[u"ArchPatternName"]
         sc = defaults[u"StructColor"]
@@ -476,6 +492,7 @@ class SettingsDialog(object):
             u"ExcludeKeywords"    : _split(w.FindName(u"ExcludeKw").Text),
             u"ManualIncludeTypeNames": _split(w.FindName(u"ManualIncludeTypes").Text),
             u"ManualExcludeTypeNames": _split(w.FindName(u"ManualExcludeTypes").Text),
+            u"ManualHideTypeNames"   : _split(w.FindName(u"ManualHideTypes").Text),
             u"StructPatternName"  : struct_pattern,
             u"ArchPatternName"    : arch_pattern,
             u"StructColor"        : {u"R": struct_rgb[0], u"G": struct_rgb[1], u"B": struct_rgb[2]},
@@ -497,11 +514,14 @@ class SettingsDialog(object):
     def _on_pick_exclude(self, sender, e):
         self._pick_and_add_exception(u"ManualExcludeTypes", u"treated as NON-CONCRETE")
 
+    def _on_pick_hide(self, sender, e):
+        self._pick_and_add_exception(u"ManualHideTypes", u"hidden entirely")
+
     def _pick_and_add_exception(self, field_name, direction_label):
         """"Add from Model..." — pick a rogue linked element directly
         instead of typing its Type Name blind, and append it to whichever
-        of the two exception fields the caller points at (`field_name`:
-        ManualIncludeTypes or ManualExcludeTypes). Hides this window (not
+        of the three exception fields the caller points at (`field_name`:
+        ManualIncludeTypes, ManualExcludeTypes or ManualHideTypes). Hides this window (not
         Close — Close would end the whole settings session and lose
         unsaved edits in the other fields) for the duration of the pick,
         since a modeless WPF window sitting on screen would otherwise

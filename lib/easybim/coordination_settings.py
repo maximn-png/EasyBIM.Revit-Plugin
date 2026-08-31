@@ -58,6 +58,17 @@ SETTINGS_DEFAULTS = {
     # name somehow ends up in both lists — see _type_is_concrete.
     u"ManualIncludeTypeNames": [],
     u"ManualExcludeTypeNames": [],
+    # Exact Type Name matches that get a dedicated HIDE filter (View.
+    # SetFilterVisibility, not a color override) applied across every
+    # category in the shared template — a manual escape hatch for a
+    # specific linked element/type that keeps staying visible despite
+    # Step 5/6's automatic link- and DWG-hiding (e.g. some model or
+    # annotation content inside a SELECTED Architecture/Structure link
+    # itself, which those steps never touch). Same "Add from Model..."
+    # picker pattern as the two lists above. Left empty, this filter is
+    # actively removed from the template each run rather than left with a
+    # stale rule — see run()'s handling.
+    u"ManualHideTypeNames": [],
     u"StructPatternName"  : u"Diagonal Up - 1.5mm",
     u"ArchPatternName"    : u"Diagonal Down - 1.5mm",
     u"StructColor"        : {u"R": 200, u"G": 30, u"B": 30},

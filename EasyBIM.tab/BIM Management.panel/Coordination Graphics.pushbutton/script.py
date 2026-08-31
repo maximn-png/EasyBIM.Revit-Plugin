@@ -249,6 +249,17 @@ TEMPLATE_NAME = u"Coordination - Arch vs Str"
 FILTER_NAME_STRUCT = u"EasyBIM - Structure Concrete"
 FILTER_NAME_ARCH   = u"EasyBIM - Architecture Concrete"
 
+# Manual per-Type-Name HIDE filter (Settings.json's ManualHideTypeNames) —
+# built the SAME safe way as FILTER_NAME_STRUCT/ARCH (a real "Type Name
+# equals X" rule via build_or_update_type_name_filter, scoped to every
+# Model category), applied via View.SetFilterVisibility instead of
+# SetFilterOverrides. NOT the same thing as the crash-causing "no-rule"
+# whitelist filters from earlier this project (_STALE_WHITELIST_FILTER_
+# NAMES/_cleanup_stale_whitelist_filters) — those crashed specifically
+# because they had NO ElementFilter rule at all; this always has a real
+# rule, exactly like the two filters above, which have never crashed.
+FILTER_NAME_MANUAL_HIDE = u"EasyBIM - Manual Hide"
+
 # Column-specific dashed-line treatment (and its separate per-role filters,
 # FILTER_NAME_STRUCT_COLUMNS/FILTER_NAME_ARCH_COLUMNS) was tried and then
 # explicitly reversed per live-testing feedback — ALL boundary lines must be
@@ -2883,6 +2894,38 @@ def apply_filter_to_target(target, pfe, ogs, warnings, label):
         warnings.append(u"Could not apply the {} view filter: {}".format(label, ex))
 
 
+def apply_or_clear_hide_filter(target, pfe, warnings, label):
+    """Manual "hide these Type Names" filter (see FILTER_NAME_MANUAL_HIDE) —
+    View.SetFilterVisibility(False), not SetFilterOverrides, since the goal
+    is to genuinely suppress the matched elements, not recolor them.
+
+    pfe is None when ManualHideTypeNames is currently empty — in that case
+    this actively REMOVES any stale filter of this name the template still
+    has attached (RemoveFilter, confirmed real via reflection), rather than
+    just skipping the add: the shared template is reused across runs, so a
+    name removed from Settings.json must stop hiding things it used to,
+    the same "reset every run, don't just skip" lesson already learned for
+    the non-concrete fallback override."""
+    if pfe is None:
+        stale = _find_existing_filter(FILTER_NAME_MANUAL_HIDE)
+        if stale is None:
+            return
+        try:
+            applied_ids = [i.IntegerValue for i in target.GetFilters()]
+            if stale.Id.IntegerValue in applied_ids:
+                target.RemoveFilter(stale.Id)
+        except Exception as ex:
+            warnings.append(u"Could not remove the stale {} filter: {}".format(label, ex))
+        return
+    try:
+        applied_ids = [i.IntegerValue for i in target.GetFilters()]
+        if pfe.Id.IntegerValue not in applied_ids:
+            target.AddFilter(pfe.Id)
+        target.SetFilterVisibility(pfe.Id, False)
+    except Exception as ex:
+        warnings.append(u"Could not apply the {} hide filter: {}".format(label, ex))
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 # GRAPHIC OVERRIDES  (Step 8D)
 # ─────────────────────────────────────────────────────────────────────────────
@@ -3528,6 +3571,28 @@ def run():
         struct_grid_ogs = build_grid_line_override(struct_color, global_warnings, u"Structure")
         arch_grid_ogs   = build_grid_line_override(arch_color, global_warnings, u"Architecture")
 
+        # Manual per-Type-Name HIDE filter (Settings.json's
+        # ManualHideTypeNames, set via ARC/STR Settings' "Add from
+        # Model..." picker) — an escape hatch for linked elements that
+        # stay visible despite Step 5/6's automatic link- and DWG-hiding
+        # (e.g. content inside a SELECTED Architecture/Structure link
+        # itself, which those steps never touch at all). Scoped to every
+        # Model category since a manually-picked rogue element could be
+        # anything, not just the structural categories in OVERRIDE_BICS.
+        manual_hide_names = set(settings.get(u"ManualHideTypeNames") or [])
+        all_model_bics = []
+        for _cat in doc.Settings.Categories:
+            try:
+                if _cat.CategoryType != DB.CategoryType.Model:
+                    continue
+                all_model_bics.append(DB.BuiltInCategory(_cat.Id.IntegerValue))
+            except Exception:
+                continue
+        manual_hide_pfe = None
+        if manual_hide_names:
+            manual_hide_pfe = build_or_update_type_name_filter(
+                FILTER_NAME_MANUAL_HIDE, all_model_bics, manual_hide_names, global_warnings)
+
         t0.Commit()
     except Exception:
         t0.RollBack()
@@ -3589,6 +3654,7 @@ def run():
 
             apply_filter_to_target(template, struct_pfe, struct_ogs, w, u"Structure")
             apply_filter_to_target(template, arch_pfe, arch_ogs, w, u"Architecture")
+            apply_or_clear_hide_filter(template, manual_hide_pfe, w, u"Manual Hide")
 
             # ── Refinement 1: host Grids hidden (element-level — see docstring) ────
             _hide_host_grids(view, w)
