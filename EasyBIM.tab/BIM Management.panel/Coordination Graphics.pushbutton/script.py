@@ -1580,8 +1580,23 @@ def _hide_category_safe(target, bic, warnings, hide=True):
 
 
 def _override_category_safe(target, bic, ogs, warnings):
+    """Mirrors _hide_category_safe's AllowsVisibilityControl pre-check —
+    live testing (2026-08-31) surfaced a huge cascade of "Category cannot
+    be overridden" warnings once the generic gray-line pass started
+    walking EVERY Model category (see _apply_coordination_categories):
+    categories like OST_ProjectInformation, OST_AnalysisDisplayStyle,
+    OST_MEPAnalyticalAirLoop etc. never had visible geometry to override
+    in the first place, so SetCategoryOverrides throwing for them isn't a
+    bug to warn about every run — same reasoning _hide_category_safe
+    already applies to SetCategoryHidden."""
     try:
         cat_id = DB.ElementId(bic)
+        try:
+            cat = DB.Category.GetCategory(doc, bic)
+            if cat is not None and not cat.get_AllowsVisibilityControl(target):
+                return
+        except Exception:
+            pass
         target.SetCategoryOverrides(cat_id, ogs)
     except Exception as ex:
         warnings.append(u"Could not set the fallback color for category '{}': {}".format(
@@ -1807,6 +1822,11 @@ def _apply_coordination_categories(target, host_clutter_bics, link_model_bics, w
         # what the parent category is set to.
         try:
             for subcat in cat.SubCategories:
+                try:
+                    if not subcat.get_AllowsVisibilityControl(target):
+                        continue
+                except Exception:
+                    pass
                 try:
                     target.SetCategoryOverrides(subcat.Id, gray_line_ogs)
                 except Exception as ex:
@@ -3596,22 +3616,52 @@ def run():
         # the list — Revit's own authoritative "these are safe to use in a
         # Filter" source, which also naturally includes the Annotation
         # categories the hand-rolled Model-only version excluded.
+        #
+        # SECOND BUG FOUND AND FIXED, same live-testing round: even with
+        # GetAllFilterableCategories() (all individually filterable),
+        # ParameterFilterElement.Create STILL threw — "One of the given
+        # rules refers to a parameter that does not apply to this filter's
+        # categories" — because "Type Name" (ALL_MODEL_TYPE_NAME) isn't a
+        # valid/filterable parameter for every one of those ~150+
+        # categories at once (e.g. purely 2D/analytical ones). The same
+        # "one bad apple fails the whole Create call" behavior as the
+        # category-list bug above, just for the RULE's parameter instead
+        # of the category list. Fixed by checking, per candidate category,
+        # whether ALL_MODEL_TYPE_NAME is actually in
+        # ParameterFilterUtilities.GetFilterableParametersInCommon(doc,
+        # [that one category]) — confirmed via reflection this is the
+        # correct per-category applicability check (IsParameterApplicable
+        # takes an Element, not a category, so it doesn't fit this
+        # "before any element exists" use case) — and only keeping
+        # categories that pass.
         manual_hide_names = set(settings.get(u"ManualHideTypeNames") or [])
         try:
             filterable_cat_ids = list(DB.ParameterFilterUtilities.GetAllFilterableCategories())
         except Exception as ex:
             filterable_cat_ids = []
             global_warnings.append(u"Could not read Revit's filterable-category list: {}".format(ex))
+        type_name_bip = getattr(DB.BuiltInParameter, "ALL_MODEL_TYPE_NAME", None)
         manual_hide_bics = []
-        for _cid in filterable_cat_ids:
-            try:
-                manual_hide_bics.append(DB.BuiltInCategory(_cid.IntegerValue))
-            except Exception:
-                continue
+        if type_name_bip is not None and filterable_cat_ids:
+            type_name_param_id = DB.ElementId(type_name_bip)
+            for _cid in filterable_cat_ids:
+                try:
+                    single = SCG.List[DB.ElementId]([_cid])
+                    common_params = DB.ParameterFilterUtilities.GetFilterableParametersInCommon(doc, single)
+                    if not any(p.IntegerValue == type_name_param_id.IntegerValue for p in common_params):
+                        continue
+                    manual_hide_bics.append(DB.BuiltInCategory(_cid.IntegerValue))
+                except Exception:
+                    continue
         manual_hide_pfe = None
         if manual_hide_names:
-            manual_hide_pfe = build_or_update_type_name_filter(
-                FILTER_NAME_MANUAL_HIDE, manual_hide_bics, manual_hide_names, global_warnings)
+            if not manual_hide_bics:
+                global_warnings.append(
+                    u"Manual Hide: no category supports filtering by Type Name in this "
+                    u"Revit version — could not build the hide filter.")
+            else:
+                manual_hide_pfe = build_or_update_type_name_filter(
+                    FILTER_NAME_MANUAL_HIDE, manual_hide_bics, manual_hide_names, global_warnings)
 
         t0.Commit()
     except Exception:
