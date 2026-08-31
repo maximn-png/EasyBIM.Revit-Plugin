@@ -460,8 +460,9 @@ PICKER_XAML = u"""
   xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
   Title="ARC/STR Coordination"
   Width="540" Height="640"
+  MinWidth="480" MinHeight="500"
   WindowStartupLocation="CenterScreen"
-  ResizeMode="NoResize"
+  ResizeMode="CanResizeWithGrip"
   WindowStyle="SingleBorderWindow"
   FontFamily="Segoe UI"
   Background="#f7f8ff">
@@ -665,7 +666,20 @@ PICKER_XAML = u"""
         <StackPanel x:Name="Step2Panel" Visibility="Collapsed">
           <Border Style="{StaticResource Card}">
             <StackPanel>
-              <TextBlock Text="ARCHITECTURE LINKS (SELECT ONE OR MORE)" Style="{StaticResource SectionLabel}"/>
+              <Grid>
+                <Grid.ColumnDefinitions>
+                  <ColumnDefinition Width="*"/>
+                  <ColumnDefinition Width="Auto"/>
+                </Grid.ColumnDefinitions>
+                <TextBlock Grid.Column="0" Text="ARCHITECTURE LINKS (SELECT ONE OR MORE)"
+                           Style="{StaticResource SectionLabel}" VerticalAlignment="Center"/>
+                <StackPanel Grid.Column="1" Orientation="Horizontal">
+                  <TextBlock x:Name="ArchSelectAll" Text="Select All" FontSize="10"
+                             Foreground="#1e248c" Cursor="Hand" TextDecorations="Underline" Margin="0,0,10,0"/>
+                  <TextBlock x:Name="ArchSelectNone" Text="Clear" FontSize="10"
+                             Foreground="#6b7280" Cursor="Hand" TextDecorations="Underline"/>
+                </StackPanel>
+              </Grid>
               <ScrollViewer MaxHeight="120" VerticalScrollBarVisibility="Auto">
                 <StackPanel x:Name="ArchLinksPanel"/>
               </ScrollViewer>
@@ -675,7 +689,20 @@ PICKER_XAML = u"""
           </Border>
           <Border Style="{StaticResource Card}">
             <StackPanel>
-              <TextBlock Text="STRUCTURE LINKS (SELECT ONE OR MORE)" Style="{StaticResource SectionLabel}"/>
+              <Grid>
+                <Grid.ColumnDefinitions>
+                  <ColumnDefinition Width="*"/>
+                  <ColumnDefinition Width="Auto"/>
+                </Grid.ColumnDefinitions>
+                <TextBlock Grid.Column="0" Text="STRUCTURE LINKS (SELECT ONE OR MORE)"
+                           Style="{StaticResource SectionLabel}" VerticalAlignment="Center"/>
+                <StackPanel Grid.Column="1" Orientation="Horizontal">
+                  <TextBlock x:Name="StructSelectAll" Text="Select All" FontSize="10"
+                             Foreground="#1e248c" Cursor="Hand" TextDecorations="Underline" Margin="0,0,10,0"/>
+                  <TextBlock x:Name="StructSelectNone" Text="Clear" FontSize="10"
+                             Foreground="#6b7280" Cursor="Hand" TextDecorations="Underline"/>
+                </StackPanel>
+              </Grid>
               <ScrollViewer MaxHeight="120" VerticalScrollBarVisibility="Auto">
                 <StackPanel x:Name="StructLinksPanel"/>
               </ScrollViewer>
@@ -802,8 +829,15 @@ class LinkPickerDialog(object):
         else:
             w.FindName(u"ViewBasementText").Text = u""
 
-        # Step 2 — link checklists (multi-select)
-        names = sorted((li[u"name"] for li in self.links), key=lambda n: n.upper())
+        # Step 2 — link checklists (multi-select). Nested links (see
+        # get_all_link_instances' is_nested docstring) are excluded from
+        # the selectable names here — they're never something a user
+        # should pick as "this is my Architecture/Structure/Traffic link"
+        # — but self.links / self._by_name below stay unfiltered, so Step
+        # 5's hide sweep in run() still treats an unselected nested link
+        # like any other "other" link.
+        names = sorted((li[u"name"] for li in self.links if not li.get(u"is_nested")),
+                        key=lambda n: n.upper())
         by_name = {}
         for li in self.links:
             by_name.setdefault(li[u"name"], li)
@@ -888,6 +922,19 @@ class LinkPickerDialog(object):
         w.FindName(u"BtnBack").Click   += self._on_back
         w.FindName(u"BtnNext").Click   += self._on_next
 
+        # "Select All" / "Clear" — plain TextBlocks styled as links (not
+        # Button, to stay visually small/secondary next to the section
+        # label) wired via MouseLeftButtonUp, same pattern XamlReader-loaded
+        # XAML already uses for every other click handler in this class.
+        w.FindName(u"ArchSelectAll").MouseLeftButtonUp += (
+            lambda s, e: self._set_all_checked(self._arch_checks, True))
+        w.FindName(u"ArchSelectNone").MouseLeftButtonUp += (
+            lambda s, e: self._set_all_checked(self._arch_checks, False))
+        w.FindName(u"StructSelectAll").MouseLeftButtonUp += (
+            lambda s, e: self._set_all_checked(self._struct_checks, True))
+        w.FindName(u"StructSelectNone").MouseLeftButtonUp += (
+            lambda s, e: self._set_all_checked(self._struct_checks, False))
+
         self._go_to_step(1)
         return window
 
@@ -908,6 +955,14 @@ class LinkPickerDialog(object):
 
     def _checked_names(self, checks):
         return [cb.Content for cb in checks if cb.IsChecked]
+
+    def _set_all_checked(self, checks, value):
+        # Setting IsChecked fires each checkbox's own Checked/Unchecked
+        # event, which already refreshes that role's Smart Linked View
+        # combo (see _refresh_arch_views/_refresh_struct_views) — nothing
+        # extra needed here.
+        for cb in checks:
+            cb.IsChecked = value
 
     def _on_settings(self, sender, e):
         """Gear icon — the two tools were merged into one button, this is
@@ -1119,7 +1174,22 @@ def apply_scope_box(view, scope_box, warnings):
 
 def get_all_link_instances():
     """One dict per placed RevitLinkInstance (not de-duplicated by file —
-    each placed instance is a distinct pickable candidate)."""
+    each placed instance is a distinct pickable candidate).
+
+    is_nested marks a link that was only loaded as a NESTED reference
+    inside another link (an "Attachment"-type nested link can surface into
+    the host document's own RevitLinkInstance collection, appearing
+    alongside genuinely independent top-level links with no visual
+    distinction) — confirmed via reflecting the installed RevitAPI.dll:
+    RevitLinkType.IsNestedLink is a real, documented property, not a
+    guess. These are excluded from the wizard's selectable Architecture/
+    Structure/Traffic lists (see LinkPickerDialog._build) — a user picking
+    "which link is Architecture" should never be offered something that
+    only exists because it happens to be nested inside another link, not
+    because it was independently, deliberately linked into this project.
+    They still count as an "other" link for Step 5's hide sweep if not
+    otherwise selected (this function's OWN result set is unfiltered;
+    only the wizard's checklist-building filters is_nested out)."""
     links = []
     for inst in DB.FilteredElementCollector(doc).OfClass(DB.RevitLinkInstance):
         link_doc = None
@@ -1127,15 +1197,22 @@ def get_all_link_instances():
             link_doc = inst.GetLinkDocument()
         except Exception:
             pass
+        is_nested = False
+        try:
+            link_type = doc.GetElement(inst.GetTypeId())
+            is_nested = bool(link_type.IsNestedLink)
+        except Exception:
+            pass
         name  = _elem_name(inst)
         title = link_doc.Title if link_doc is not None else name
         links.append({
-            u"instance": inst,
-            u"id"      : inst.Id,
-            u"doc"     : link_doc,
-            u"name"    : name,
-            u"title"   : title,
-            u"loaded"  : link_doc is not None,
+            u"instance" : inst,
+            u"id"       : inst.Id,
+            u"doc"      : link_doc,
+            u"name"     : name,
+            u"title"    : title,
+            u"loaded"   : link_doc is not None,
+            u"is_nested": is_nested,
         })
     return links
 
