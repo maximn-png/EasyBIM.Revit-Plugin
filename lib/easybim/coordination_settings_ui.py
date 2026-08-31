@@ -228,13 +228,17 @@ XAML = u"""
           <StackPanel>
             <TextBlock Text="MANUAL EXCEPTIONS (BY TYPE NAME)" Style="{StaticResource SectionHeader}"/>
             <TextBlock TextWrapping="Wrap" FontSize="10.5" Foreground="#8b93a7" Margin="0,2,0,0"
-                       Text="A Type Name listed here is ALWAYS treated as non-concrete, overriding every rule above -- for one specific type the keyword/material rules keep getting wrong."/>
+                       Text="A Type Name listed in either box below ALWAYS overrides every rule above, in that direction -- for one specific type the keyword/material rules keep getting wrong."/>
 
-            <TextBlock Text="EXCLUDED TYPE NAMES" Style="{StaticResource FieldLabel}"/>
+            <TextBlock Text="ALWAYS TREAT AS CONCRETE" Style="{StaticResource FieldLabel}"/>
+            <TextBox x:Name="ManualIncludeTypes" Style="{StaticResource FieldBox}"/>
+            <Button x:Name="BtnPickInclude" Content="Add from Model..." Style="{StaticResource GhostBtn}"
+                    HorizontalAlignment="Left" Padding="14,0" Margin="0,8,0,0"/>
+
+            <TextBlock Text="ALWAYS TREAT AS NON-CONCRETE" Style="{StaticResource FieldLabel}" Margin="0,16,0,3"/>
             <TextBox x:Name="ManualExcludeTypes" Style="{StaticResource FieldBox}"/>
-
-            <Button x:Name="BtnPickException" Content="Add from Model..." Style="{StaticResource GhostBtn}"
-                    HorizontalAlignment="Left" Padding="14,0" Margin="0,10,0,0"/>
+            <Button x:Name="BtnPickExclude" Content="Add from Model..." Style="{StaticResource GhostBtn}"
+                    HorizontalAlignment="Left" Padding="14,0" Margin="0,8,0,0"/>
           </StackPanel>
         </Border>
 
@@ -372,6 +376,7 @@ class SettingsDialog(object):
         w.FindName(u"TrafficLinkKw").Text = _join(s.get(u"TrafficLinkKeywords"))
         w.FindName(u"ConcreteKw").Text    = _join(s.get(u"ConcreteKeywords"))
         w.FindName(u"ExcludeKw").Text     = _join(s.get(u"ExcludeKeywords"))
+        w.FindName(u"ManualIncludeTypes").Text = _join(s.get(u"ManualIncludeTypeNames"))
         w.FindName(u"ManualExcludeTypes").Text = _join(s.get(u"ManualExcludeTypeNames"))
         w.FindName(u"StructPattern").Text = s.get(u"StructPatternName") or u""
         w.FindName(u"ArchPattern").Text   = s.get(u"ArchPatternName") or u""
@@ -396,7 +401,8 @@ class SettingsDialog(object):
         w.FindName(u"BtnCancel").Click += lambda s_, e: window.Close()
         w.FindName(u"BtnReset").Click  += self._on_reset
         w.FindName(u"BtnSave").Click   += self._on_save
-        w.FindName(u"BtnPickException").Click += self._on_pick_exception
+        w.FindName(u"BtnPickInclude").Click += self._on_pick_include
+        w.FindName(u"BtnPickExclude").Click += self._on_pick_exclude
 
         return window
 
@@ -432,6 +438,7 @@ class SettingsDialog(object):
         w.FindName(u"TrafficLinkKw").Text = _join(defaults[u"TrafficLinkKeywords"])
         w.FindName(u"ConcreteKw").Text    = _join(defaults[u"ConcreteKeywords"])
         w.FindName(u"ExcludeKw").Text     = _join(defaults[u"ExcludeKeywords"])
+        w.FindName(u"ManualIncludeTypes").Text = _join(defaults[u"ManualIncludeTypeNames"])
         w.FindName(u"ManualExcludeTypes").Text = _join(defaults[u"ManualExcludeTypeNames"])
         w.FindName(u"StructPattern").Text = defaults[u"StructPatternName"]
         w.FindName(u"ArchPattern").Text   = defaults[u"ArchPatternName"]
@@ -467,6 +474,7 @@ class SettingsDialog(object):
             u"TrafficLinkKeywords": _split(w.FindName(u"TrafficLinkKw").Text),
             u"ConcreteKeywords"   : _split(w.FindName(u"ConcreteKw").Text),
             u"ExcludeKeywords"    : _split(w.FindName(u"ExcludeKw").Text),
+            u"ManualIncludeTypeNames": _split(w.FindName(u"ManualIncludeTypes").Text),
             u"ManualExcludeTypeNames": _split(w.FindName(u"ManualExcludeTypes").Text),
             u"StructPatternName"  : struct_pattern,
             u"ArchPatternName"    : arch_pattern,
@@ -483,9 +491,17 @@ class SettingsDialog(object):
         self.saved = True
         w.Close()
 
-    def _on_pick_exception(self, sender, e):
+    def _on_pick_include(self, sender, e):
+        self._pick_and_add_exception(u"ManualIncludeTypes", u"treated as CONCRETE")
+
+    def _on_pick_exclude(self, sender, e):
+        self._pick_and_add_exception(u"ManualExcludeTypes", u"treated as NON-CONCRETE")
+
+    def _pick_and_add_exception(self, field_name, direction_label):
         """"Add from Model..." — pick a rogue linked element directly
-        instead of typing its Type Name blind. Hides this window (not
+        instead of typing its Type Name blind, and append it to whichever
+        of the two exception fields the caller points at (`field_name`:
+        ManualIncludeTypes or ManualExcludeTypes). Hides this window (not
         Close — Close would end the whole settings session and lose
         unsaved edits in the other fields) for the duration of the pick,
         since a modeless WPF window sitting on screen would otherwise
@@ -504,8 +520,8 @@ class SettingsDialog(object):
             try:
                 ref = uidoc.Selection.PickObject(
                     ObjectType.LinkedElement,
-                    u"Select a wall/column/framing/foundation in a link to exclude "
-                    u"from concrete coloring (Esc to cancel)")
+                    u"Select a wall/column/framing/foundation in a link to be "
+                    u"always {} (Esc to cancel)".format(direction_label))
             except RevitExceptions.OperationCanceledException:
                 return
             except Exception as ex:
@@ -538,12 +554,12 @@ class SettingsDialog(object):
                 err_tb.Text = u"The picked element has no readable Type Name."
                 return
 
-            current = _split(w.FindName(u"ManualExcludeTypes").Text)
+            current = _split(w.FindName(field_name).Text)
             if type_name in current:
-                err_tb.Text = u"'{}' is already in the exception list.".format(type_name)
+                err_tb.Text = u"'{}' is already in that list.".format(type_name)
             else:
                 current.append(type_name)
-                w.FindName(u"ManualExcludeTypes").Text = _join(current)
+                w.FindName(field_name).Text = _join(current)
                 err_tb.Text = u"Added '{}' — click Save to keep it.".format(type_name)
         finally:
             w.Show()
