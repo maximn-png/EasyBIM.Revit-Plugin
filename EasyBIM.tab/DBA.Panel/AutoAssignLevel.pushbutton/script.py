@@ -361,14 +361,17 @@ def run_assignment(elements, active_levels, process_groups):
                         offset_param.Set(z_pos - target_level.Elevation)
                 elif tier == TIER_FREESTANDING:
                     # Freestanding furniture/equipment/generic models: same
-                    # offset recalculation. Prefer the exact on-screen
-                    # "Elevation from Level" field — an unhosted instance
-                    # can still carry an unrelated, separately-existing
-                    # "Offset from Host" parameter, and picking that one
-                    # instead would leave the real Z-driving parameter
-                    # untouched.
+                    # offset recalculation. Prefer "Offset from Host" over
+                    # "Elevation from Level" — for some unassociated
+                    # face-based families (e.g. Lighting/Electrical
+                    # Fixtures whose host face is no longer resolvable),
+                    # "Elevation from Level" behaves as an absolute Z
+                    # elevation rather than a level-relative offset, so
+                    # writing to it here physically shifts the element in
+                    # 3D space instead of preserving its height under the
+                    # new level.
                     offset_param = _first_named_or_param(
-                        elem, [u"Elevation from Level"], FREESTANDING_OFFSET_PARAMS,
+                        elem, [u"Offset from Host", u"Elevation from Level"], FREESTANDING_OFFSET_PARAMS,
                         DB.StorageType.Double)
                     if offset_param and not offset_param.IsReadOnly:
                         offset_param.Set(z_pos - target_level.Elevation)
