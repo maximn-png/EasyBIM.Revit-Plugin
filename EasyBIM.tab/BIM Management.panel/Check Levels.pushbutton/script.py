@@ -7,12 +7,10 @@ Comparison logic:
   True_Absolute_Z = Level.Elevation + LinkInstance.GetTotalTransform().Origin.Z
   PBP extracted from BasePoint element (IsSharedBasePoint == False)
 
-Status logic:
-  GREEN  (OK)                     — name match + True_Absolute_Z match
-  RED    (Height Misalignment)    — name match + True_Absolute_Z differs
-  ORANGE (Wrong Name / Unknown)   — consultant level has no name match in arch
-  ORANGE (Missing in Consultant)  — arch level has no name match in consultant
-                                     (names the missing level explicitly)
+Status logic (3 conditions):
+  GREEN  (OK)                          — name match + True_Absolute_Z match
+  RED    (Height Misalignment)         — name match + True_Absolute_Z differs
+  ORANGE (Wrong Name / Unknown / Missing) — no name match / missing in consultant
 """
 
 import clr, os, traceback, re, datetime
@@ -37,6 +35,7 @@ import System.Windows.Media
 import System.Windows.Input
 
 from System.Windows.Markup import XamlReader
+from System.Windows.Interop import WindowInteropHelper
 from System.IO             import StringReader
 from System.Xml            import XmlReader as SysXmlReader
 
@@ -55,35 +54,30 @@ doc    = revit.doc
 # CONSTANTS
 # ─────────────────────────────────────────────────────────────────────────────
 
-TOLERANCE = 0.0001   # feet — for elevation matching
+TOLERANCE = 0.01   # feet (~3mm) — for elevation matching.
+# Must be looser than the display rounding (2 decimal cm = ~0.0003 ft) and
+# than the floating-point noise from combining two independently-sourced
+# offsets (e.g. raw + pbp_z vs raw + tz — see true_z below), otherwise
+# levels that are visibly identical in the report still fail comparison.
 
 CM = 30.48           # 1 ft → cm
 
-# ── LevelStatus enum ───────────────────────────────────────────────────────────
+# ── LevelStatus enum (3 states) ───────────────────────────────────────────────
 # GREEN  — name match + elevation within tolerance          → fully valid
 # RED    — name match found BUT elevation out of tolerance   → height error
-# ORANGE — no valid name match (unknown / wrong name),
-#          and no arch level shares its elevation either      → naming error
-# ORANGE — no name match, BUT an arch level shares its exact
-#          elevation → almost certainly the same physical      → S_WRONGNAME
-#          level, just misnamed. The matching arch level's
-#          name is recorded so the report can say what it
-#          should be renamed to.
-# ORANGE — arch level missing entirely in consultant         → S_MISSING (distinct
-#          text so the report states exactly which level is missing, instead of
-#          being lumped under the generic "Wrong Name / Unknown" label)
+# ORANGE — no valid name match (unknown / wrong name)        → naming error
+#          also covers: missing in consultant
 
-S_GREEN    = "OK"                          # green  — valid
-S_RED      = "Height Misalignment"         # red    — elevation error
-S_ORANGE   = "Wrong Name / Unknown"        # orange — naming, no elevation match either
-S_WRONGNAME= "Wrong Name (elevation matches)"  # orange — naming, but elevation matches an arch level
-S_MISSING  = "Missing in Consultant"       # orange — arch level absent in consultant
+S_GREEN  = "OK"                          # green  — valid
+S_RED    = "Height Misalignment"         # red    — elevation error
+S_ORANGE = "Wrong Name / Unknown"        # orange — naming / missing
 
 # Legacy aliases kept so chart/summary code that uses old names still works
 S_OK      = S_GREEN
 S_HEIGHT  = S_RED
 S_NAME    = S_ORANGE
 S_UNKNOWN = S_ORANGE
+S_MISSING = S_ORANGE
 
 # Excel fill colors — 0xRRGGBB  (3 colors per spec)
 HEX_GREEN  = 0x00C853   # vivid green  — OK
@@ -322,9 +316,7 @@ def get_loaded_links(document):
     silently merges them into a single entry and keeps whichever Document
     the collector happens to reach first — while still displaying the
     correct-looking filename — so the actual level data pulled for that
-    entry can belong to the WRONG physical file. This is exactly what was
-    observed: Architecture Reference showed the right filename, but its
-    level list didn't match that file's real levels.
+    entry can belong to the WRONG physical file.
 
     If two different full paths share a basename, the 2nd+ occurrence gets
     a " (2)", " (3)", ... suffix in its display name so both stay visible
@@ -395,72 +387,86 @@ def get_transform_z(link_instance):
 
 def get_pbp_elevation(link_doc, debug=False):
     """
-    Extract Project Base Point Z elevation (ft) from a linked document —
-    the "Elevation" value Revit shows when you select the Project Base
-    Point and look at the Properties palette / coordinate flyout.
+    Extract Project Base Point Z elevation (ft) from a linked document.
 
-    CONFIRMED against live data (TZE_C-AR-ARC-MAIN-R25.rvt, real PBP
-    Elevation = 4030 cm per the Properties palette, cross-checked because
-    that file's "GF_BLD 5" level sits at raw elevation 0 — i.e. exactly AT
-    the Project Base Point, so its true elevation must equal the PBP's own):
+    KEY INSIGHT from debug output:
+    The OST_ProjectBasePoint element has NO numeric elevation parameter visible —
+    only: Category, Design Option, Edited by, Workset, Family Name, Type Name.
+    Position.Z also returns 0 for most links.
 
-      GetProjectPosition(XYZ.Zero)   → 4000 cm  — WRONG (30 cm off)
-      GetProjectPosition(PBP.Position) → 4030 cm — CORRECT
+    CORRECT APPROACH:
+    The true PBP elevation in a linked file is stored on the
+    BasePoint element's SITE parameters — specifically read via
+    the parameter named "Elevation" (English) or "גובה" (Hebrew)
+    OR via get_BoundingBox which is unreliable.
 
-    The difference: GetProjectPosition(XYZ.Zero) reports the shared-
-    coordinates position of the model's internal origin. But the Project
-    Base Point element itself isn't necessarily located exactly at that
-    origin — its own Position can be offset from (0,0,0) — so the origin's
-    shared position and the PBP's own shared position are different points
-    entirely. Passing the PBP's own Position into GetProjectPosition gives
-    the position Revit actually means by "the Project Base Point".
+    MOST RELIABLE METHOD for linked docs:
+    Use DB.BasePoint.GetProjectPosition() equivalent — which in the API
+    means reading the BasePoint's internal coordinates directly from
+    the document's ProjectLocation / SiteLocation.
 
-    BASEPOINT_ELEVATION_PARAM does not exist on this element (confirmed:
-    get_Parameter returns None every time, and a full raw dump of every
-    parameter on the element — Category / Design Option / Edited by /
-    Workset / Family Name / Type Name — has nothing elevation-related).
+    For a linked document:
+      pbp_z = link_doc.ActiveProjectLocation
+                      .GetProjectPosition(XYZ.Zero).Elevation
+    This is exactly what Revit shows in the UI as the PBP elevation.
     """
     fname = os.path.basename(link_doc.PathName or "unknown")
-    project_location = link_doc.ActiveProjectLocation
 
+    # ── PRIMARY: ProjectLocation.GetProjectPosition(XYZ.Zero).Elevation ──────
+    # This reads the PBP Z offset from the document's own coordinate system.
+    # It's the same value Revit shows in Project Base Point > Elevation in UI.
+    try:
+        project_location = link_doc.ActiveProjectLocation
+        if project_location is not None:
+            origin = DB.XYZ(0, 0, 0)
+            proj_pos = project_location.GetProjectPosition(origin)
+            if proj_pos is not None:
+                z = proj_pos.Elevation
+                if debug:
+                    output.print_md(
+                        "**PBP `{}`** via GetProjectPosition → "
+                        "**{:.4f} ft = {:.2f} cm**".format(fname, z, z * CM))
+                return z
+    except Exception as ex:
+        if debug:
+            output.print_md("  GetProjectPosition FAILED: {}".format(ex))
+
+    # ── FALLBACK: OST_ProjectBasePoint → scan all parameter names ────────────
+    # Look for a parameter named "Elevation" / "גובה" / "Elev" on the element
+    ELEV_NAMES = ("elevation", u"גובה", "elev", "z")
     try:
         cat_filter = DB.ElementCategoryFilter(DB.BuiltInCategory.OST_ProjectBasePoint)
         pbp_list = list(DB.FilteredElementCollector(link_doc)
                           .WherePasses(cat_filter).ToElements())
+        if debug:
+            output.print_md("  Fallback: {} OST_ProjectBasePoint elements".format(len(pbp_list)))
+
+        for bp in pbp_list:
+            if debug:
+                output.print_md("  Scanning all params:")
+            for p in bp.Parameters:
+                try:
+                    pname = p.Definition.Name.lower()
+                    if debug:
+                        try:
+                            val = p.AsValueString() or p.AsString() or "{:.4f}".format(p.AsDouble())
+                            output.print_md("    `{}` = {}".format(p.Definition.Name, val))
+                        except Exception:
+                            pass
+                    if pname in ELEV_NAMES:
+                        z = p.AsDouble()
+                        if debug:
+                            output.print_md("  Found '{}' = {:.4f} ft = {:.2f} cm".format(
+                                p.Definition.Name, z, z * CM))
+                        return z
+                except Exception:
+                    pass
     except Exception as ex:
         if debug:
-            output.print_md(u"  OST_ProjectBasePoint collector FAILED for `{}`: {}".format(fname, ex))
-        pbp_list = []
-
-    for bp in pbp_list:
-        try:
-            z = project_location.GetProjectPosition(bp.Position).Elevation
-            if debug:
-                output.print_md(
-                    u"**PBP `{}`** via GetProjectPosition(PBP.Position) → "
-                    u"**{:.4f} ft = {:.2f} cm**".format(fname, z, z * CM))
-            return z
-        except Exception as ex:
-            if debug:
-                output.print_md(u"  GetProjectPosition(PBP.Position) FAILED for `{}`: {}".format(fname, ex))
-
-    # ── Fallback: origin-based position. Known to be wrong when the PBP's
-    # own Position is offset from the internal origin, but better than 0.0
-    # if no OST_ProjectBasePoint element was found at all.
-    try:
-        if project_location is not None:
-            z = project_location.GetProjectPosition(DB.XYZ(0, 0, 0)).Elevation
-            if debug:
-                output.print_md(
-                    u"**PBP `{}`** via GetProjectPosition(origin) [fallback — "
-                    u"no PBP element found] → **{:.4f} ft = {:.2f} cm**".format(fname, z, z * CM))
-            return z
-    except Exception as ex:
-        if debug:
-            output.print_md(u"  GetProjectPosition(origin) FAILED for `{}`: {}".format(fname, ex))
+            output.print_md("  Fallback scan FAILED: {}".format(ex))
 
     if debug:
-        output.print_md(u"  **All strategies failed for `{}` → returning 0.0**".format(fname))
+        output.print_md("  **All strategies failed → returning 0.0**")
     return 0.0
 
 
@@ -553,11 +559,15 @@ def _get_levels_for_instance(link_info, inst, debug_output=False):
             disp_abs  = raw + tz
 
         # ── true_z (used ONLY for comparison between models) ─────────────────
-        # Comparison must use the Absolute elevation (Level.Elevation + PBP
-        # offset / link transform), NOT the raw Level.Elevation. Two levels
-        # with the same name can share the same raw elevation while sitting
-        # at different real-world heights if their files have different PBP
-        # placements — only the absolute value reflects the true coordinate.
+        # A level's raw Elevation is relative to whatever "Elevation Base" it
+        # uses (Project Base Point or Survey Point). Two files legitimately
+        # use different bases for the same physical level (e.g. architecture
+        # on Survey Point, HVAC on Project Base Point) — comparing raw values
+        # directly is invalid in that case even though both levels sit at the
+        # same real-world height. disp_abs already normalizes each level to
+        # an absolute elevation (PBP branch adds the file's own PBP offset,
+        # SP branch adds the link's placement transform), so reuse it here
+        # instead of comparing raw.
         true_z = disp_abs
 
         if debug_output:
@@ -616,48 +626,30 @@ def get_levels_data(link_info, debug_output=False):
 
 def compare_levels(arch_rows, cons_rows, level_filter=None):
     """
-    Level Validation Engine.
+    Level Validation Engine — 3-status classification.
 
     level_filter: list of arch level names to include (None = all).
 
-    ┌───────────────────────────────────────────────────────────────────────┐
-    │  Status       │ Name match │ Elevation match │ Color  │
-    ├───────────────────────────────────────────────────────────────────────┤
-    │  GREEN        │  ✓ found   │  ✓ yes          │ green  │
-    │  RED          │  ✓ found   │  ✗ no           │ red    │
-    │  S_WRONGNAME  │  ✗ none    │  ✓ matches an   │ orange │  ← same physical
-    │               │            │    arch level    │        │    level, wrong name
-    │  ORANGE       │  ✗ none    │  ✗ no match      │ orange │
-    └───────────────────────────────────────────────────────────────────────┘
+    ┌─────────────────────────────────────────────────────────────────────┐
+    │  Status   │  Name match   │  Elevation within tolerance   │  Color  │
+    ├─────────────────────────────────────────────────────────────────────┤
+    │  GREEN    │  ✓ found      │  ✓ yes                        │  green  │
+    │  RED      │  ✓ found      │  ✗ no                         │  red    │
+    │  ORANGE   │  ✗ not found  │  (irrelevant)                 │  orange │
+    └─────────────────────────────────────────────────────────────────────┘
 
     Matching uses normalize_name() so "Level 01", "LEVEL 01", "level 01"
     are all treated as identical.
 
-    S_WRONGNAME rows record which arch level's name they should match in
-    "expected_name" — this is the naming-error case explicitly called out:
-    a consultant level sitting at exactly an architecture level's elevation
-    but filed under a different name.
-
-    Pass 2 adds a "Missing in Consultant" row (orange) for each arch level
-    that has no name match at all in the consultant, naming it explicitly.
+    Pass 2 adds ORANGE rows for arch levels missing entirely in consultant.
     """
     # ── Apply optional level filter ───────────────────────────────────────────
     if level_filter:
         filter_set = {normalize_name(n) for n in level_filter}
         arch_rows  = [r for r in arch_rows
                       if normalize_name(r["name"]) in filter_set]
-
-        # Keep a consultant row if EITHER its name matches a selected arch
-        # level OR its elevation matches one — not name alone. Filtering by
-        # name only would throw away exactly the wrongly-named-but-right-
-        # elevation rows the S_WRONGNAME check below needs to see, since by
-        # definition their name does NOT match any selected arch level.
-        filtered_arch_elevs = [r["true_z"] for r in arch_rows]
-        cons_rows = [
-            r for r in cons_rows
-            if normalize_name(r["name"]) in filter_set
-            or any(abs(r["true_z"] - z) <= TOLERANCE for z in filtered_arch_elevs)
-        ]
+        cons_rows  = [r for r in cons_rows
+                      if normalize_name(r["name"]) in filter_set]
 
     # ── Build normalized arch lookup ──────────────────────────────────────────
     # Key = normalized name → value = true_z
@@ -682,7 +674,6 @@ def compare_levels(arch_rows, cons_rows, level_filter=None):
     for row in cons_rows:
         norm = normalize_name(row["name"])
         z    = row["true_z"]
-        expected_name = None
 
         if norm in arch_by_norm:
             # Name match found — check for ambiguity first
@@ -702,59 +693,32 @@ def compare_levels(arch_rows, cons_rows, level_filter=None):
                 desired = arch_by_norm[norm]
                 color   = HEX_RED
         else:
-            # No name match — but if this level's elevation exactly matches an
-            # arch level anyway, it's almost certainly the SAME physical level
-            # under a different name. Flag it explicitly as a naming issue and
-            # record which arch level it should be renamed to match.
-            elev_match = None
-            for arch_row in arch_rows:
-                if abs(z - arch_row["true_z"]) <= TOLERANCE:
-                    elev_match = arch_row
-                    break
-
-            if elev_match is not None:
-                status        = S_WRONGNAME
-                desired       = elev_match["true_z"]
-                expected_name = elev_match["name"]
-                color         = HEX_ORANGE
-            else:
-                # ORANGE — no valid name match, no elevation match either
-                status  = S_ORANGE
-                desired = None
-                color   = HEX_ORANGE
+            # ORANGE — no valid name match
+            status  = S_ORANGE
+            desired = None
+            color   = HEX_ORANGE
 
         r = dict(row)
-        r["status"]        = status
-        r["desired"]       = desired
-        r["expected_name"] = expected_name
-        r["color"]         = color
+        r["status"]  = status
+        r["desired"] = desired
+        r["color"]   = color
         out.append(r)
 
-    # ── Pass 2: arch levels completely absent in consultant → S_MISSING ───────
-    # Distinct status text (not S_ORANGE) so the report states plainly which
-    # named level is missing, rather than lumping it under "Wrong Name / Unknown".
-    #
-    # Skip arch levels already claimed by a Pass-1 S_WRONGNAME row — otherwise
-    # the SAME arch level shows up twice with contradictory-looking rows: e.g.
-    # "ST-97 should be renamed to B3" AND, separately, "B3 is missing".
-    wrongname_resolved = {normalize_name(r["expected_name"]) for r in out
-                          if r["status"] == S_WRONGNAME}
-    fallback_fname = cons_rows[0]["filename"] if cons_rows else ""
+    # ── Pass 2: arch levels completely absent in consultant → ORANGE ──────────
     for arch_row in arch_rows:
         norm = normalize_name(arch_row["name"])
-        if norm not in cons_norm_names and norm not in wrongname_resolved:
+        if norm not in cons_norm_names:
             out.append({
-                "filename"     : fallback_fname,
-                "name"         : arch_row["name"],
-                "base"         : "-",
-                "disp_elev"    : None,
-                "disp_pbp"     : None,
-                "disp_abs"     : None,
-                "true_z"       : None,
-                "status"       : S_MISSING,
-                "desired"      : arch_row["true_z"],
-                "expected_name": None,
-                "color"        : HEX_ORANGE,
+                "filename"  : out[0]["filename"] if out else "",
+                "name"      : arch_row["name"],
+                "base"      : "-",
+                "disp_elev" : None,
+                "disp_pbp"  : None,
+                "disp_abs"  : None,
+                "true_z"    : None,
+                "status"    : S_ORANGE,
+                "desired"   : arch_row["true_z"],
+                "color"     : HEX_ORANGE,
             })
 
     # Sort: matched rows first (by abs elevation), then missing (Nones last)
@@ -774,11 +738,10 @@ DETAIL_COLS = [
     "PBP elevation",
     "Absolute elevation",
     "Status",
-    "Expected Level Name",
     "Desired elevation",
 ]
 
-COL_WIDTHS = [38, 22, 22, 14, 14, 20, 26, 22, 18]
+COL_WIDTHS = [38, 22, 22, 14, 14, 20, 28, 18]
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -823,7 +786,6 @@ def build_csv(arch_info, results_map, save_path):
                 _fmt(ft_to_cm(r.get("disp_pbp"))),
                 _fmt(ft_to_cm(r.get("disp_abs"))),
                 r.get("status", u""),
-                r.get("expected_name") or u"",
                 _fmt(ft_to_cm(r.get("desired"))) if r.get("desired") != "-" else u"-",
             ])
 
@@ -853,7 +815,7 @@ def build_excel(arch_info, results_map, save_path, link_info_map=None, arch_rows
     Build the multi-tab .xlsx file.
 
     Tab 1  — Reference  (levels of the architecture model everything is compared to)
-    Tab 2  — Summary    (counts per link per status)
+    Tab 2  — Summary     (counts per link per status)
     Tab 3  — Chart
     Tab 4+ — One tab per consultant link (detail rows)
     """
@@ -901,16 +863,15 @@ def build_excel(arch_info, results_map, save_path, link_info_map=None, arch_rows
     _o = (mk_text(HEX_ORANGE), mk_num(HEX_ORANGE), mk_ctr(HEX_ORANGE))
 
     STATUS_FMT = {
-        S_GREEN    : _g,
-        S_RED      : _r,
-        S_ORANGE   : _o,
-        S_WRONGNAME: _o,
-        S_MISSING  : _o,
+        S_GREEN  : _g,
+        S_RED    : _r,
+        S_ORANGE : _o,
         # legacy aliases
         S_OK     : _g,
         S_HEIGHT : _r,
         S_NAME   : _o,
         S_UNKNOWN: _o,
+        S_MISSING: _o,
     }
 
     # ── TAB 1: Reference (the architecture model everything is compared to) ──
@@ -945,12 +906,12 @@ def build_excel(arch_info, results_map, save_path, link_info_map=None, arch_rows
     ws_sum.freeze_panes(1, 0)
 
     sum_hdrs = [
+        u"Status",
         "RVT Link: File Name",
         S_GREEN,   # OK
         S_RED,     # Height Misalignment
         S_ORANGE,  # Wrong Name / Unknown / Missing
     ]
-    sum_hdrs = [u"Status"] + sum_hdrs
     for ci, h in enumerate(sum_hdrs):
         ws_sum.write(0, ci, h, hdr)
 
@@ -1201,18 +1162,14 @@ def build_excel(arch_info, results_map, save_path, link_info_map=None, arch_rows
             # col 6 — Status
             ws.write(ri, 6, r["status"], cf)
 
-            # col 7 — Expected Level Name (only set for S_WRONGNAME rows —
-            # the arch level name this consultant level should be renamed to)
-            ws.write(ri, 7, r.get("expected_name") or "", tf)
-
-            # col 8 — Desired elevation (cm)
+            # col 7 — Desired elevation (cm)
             #   None   → blank
             #   number → converted from ft
             d = r["desired"]
             if d is None:
-                ws.write_blank(ri, 8, None, nf)
+                ws.write_blank(ri, 7, None, nf)
             else:
-                ws.write_number(ri, 8, ft_to_cm(d), nf)
+                ws.write_number(ri, 7, ft_to_cm(d), nf)
 
     wb.close()
 
@@ -1257,7 +1214,6 @@ _COL_NOTES = {
     u"PBP elevation":       u"The Project Base Point's own height in this file",
     u"Absolute elevation":  u"True height in shared coordinates",
     u"Status":              u"Result of comparing to the architecture reference",
-    u"Expected Level Name": u"Architecture level this elevation actually matches",
     u"Desired elevation":   u"The elevation this level should have",
 }
 
@@ -1512,6 +1468,11 @@ def build_html(arch_info, arch_rows, results_map, save_path, link_info_map=None)
     presented for a much faster "what's wrong, right now" read: status
     cards up front, click-to-jump tabs per consultant link, and a live
     search box across all detail tables.
+
+    Consumes the 3-status schema (S_GREEN / S_RED / S_ORANGE, with
+    S_MISSING as an alias of S_ORANGE) that compare_levels() actually
+    returns — there is no "Expected Level Name" column here because ours'
+    row shape has no expected_name field.
     """
     import io
 
@@ -1664,7 +1625,7 @@ def build_html(arch_info, arch_rows, results_map, save_path, link_info_map=None)
                      u"<div class=\"table-wrap\"><table class=\"detail-table\"><thead><tr>".format(
                          slug=o["slug"], disp=display))
         for ci, h in enumerate(DETAIL_COLS):
-            th_cls = u" class=\"num\"" if ci in (3, 4, 5, 8) else u""
+            th_cls = u" class=\"num\"" if ci in (3, 4, 5, 7) else u""
             parts.append(_th_html(h, th_cls))
         parts.append(u"</tr></thead><tbody>")
         for r in rows:
@@ -1677,7 +1638,6 @@ def build_html(arch_info, arch_rows, results_map, save_path, link_info_map=None)
                 u"<td class=\"num\">{elev}</td><td class=\"num\">{pbp}</td>"
                 u"<td class=\"num\">{abs_}</td>"
                 u"<td><span class=\"chip {cls}\">{status}</span></td>"
-                u"<td>{expected}</td>"
                 u"<td class=\"num\">{desired}</td></tr>".format(
                     cls=row_cls, name_attr=_html_escape(r["name"]),
                     fname=_html_escape(r["filename"]), name=_html_escape(r["name"]),
@@ -1686,7 +1646,6 @@ def build_html(arch_info, arch_rows, results_map, save_path, link_info_map=None)
                     pbp=_html_num(ft_to_cm(r["disp_pbp"])),
                     abs_=_html_num(ft_to_cm(r["disp_abs"])),
                     status=_html_escape(r["status"]),
-                    expected=_html_escape(r.get("expected_name") or u""),
                     desired=desired_txt))
         parts.append(u"</tbody></table></div></div>")
     parts.append(u"</section>")
@@ -2007,23 +1966,21 @@ _SESSION = {
 }
 
 
-def _smart_arch_default(names):
+def _smart_arch_default(links):
     """
-    Pick a default filename out of an already-sorted list of link filenames.
-
     Priority:
       1. filename contains both 'AR' and 'MAIN'
       2. filename contains 'AR'
-      3. first name (alphabetically, since `names` is pre-sorted)
+      3. index 0
     """
-    for n in names:
-        u = n.upper()
-        if "AR" in u and "MAIN" in u:
-            return n
-    for n in names:
-        if "AR" in n.upper():
-            return n
-    return names[0] if names else None
+    names = [li["filename"].upper() for li in links]
+    for i, n in enumerate(names):
+        if "AR" in n and "MAIN" in n:
+            return i
+    for i, n in enumerate(names):
+        if "AR" in n:
+            return i
+    return 0
 
 
 def _make_level_row(name, elev_cm):
@@ -2095,20 +2052,19 @@ class SelectionDialog(object):
         window = XamlReader.Load(ctx)
         self._window = window
 
-        # ── Architecture combo (alphabetical) ─────────────────────────────────
+        # ── Architecture combo ────────────────────────────────────────────────
         combo = window.FindName("ArchCombo")
-        sorted_names = sorted((li["filename"] for li in self.links), key=lambda n: n.upper())
-        for n in sorted_names:
-            combo.Items.Add(n)
+        for li in self.links:
+            combo.Items.Add(li["filename"])
 
-        # Smart default then session override — resolved by filename, so it's
-        # immune to ordering (works regardless of how `self.links` is sorted).
-        if _SESSION["arch_name"] in sorted_names:
-            default_name = _SESSION["arch_name"]
-        else:
-            default_name = _smart_arch_default(sorted_names)
-        combo.SelectedItem = default_name
-
+        # Smart default then session override
+        default_idx = _smart_arch_default(self.links)
+        if _SESSION["arch_name"]:
+            for i, li in enumerate(self.links):
+                if li["filename"] == _SESSION["arch_name"]:
+                    default_idx = i
+                    break
+        combo.SelectedIndex = default_idx
         self._arch_changed_handler = self._on_arch_changed
         combo.SelectionChanged += self._arch_changed_handler
 
@@ -2155,8 +2111,7 @@ class SelectionDialog(object):
 
         session_cons = _SESSION["cons_names"]
 
-        sorted_links = sorted(self.links, key=lambda li: li["filename"].upper())
-        for li in sorted_links:
+        for li in self.links:
             if li["filename"] == arch:
                 continue
 
@@ -2382,7 +2337,7 @@ class SelectionDialog(object):
         combo   = self._window.FindName("ArchCombo")
         current = combo.SelectedItem
 
-        names    = sorted((li["filename"] for li in self.links), key=lambda n: n.upper())
+        names    = [li["filename"] for li in self.links]
         filtered = [n for n in names if not text or text in n.lower()]
 
         combo.SelectionChanged -= self._arch_changed_handler
@@ -2503,11 +2458,21 @@ class SelectionDialog(object):
         window = self._build()
         frame  = DispatcherFrame()
 
+        # Parent the dialog to Revit's main window so it floats above Revit
+        # without being lost behind it, but without forcing itself ahead of
+        # everything else (pyRevit's own output window, TaskDialogs, other
+        # apps) the way a global Topmost would.
+        try:
+            WindowInteropHelper(window).Owner = System.IntPtr(revit.uiapp.MainWindowHandle.ToInt64())
+        except Exception:
+            pass
+
         def on_closed(sender, e):
             frame.Continue = False
 
         window.Closed += on_closed
         window.Show()
+        window.Activate()
         Dispatcher.PushFrame(frame)
 
 
@@ -2627,18 +2592,18 @@ def main():
         output.print_md("```\n{}\n```".format(traceback.format_exc()))
         return
 
-    # ── Build interactive HTML report (same folder/basename as the .xlsx) ────
+    # -- Build interactive HTML report (same folder/basename as the .xlsx) --
     html_path = save_path[:-len(".xlsx")] + ".html"
     try:
         build_html(arch_info, arch_rows, results_map, html_path,
                    link_info_map=link_info_map)
-        output.print_md(u"✅ **HTML report saved:** `{}`".format(html_path))
+        output.print_md(u"\u2705 **HTML report saved:** `{}`".format(html_path))
     except Exception as ex:
-        output.print_md(u"❌ **HTML export error:** `{}`".format(ex))
+        output.print_md(u"\u274c **HTML export error:** `{}`".format(ex))
         output.print_md("```\n{}\n```".format(traceback.format_exc()))
         html_path = None
 
-    # ── Open files ─────────────────────────────────────────────────────────────
+    # -- Open files --
     try:
         import subprocess
         subprocess.Popen(["explorer", save_path])
