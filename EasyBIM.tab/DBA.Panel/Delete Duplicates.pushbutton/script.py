@@ -9,17 +9,21 @@ dialog, so it is language- and category-independent — it works for whatever
 Revit itself considers a duplicate (furniture, fixtures, rooms, etc.), not
 just elements that merely look alike.
 
-That warning is unreliable for line-based elements — two perfectly
-overlapping duct/pipe/cable-tray/conduit/wall/beam segments routinely
-produce no Revit warning at all. Those categories get a second,
-geometry-based check (same category + matching curve endpoints) instead of
-relying on the warning (see find_geometric_duplicates).
+That warning is unreliable for a lot of elements — two perfectly overlapping
+ducts/pipes/walls/beams, or two point-placed instances sitting in the exact
+same spot, routinely produce no Revit warning at all. Every physical model
+element (not just a hardcoded category list) also gets a geometry-based
+check — same category + matching position/shape (curve endpoints, insertion
+point, or bounding box, whichever the element has) — instead of relying on
+the warning alone (see find_geometric_duplicates).
 
-The tool walks through a small 2-step dialog (styled to match EasyBIM's other
+The tool walks through a small 3-step dialog (styled to match EasyBIM's other
 wizard tools, e.g. Solution Section):
-  1. Scope   — Current Selection / Active View / Entire Model
-  2. Review  — every element/group about to be deleted, with checkboxes to
-               keep specific items, followed by a result summary
+  1. Scope      — Current Selection / Active View / Entire Model
+  2. Categories — every category found in that scope, checked by default;
+                  untick any category to exclude it from the check entirely
+  3. Review     — every element/group about to be deleted, with checkboxes
+                  to keep specific items, followed by a result summary
 
 Group instances get special treatment: if every member of a Model Group
 instance is itself flagged as a duplicate of a member in one specific other
@@ -89,22 +93,12 @@ def is_duplicate_warning(msg):
     return "identical instance" in text.lower()
 
 
-# Revit's own "identical instances" warning is built around point-placed
-# family instances and does not reliably fire for these line-based
-# categories — two perfectly overlapping duct/pipe/wall/beam segments
-# routinely produce no warning at all. They get a geometry-based duplicate
-# check of their own (see find_geometric_duplicates) instead of relying on
-# doc.GetWarnings().
-GEOMETRIC_DUP_CATEGORIES = [
-    DB.BuiltInCategory.OST_DuctCurves,
-    DB.BuiltInCategory.OST_FlexDuctCurves,
-    DB.BuiltInCategory.OST_PipeCurves,
-    DB.BuiltInCategory.OST_FlexPipeCurves,
-    DB.BuiltInCategory.OST_CableTray,
-    DB.BuiltInCategory.OST_Conduit,
-    DB.BuiltInCategory.OST_Walls,
-    DB.BuiltInCategory.OST_StructuralFraming,
-]
+# Revit's own "identical instances" warning does not reliably fire for
+# every kind of duplicate — two perfectly overlapping duct/pipe/wall/beam
+# segments routinely produce no warning at all, and neither do some
+# point-placed instances. Every physical model element gets a geometry-based
+# duplicate check of its own (see find_geometric_duplicates) instead of
+# relying only on doc.GetWarnings().
 GEOMETRIC_DUP_TOLERANCE = 0.01  # feet (~3mm) — matches Revit's own snap tolerance
 
 
@@ -149,95 +143,194 @@ def _rounded_endpoint_key(curve):
     return (tuple(sorted((a, b))), length_key)
 
 
-def find_geometric_duplicates(scope_ids):
-    """Group ducts/pipes/cable trays/conduit/walls/structural framing that
-    occupy the exact same curve (endpoints + length match within
-    GEOMETRIC_DUP_TOLERANCE, see _rounded_endpoint_key) — this is the
-    fallback for the line-based categories where Revit's own "identical
-    instances" warning does not reliably fire (see GEOMETRIC_DUP_CATEGORIES
-    above).
+def _rounded_point_key(pt):
+    """A point's coordinates rounded to GEOMETRIC_DUP_TOLERANCE."""
+    return (
+        round(pt.X / GEOMETRIC_DUP_TOLERANCE),
+        round(pt.Y / GEOMETRIC_DUP_TOLERANCE),
+        round(pt.Z / GEOMETRIC_DUP_TOLERANCE),
+    )
 
-    Matching is by category + curve shape only, NOT by Type: two straight
-    segments of the same category that share both endpoints are already an
-    overlap regardless of which Type each happens to reference (a
-    duplicate created via copy/paste-in-place, an import, or a family swap
-    can easily end up on a different Type than the original). Segments
-    that merely touch end-to-end (a continuous run) share only one
-    endpoint, not both, so they are never mistaken for an overlap. Anything
-    this flags still goes through the same review screen before deletion,
-    so a same-position/different-type pair can simply be unticked if it
-    turns out not to be a real duplicate.
+
+def _rounded_bbox_key(bbox):
+    """A bounding box's Min/Max corners, each rounded to
+    GEOMETRIC_DUP_TOLERANCE. This is the fallback for elements that have
+    neither a LocationCurve nor a LocationPoint (e.g. some in-place
+    families, imports, or link instances) — coarser than an exact
+    curve/point match, but still enough to catch two literal copies
+    sitting in the exact same place."""
+    return (_rounded_point_key(bbox.Min), _rounded_point_key(bbox.Max))
+
+
+def _geometry_signature(elem):
+    """Identify an element's physical position/shape for duplicate
+    matching. Returns (geometry_type, signature) or None if the element has
+    nothing usable to compare (no Location and no BoundingBox) — those
+    elements are skipped entirely since there is no reliable "same place"
+    check for them.
+
+    - LocationCurve elements (ducts, pipes, walls, framing, ...) key off
+      endpoints + length (see _rounded_endpoint_key).
+    - LocationPoint elements (furniture, fixtures, rooms, columns, ...) key
+      off the rounded insertion point. Rotation/Type are deliberately not
+      part of the key, same as the curve-based check — anything this flags
+      still goes through the review screen before deletion, so a
+      same-position/different-type (or different-rotation) pair can simply
+      be unticked if it turns out not to be a real duplicate.
+    - Anything else falls back to its model bounding box, rounded Min/Max.
+    """
+    loc = elem.Location
+    if isinstance(loc, DB.LocationCurve):
+        try:
+            return ("curve", _rounded_endpoint_key(loc.Curve))
+        except Exception:
+            return None
+    if isinstance(loc, DB.LocationPoint):
+        try:
+            return ("point", _rounded_point_key(loc.Point))
+        except Exception:
+            return None
+    try:
+        bbox = elem.get_BoundingBox(None)
+    except Exception:
+        bbox = None
+    if bbox is None:
+        return None
+    try:
+        return ("bbox", _rounded_bbox_key(bbox))
+    except Exception:
+        return None
+
+
+def _scoped_model_collector(scope_ids):
+    """FilteredElementCollector narrowed to scope_ids up front (Current
+    Selection / Active View) via the FilteredElementCollector(doc, ids)
+    constructor, instead of walking every element in the whole document
+    and discarding most of them one at a time in Python — the latter turns
+    even a 2-element Current Selection check into a full-model scan, which
+    on a real project is slow enough to make the dialog look hung (no
+    progress indicator, so a multi-second synchronous scan on the UI
+    thread reads as an unresponsive Next button). Entire Model (scope_ids
+    is None) still needs the full document."""
+    if scope_ids is not None:
+        ids = SCG.List[DB.ElementId]([DB.ElementId(iv) for iv in scope_ids])
+        return DB.FilteredElementCollector(doc, ids).WhereElementIsNotElementType()
+    return DB.FilteredElementCollector(doc).WhereElementIsNotElementType()
+
+
+def _discover_categories(scope_ids):
+    """Every Model-category present among elements in scope, with a count
+    of matching elements each, sorted by name — powers the Categories
+    step's checklist so the duplicate check can be limited to just the
+    categories the user cares about instead of always running against
+    everything in scope.
+
+    Returns a list of (CategoryId.IntegerValue, name, count) tuples."""
+    counts = defaultdict(int)
+    names = {}
+    for elem in _scoped_model_collector(scope_ids):
+        cat = elem.Category
+        if cat is None or cat.CategoryType != DB.CategoryType.Model:
+            continue
+        cat_iv = cat.Id.IntegerValue
+        counts[cat_iv] += 1
+        names[cat_iv] = cat.Name
+    return sorted(
+        ((cat_iv, names[cat_iv], counts[cat_iv]) for cat_iv in counts),
+        key=lambda t: t[1].lower()
+    )
+
+
+def find_geometric_duplicates(scope_ids, category_ids=None):
+    """Group every physical model element (any category — not a hardcoded
+    list) that occupies the exact same position/shape (within
+    GEOMETRIC_DUP_TOLERANCE, see _geometry_signature) — this is the fallback
+    for whatever Revit's own "identical instances" warning doesn't reliably
+    cover: line-based elements (ducts/pipes/walls/framing/...) as well as
+    point-placed instances that Revit's warning happens to miss.
+
+    Only elements whose Category.CategoryType is Model are considered —
+    this excludes annotation, view-specific, and internal elements (text,
+    tags, dimensions, view elements, etc.) that could never be a physical
+    duplicate in the first place. Elements with no usable geometry (no
+    Location, no BoundingBox — e.g. most Materials) are skipped by
+    _geometry_signature returning None. category_ids, when given (see the
+    Categories wizard step), further restricts this to just those
+    Category.Id.IntegerValue values.
+
+    Matching is by category + shape only, NOT by Type: two elements of the
+    same category that share the same position are already an overlap
+    regardless of which Type each happens to reference (a duplicate created
+    via copy/paste-in-place, an import, or a family swap can easily end up
+    on a different Type than the original). Anything this flags still goes
+    through the same review screen before deletion, so a same-position/
+    different-type pair can simply be unticked if it turns out not to be a
+    real duplicate.
 
     Returns:
-        groups_found - number of overlapping-curve clusters found
+        groups_found - number of overlapping-geometry clusters found
         clusters     - list of lists of ElementId; each inner list holds
-                       every element (>= 2) found occupying the same curve.
-                       Deciding which one "survives" is left to the caller
-                       (find_duplicates_to_delete), which merges these
-                       clusters with the warning-based ones before picking
-                       a single global survivor per physical duplicate.
+                       every element (>= 2) found occupying the same
+                       position/shape. Deciding which one "survives" is left
+                       to the caller (find_duplicates_to_delete), which
+                       merges these clusters with the warning-based ones
+                       before picking a single global survivor per physical
+                       duplicate.
     """
-    buckets = defaultdict(list)  # (category, endpoint+length key) -> [ElementId]
-    for bic in GEOMETRIC_DUP_CATEGORIES:
-        collector = DB.FilteredElementCollector(doc).OfCategory(bic).WhereElementIsNotElementType()
-        for elem in collector:
-            if scope_ids is not None and elem.Id.IntegerValue not in scope_ids:
-                continue
-            loc = elem.Location
-            if not isinstance(loc, DB.LocationCurve):
-                continue
-            try:
-                key = (int(bic), _rounded_endpoint_key(loc.Curve))
-            except Exception:
-                continue
-            buckets[key].append(elem.Id)
+    buckets = defaultdict(list)  # (CategoryId, geometry_type, signature) -> [ElementId]
+    for elem in _scoped_model_collector(scope_ids):
+        cat = elem.Category
+        if cat is None or cat.CategoryType != DB.CategoryType.Model:
+            continue
+        cat_iv = cat.Id.IntegerValue
+        if category_ids is not None and cat_iv not in category_ids:
+            continue
+        sig = _geometry_signature(elem)
+        if sig is None:
+            continue
+        geom_type, signature = sig
+        key = (cat_iv, geom_type, signature)
+        buckets[key].append(elem.Id)
 
     clusters = [ids for ids in buckets.values() if len(ids) >= 2]
     return len(clusters), clusters
 
 
-def debug_geometric_candidates(scope_ids):
-    """Diagnostic dump of every line-based candidate in scope — prints
-    category, Id, type, and raw/rounded curve endpoints so a pair that
-    still isn't grouped by find_geometric_duplicates can be compared by
-    eye. Only meant for a small scope (Current Selection)."""
+def debug_geometric_candidates(scope_ids, category_ids=None):
+    """Diagnostic dump of every candidate in scope — prints category, Id,
+    type, and the geometry signature find_geometric_duplicates would use
+    (or the reason an element was skipped, including exclusion by the
+    Categories step's category_ids filter), so a pair that still isn't
+    grouped can be compared by eye. Only meant for a small scope (Current
+    Selection)."""
     rows = []
-    for bic in GEOMETRIC_DUP_CATEGORIES:
-        collector = DB.FilteredElementCollector(doc).OfCategory(bic).WhereElementIsNotElementType()
-        for elem in collector:
-            if scope_ids is not None and elem.Id.IntegerValue not in scope_ids:
-                continue
-            loc = elem.Location
-            if not isinstance(loc, DB.LocationCurve):
-                rows.append((elem.Id.IntegerValue, elem.Category.Name if elem.Category else "?",
-                             "NOT a LocationCurve ({})".format(type(loc).__name__ if loc else "None"),
-                             None, None, None))
-                continue
-            curve = loc.Curve
-            p0, p1 = curve.GetEndPoint(0), curve.GetEndPoint(1)
-            type_elem = doc.GetElement(elem.GetTypeId())
-            type_name = type_elem.Name if type_elem is not None else "?"
-            try:
-                rkey = _rounded_endpoint_key(curve)
-            except Exception as ex:
-                rkey = "ERROR: {}".format(ex)
-            rows.append((elem.Id.IntegerValue, elem.Category.Name if elem.Category else "?",
-                         type_name, p0, p1, rkey))
+    for elem in _scoped_model_collector(scope_ids):
+        cat = elem.Category
+        cat_name = cat.Name if cat else "?"
+        if cat is None or cat.CategoryType != DB.CategoryType.Model:
+            rows.append((elem.Id.IntegerValue, cat_name, "?", "skipped (not a Model category)"))
+            continue
+        if category_ids is not None and cat.Id.IntegerValue not in category_ids:
+            rows.append((elem.Id.IntegerValue, cat_name, "?", "skipped (excluded by category filter)"))
+            continue
+        type_elem = doc.GetElement(elem.GetTypeId())
+        type_name = type_elem.Name if type_elem is not None else "?"
+        sig = _geometry_signature(elem)
+        if sig is None:
+            info = "skipped (no Location/BoundingBox)"
+        else:
+            geom_type, signature = sig
+            info = "{}: {}".format(geom_type, signature)
+        rows.append((elem.Id.IntegerValue, cat_name, type_name, info))
 
     if not rows:
-        output.print_md("### Debug — no line-based elements found in this scope")
+        output.print_md("### Debug — no elements found in this scope")
         return
 
     output.show()
-    output.print_md("### Debug — MEP curve candidates in scope")
-    for iv, cat, tname, p0, p1, rkey in rows:
-        if p0 is None:
-            output.print_md("- Id `{}` — {} — {}".format(iv, cat, tname))
-        else:
-            output.print_md(
-                "- Id `{}` — {} / {} — p0=({:.5f}, {:.5f}, {:.5f}) ft — "
-                "p1=({:.5f}, {:.5f}, {:.5f}) ft — rounded key={}".format(
-                    iv, cat, tname, p0.X, p0.Y, p0.Z, p1.X, p1.Y, p1.Z, rkey))
+    output.print_md("### Debug — geometric duplicate candidates in scope")
+    for iv, cat, tname, info in rows:
+        output.print_md("- Id `{}` — {} / {} — {}".format(iv, cat, tname, info))
 
 
 class _DSU(object):
@@ -280,11 +373,17 @@ class _DSU(object):
         return list(groups.values())
 
 
-def find_duplicates_to_delete(scope_ids):
+def find_duplicates_to_delete(scope_ids, category_ids=None):
     """Scan Revit's own duplicate-instance warnings, plus a geometric
-    fallback check for line-based elements (see
+    fallback check across every physical model element (see
     find_geometric_duplicates), and sort the failing elements into what can
     be safely deleted.
+
+    category_ids, when given (see the Categories wizard step), restricts
+    both detectors to elements whose Category.Id.IntegerValue is in the
+    set — a duplicate warning is only honored if every one of its failing
+    elements passes the filter, matching how scope_ids already requires
+    every failing element to be in scope.
 
     Every pairing/cluster either detector reports is first merged into a
     union-find (_DSU) rather than immediately deciding keep/delete per
@@ -322,15 +421,21 @@ def find_duplicates_to_delete(scope_ids):
             continue
         if scope_ids is not None and not all(eid.IntegerValue in scope_ids for eid in failing_ids):
             continue  # part of this duplicate group falls outside the chosen scope
+        if category_ids is not None:
+            failing_elems = [doc.GetElement(eid) for eid in failing_ids]
+            if not all(el is not None and el.Category is not None
+                       and el.Category.Id.IntegerValue in category_ids for el in failing_elems):
+                continue  # part of this duplicate group is outside the chosen categories
 
         groups_in_scope += 1
         ivs = [eid.IntegerValue for eid in failing_ids]
         for iv in ivs[1:]:
             dsu.union(ivs[0], iv)
 
-    # Geometric fallback for line-based categories Revit's own warning
-    # doesn't reliably cover (see find_geometric_duplicates).
-    geo_groups, geo_clusters = find_geometric_duplicates(scope_ids)
+    # Geometric fallback across every physical model element, for whatever
+    # Revit's own warning doesn't reliably cover (see
+    # find_geometric_duplicates).
+    geo_groups, geo_clusters = find_geometric_duplicates(scope_ids, category_ids)
     groups_in_scope += geo_groups
     for cluster in geo_clusters:
         ivs = [eid.IntegerValue for eid in cluster]
@@ -665,9 +770,10 @@ XAML = """
       <Grid.ColumnDefinitions>
         <ColumnDefinition Width="*"/>
         <ColumnDefinition Width="*"/>
+        <ColumnDefinition Width="*"/>
       </Grid.ColumnDefinitions>
-      <Border Grid.Column="0" Grid.ColumnSpan="2" Height="1.5" Background="#e0e3f8"
-              VerticalAlignment="Top" Margin="70,13,70,0"/>
+      <Border Grid.Column="0" Grid.ColumnSpan="3" Height="1.5" Background="#e0e3f8"
+              VerticalAlignment="Top" Margin="58,13,58,0"/>
       <StackPanel Grid.Column="0" HorizontalAlignment="Center">
         <Border x:Name="SC1" Width="28" Height="28" CornerRadius="14" Background="#1e248c" HorizontalAlignment="Center">
           <TextBlock x:Name="SN1" Text="1" FontSize="12" FontWeight="SemiBold" Foreground="White"
@@ -681,7 +787,15 @@ XAML = """
           <TextBlock x:Name="SN2" Text="2" FontSize="12" FontWeight="SemiBold" Foreground="White"
                      HorizontalAlignment="Center" VerticalAlignment="Center"/>
         </Border>
-        <TextBlock x:Name="SL2" Text="Review &amp; Delete" FontSize="10" TextAlignment="Center"
+        <TextBlock x:Name="SL2" Text="Categories" FontSize="10" TextAlignment="Center"
+                   Foreground="#9aa0ac" Margin="0,5,0,0"/>
+      </StackPanel>
+      <StackPanel Grid.Column="2" HorizontalAlignment="Center">
+        <Border x:Name="SC3" Width="28" Height="28" CornerRadius="14" Background="#c6cbe0" HorizontalAlignment="Center">
+          <TextBlock x:Name="SN3" Text="3" FontSize="12" FontWeight="SemiBold" Foreground="White"
+                     HorizontalAlignment="Center" VerticalAlignment="Center"/>
+        </Border>
+        <TextBlock x:Name="SL3" Text="Review &amp; Delete" FontSize="10" TextAlignment="Center"
                    Foreground="#9aa0ac" Margin="0,5,0,0"/>
       </StackPanel>
     </Grid>
@@ -698,8 +812,27 @@ XAML = """
           </Border>
         </StackPanel>
 
-        <!-- STEP 2: Review + Result -->
+        <!-- STEP 2: Categories -->
         <StackPanel x:Name="Step2Panel" Visibility="Collapsed">
+          <Grid Margin="0,0,0,9">
+            <Grid.ColumnDefinitions>
+              <ColumnDefinition Width="*"/>
+              <ColumnDefinition Width="Auto"/>
+            </Grid.ColumnDefinitions>
+            <TextBlock x:Name="CategoryLabel" Grid.Column="0" FontFamily="Consolas" FontSize="10"
+                       Foreground="#9aa0ac" VerticalAlignment="Center"/>
+            <Button x:Name="CategoryToggleAllBtn" Grid.Column="1" Content="Deselect all"
+                    Style="{StaticResource CyanTextBtn}"/>
+          </Grid>
+          <Border Background="White" BorderBrush="#e8eaff" BorderThickness="1" CornerRadius="8" MaxHeight="360">
+            <ScrollViewer VerticalScrollBarVisibility="Auto">
+              <StackPanel x:Name="CategoryListPanel"/>
+            </ScrollViewer>
+          </Border>
+        </StackPanel>
+
+        <!-- STEP 3: Review + Result -->
+        <StackPanel x:Name="Step3Panel" Visibility="Collapsed">
 
           <StackPanel x:Name="ReviewPanel">
             <Grid Margin="0,0,0,9">
@@ -765,7 +898,7 @@ XAML = """
           <ColumnDefinition Width="*"/>
           <ColumnDefinition Width="Auto"/>
         </Grid.ColumnDefinitions>
-        <TextBlock x:Name="StepLabel" Grid.Column="0" Text="Step 1 of 2"
+        <TextBlock x:Name="StepLabel" Grid.Column="0" Text="Step 1 of 3"
                    FontFamily="Consolas" FontSize="12" Foreground="#9aa0ac" VerticalAlignment="Center"/>
         <StackPanel Grid.Column="1" Orientation="Horizontal">
           <Button x:Name="CancelBtn"    Content="Cancel"                Style="{StaticResource GhostBtn}"/>
@@ -783,8 +916,10 @@ XAML = """
 
 BANNERS = [
     "Choose which part of the model to check for duplicate elements — this uses Revit's own "
-    "\"identical instances\" warning plus a geometry check for overlapping ducts/pipes/"
-    "cable trays/conduit/walls/beams, so it works for any category.",
+    "\"identical instances\" warning plus a geometry check across every physical model element, "
+    "so it works for any category.",
+    "Every category found in this scope is selected by default. Untick a category to leave it "
+    "out of the check entirely, or use Select/Deselect all.",
     "Review what will be deleted. Untick anything you want to keep — pinned elements and "
     "partially-duplicated groups are already excluded.",
 ]
@@ -812,6 +947,12 @@ class DeleteDuplicatesDialog(object):
 
         self._sel_scope = None
         self._scope_rows = {}
+        self._scope_ids = None       # set of IntegerValue, or None for Entire Model — fixed at
+                                      # the Scope->Categories transition, reused for the actual
+                                      # detection run so it can't drift from what Categories saw
+
+        self._category_rows = []     # [{item, border, cb_outer, cb_check, refresh_cb}]
+        self._selected_category_ids = None  # set of Category.Id.IntegerValue chosen in step 2
 
         self._review_rows = []       # [{item, border, cb_outer, cb_check, refresh_cb}]
         self._review_by_iv = {}      # IntegerValue -> item (title/subtitle lookup post-delete)
@@ -846,6 +987,7 @@ class DeleteDuplicatesDialog(object):
         w.FindName("DeleteBtn").Click   += self._on_delete
         w.FindName("CloseDoneBtn").Click += self._on_close_done
         w.FindName("ToggleAllBtn").Click += self._on_toggle_all
+        w.FindName("CategoryToggleAllBtn").Click += self._on_toggle_all_categories
 
         self._populate_scope()
         self._go_to_step(1)
@@ -922,7 +1064,135 @@ class DeleteDuplicatesDialog(object):
                 icon_tb.Foreground = _color(GRAY_COLOR)
                 title_tb.FontWeight = System.Windows.FontWeights.Normal
 
-    # ── Step 2: Review ───────────────────────────────────────────────────────
+    # ── Step 2: Categories ───────────────────────────────────────────────────
+
+    def _populate_categories(self, categories):
+        """categories: list of (CategoryId.IntegerValue, name, count) from
+        _discover_categories. Rebuilds CategoryListPanel from scratch, all
+        checked by default so the default behavior (check every category
+        found in scope) matches what the tool did before this step
+        existed."""
+        panel = self._window.FindName("CategoryListPanel")
+        panel.Children.Clear()
+        self._category_rows = []
+        for i, (cat_iv, name, count) in enumerate(categories):
+            is_last = (i == len(categories) - 1)
+            item = {"cat_id": cat_iv, "title": name, "count": count, "on": True}
+            row_data = self._make_category_row(item, is_last)
+            panel.Children.Add(row_data["border"])
+            self._category_rows.append(row_data)
+        self._update_category_label()
+
+    def _make_category_row(self, item, is_last):
+        outer = WC.Border()
+        outer.Padding = System.Windows.Thickness(12, 10, 12, 10)
+        outer.Background = WM.Brushes.White
+        outer.Cursor = WI.Cursors.Hand
+        if not is_last:
+            outer.BorderBrush = _color(LINE_COLOR)
+            outer.BorderThickness = System.Windows.Thickness(0, 0, 0, 1)
+
+        grid = WC.Grid()
+        c1 = WC.ColumnDefinition()
+        c2 = WC.ColumnDefinition()
+        c1.Width = System.Windows.GridLength(1, System.Windows.GridUnitType.Star)
+        c2.Width = System.Windows.GridLength(1, System.Windows.GridUnitType.Auto)
+        grid.ColumnDefinitions.Add(c1)
+        grid.ColumnDefinitions.Add(c2)
+
+        left = WC.StackPanel()
+        left.Orientation = WC.Orientation.Horizontal
+        WC.Grid.SetColumn(left, 0)
+
+        cb_outer = WC.Border()
+        cb_outer.Width = 18
+        cb_outer.Height = 18
+        cb_outer.CornerRadius = System.Windows.CornerRadius(5)
+        cb_outer.VerticalAlignment = System.Windows.VerticalAlignment.Center
+        cb_outer.Margin = System.Windows.Thickness(0, 0, 10, 0)
+        cb_outer.Cursor = WI.Cursors.Hand
+
+        cb_check = WC.TextBlock()
+        cb_check.Text = "✓"
+        cb_check.FontSize = 11
+        cb_check.FontWeight = System.Windows.FontWeights.Bold
+        cb_check.Foreground = WM.Brushes.White
+        cb_check.HorizontalAlignment = System.Windows.HorizontalAlignment.Center
+        cb_check.VerticalAlignment = System.Windows.VerticalAlignment.Center
+        cb_outer.Child = cb_check
+
+        title_tb = WC.TextBlock()
+        title_tb.Text = item["title"]
+        title_tb.FontSize = 12.5
+        title_tb.FontWeight = System.Windows.FontWeights.SemiBold
+        title_tb.Foreground = _color(BODY_COLOR)
+        title_tb.VerticalAlignment = System.Windows.VerticalAlignment.Center
+
+        left.Children.Add(cb_outer)
+        left.Children.Add(title_tb)
+
+        count_tb = WC.TextBlock()
+        count_tb.Text = "{} element{}".format(item["count"], "" if item["count"] == 1 else "s")
+        count_tb.FontSize = 11
+        count_tb.FontFamily = WM.FontFamily("Consolas")
+        count_tb.Foreground = _color(MUTED_COLOR)
+        count_tb.VerticalAlignment = System.Windows.VerticalAlignment.Center
+        WC.Grid.SetColumn(count_tb, 1)
+
+        grid.Children.Add(left)
+        grid.Children.Add(count_tb)
+        outer.Child = grid
+
+        row_data = {
+            "item": item,
+            "border": outer,
+            "cb_outer": cb_outer,
+            "cb_check": cb_check,
+        }
+
+        def _refresh_cb(rd=row_data):
+            on = rd["item"]["on"]
+            if on:
+                rd["cb_outer"].Background = _color(NAVY_COLOR)
+                rd["cb_outer"].BorderBrush = _color(NAVY_COLOR)
+                rd["cb_outer"].BorderThickness = System.Windows.Thickness(1.5)
+                rd["cb_check"].Visibility = System.Windows.Visibility.Visible
+            else:
+                rd["cb_outer"].Background = WM.Brushes.White
+                rd["cb_outer"].BorderBrush = _color(GRAY_COLOR)
+                rd["cb_outer"].BorderThickness = System.Windows.Thickness(1.5)
+                rd["cb_check"].Visibility = System.Windows.Visibility.Collapsed
+
+        row_data["refresh_cb"] = _refresh_cb
+        _refresh_cb()
+
+        def on_click(s, e, rd=row_data):
+            rd["item"]["on"] = not rd["item"]["on"]
+            rd["refresh_cb"]()
+            self._update_category_label()
+            self._update_primary_enabled()
+
+        outer.MouseLeftButtonUp += on_click
+        return row_data
+
+    def _update_category_label(self):
+        label = self._window.FindName("CategoryLabel")
+        total = len(self._category_rows)
+        selected = sum(1 for r in self._category_rows if r["item"]["on"])
+        label.Text = "{} OF {} CATEGORIES SELECTED".format(selected, total)
+        toggle_btn = self._window.FindName("CategoryToggleAllBtn")
+        toggle_btn.Content = "Deselect all" if (total > 0 and selected == total) else "Select all"
+
+    def _on_toggle_all_categories(self, s, e):
+        all_on = all(r["item"]["on"] for r in self._category_rows)
+        new_state = not all_on
+        for r in self._category_rows:
+            r["item"]["on"] = new_state
+            r["refresh_cb"]()
+        self._update_category_label()
+        self._update_primary_enabled()
+
+    # ── Step 3: Review ───────────────────────────────────────────────────────
 
     def _populate_review(self, items):
         panel = self._window.FindName("ReviewListPanel")
@@ -1171,21 +1441,22 @@ class DeleteDuplicatesDialog(object):
 
         w.FindName("Step1Panel").Visibility = vis if step == 1 else col
         w.FindName("Step2Panel").Visibility = vis if step == 2 else col
+        w.FindName("Step3Panel").Visibility = vis if step == 3 else col
 
         w.FindName("CancelBtn").Visibility = vis if step == 1 and not self._done else col
-        w.FindName("BackBtn").Visibility = vis if step == 2 and not self._done else col
-        w.FindName("NextBtn").Visibility = vis if step == 1 and not self._done else col
-        w.FindName("DeleteBtn").Visibility = vis if step == 2 and not self._done else col
+        w.FindName("BackBtn").Visibility = vis if step in (2, 3) and not self._done else col
+        w.FindName("NextBtn").Visibility = vis if step in (1, 2) and not self._done else col
+        w.FindName("DeleteBtn").Visibility = vis if step == 3 and not self._done else col
         w.FindName("CloseDoneBtn").Visibility = vis if self._done else col
 
-        w.FindName("StepLabel").Text = "" if self._done else "Step {} of 2".format(step)
+        w.FindName("StepLabel").Text = "" if self._done else "Step {} of 3".format(step)
 
         self._update_primary_enabled()
         self._update_stepper(step)
         self._update_banner(step)
 
     def _update_stepper(self, step):
-        circles = [("SC1", "SN1", "SL1"), ("SC2", "SN2", "SL2")]
+        circles = [("SC1", "SN1", "SL1"), ("SC2", "SN2", "SL2"), ("SC3", "SN3", "SL3")]
         for i, (cn, nn, ln) in enumerate(circles):
             s = i + 1
             circle = self._window.FindName(cn)
@@ -1221,6 +1492,8 @@ class DeleteDuplicatesDialog(object):
         if self._step == 1:
             self._window.FindName("NextBtn").IsEnabled = self._sel_scope is not None
         elif self._step == 2 and not self._done:
+            self._window.FindName("NextBtn").IsEnabled = any(r["item"]["on"] for r in self._category_rows)
+        elif self._step == 3 and not self._done:
             self._window.FindName("DeleteBtn").IsEnabled = any(r["item"]["on"] for r in self._review_rows)
 
     # ── Event handlers ───────────────────────────────────────────────────────
@@ -1252,6 +1525,23 @@ class DeleteDuplicatesDialog(object):
             self._go_to_step(self._step - 1)
 
     def _on_next(self, s, e):
+        # Wrapped in try/except (unlike a plain WPF Click handler) because an
+        # unhandled exception here can otherwise be silently swallowed by the
+        # dispatcher — Next would just stop responding with no error shown at
+        # all, indistinguishable from a hang.
+        try:
+            if self._step == 1:
+                self._advance_from_scope()
+            elif self._step == 2:
+                self._advance_from_categories()
+        except Exception:
+            forms.alert(
+                "Delete Duplicates failed while checking for duplicates:\n\n{}".format(
+                    traceback.format_exc()),
+                title="EasyBIM — Error",
+            )
+
+    def _advance_from_scope(self):
         scope_ids = get_scope_ids(self._sel_scope)
         if scope_ids is False:
             forms.alert(
@@ -1261,13 +1551,30 @@ class DeleteDuplicatesDialog(object):
             )
             return
 
+        categories = _discover_categories(scope_ids)
+        if not categories:
+            forms.alert(
+                "No physical model elements were found in this scope ({}).".format(self._sel_scope),
+                title="Delete Duplicates",
+            )
+            return
+
+        self._scope_ids = scope_ids
+        self._populate_categories(categories)
+        self._go_to_step(2)
+
+    def _advance_from_categories(self):
+        category_ids = set(r["item"]["cat_id"] for r in self._category_rows if r["item"]["on"])
+        self._selected_category_ids = category_ids
+
         groups_in_scope, element_deletes, group_deletes, skipped_grouped, kept_for = \
-            find_duplicates_to_delete(scope_ids)
+            find_duplicates_to_delete(self._scope_ids, category_ids)
         if not element_deletes and not group_deletes:
             if self._sel_scope == SCOPE_SELECTION:
-                debug_geometric_candidates(scope_ids)
+                debug_geometric_candidates(self._scope_ids, category_ids)
             forms.alert(
-                "No duplicate elements were found in this scope ({}).".format(self._sel_scope),
+                "No duplicate elements were found in this scope ({}) for the selected "
+                "categories.".format(self._sel_scope),
                 title="Delete Duplicates",
             )
             return
@@ -1276,7 +1583,7 @@ class DeleteDuplicatesDialog(object):
         self._skipped_grouped = skipped_grouped
         self._kept_for = kept_for
         self._populate_review(build_review_items(element_deletes, group_deletes))
-        self._go_to_step(2)
+        self._go_to_step(3)
 
     def _on_delete(self, s, e):
         w = self._window
@@ -1299,12 +1606,8 @@ class DeleteDuplicatesDialog(object):
             self.cancelled = False
 
             try:
-                # Re-assert Topmost/Activate to reclaim focus after the
-                # delete transaction (Revit's own UI can steal it) —
-                # deliberately NOT turning Topmost back off afterward,
-                # since that would silently undo the "stay above Revit"
-                # fix in show() for the rest of this dialog's lifetime.
-                self._window.Topmost = True
+                # Reclaim focus after the delete transaction (Revit's own
+                # UI can steal it).
                 self._window.Activate()
             except Exception:
                 pass
@@ -1425,7 +1728,7 @@ class DeleteDuplicatesDialog(object):
         self._set_selection(skipped_ids)
         self._paint(skipped_ids, self._amber_ogs())
 
-        self._go_to_step(2)
+        self._go_to_step(3)
 
     # ── Show ─────────────────────────────────────────────────────────────────
 
@@ -1434,17 +1737,16 @@ class DeleteDuplicatesDialog(object):
         window = self._build()
         frame = DispatcherFrame()
 
-        # Keep the wizard above Revit's main window and always on top —
-        # otherwise it's easy to lose the dialog behind Revit, or have it
-        # rendered on top but not actually own input focus, so clicks on
-        # it silently do nothing. UIApplication.MainWindowHandle is the
-        # documented Revit API handle for exactly this (an AdWindows.
-        # ComponentManager-based Owner assignment failed silently here).
+        # Parent the wizard to Revit's main window so it floats above Revit
+        # without being forced ahead of everything else (pyRevit's own
+        # output window, TaskDialogs, other apps) the way Topmost=True did.
+        # UIApplication.MainWindowHandle is the documented Revit API handle
+        # for exactly this (an AdWindows.ComponentManager-based Owner
+        # assignment failed silently here).
         try:
-            WindowInteropHelper(window).Owner = revit.uiapp.MainWindowHandle
+            WindowInteropHelper(window).Owner = System.IntPtr(revit.uiapp.MainWindowHandle.ToInt64())
         except Exception:
             pass
-        window.Topmost = True
 
         def on_closed(s, e):
             frame.Continue = False
