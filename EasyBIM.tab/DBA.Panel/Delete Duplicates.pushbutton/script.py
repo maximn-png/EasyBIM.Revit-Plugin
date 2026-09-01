@@ -6,14 +6,16 @@ Finds elements that Revit itself already flags with the built-in warning
 "There are identical instances in the same place" and deletes all but one
 copy of each group. This is the same check that produces the yellow warning
 dialog, so it is language- and category-independent — it works for whatever
-Revit itself considers a duplicate (furniture, fixtures, framing, rooms,
-etc.), not just elements that merely look alike.
+Revit itself considers a duplicate (furniture, fixtures, rooms, etc.), not
+just elements that merely look alike.
 
-That warning is unreliable for line-based MEP elements — two perfectly
-overlapping duct/pipe/cable-tray/conduit segments routinely produce no
-Revit warning at all. Those categories get a second, geometry-based check
-(same type + matching curve endpoints) instead of relying on the warning
-(see find_geometric_duplicates).
+That warning is unreliable for a lot of elements — two perfectly overlapping
+ducts/pipes/walls/beams, or two point-placed instances sitting in the exact
+same spot, routinely produce no Revit warning at all. Every physical model
+element (not just a hardcoded category list) also gets a geometry-based
+check — same category + matching position/shape (curve endpoints, insertion
+point, or bounding box, whichever the element has) — instead of relying on
+the warning alone (see find_geometric_duplicates).
 
 The tool walks through a small 2-step dialog (styled to match EasyBIM's other
 wizard tools, e.g. Solution Section):
@@ -51,6 +53,7 @@ import System.Windows.Input as WI
 import System.Collections.Generic as SCG
 
 from System.Windows.Markup import XamlReader
+from System.Windows.Interop import WindowInteropHelper
 from System.IO import StringReader
 from System.Xml import XmlReader as SysXmlReader
 
@@ -88,20 +91,12 @@ def is_duplicate_warning(msg):
     return "identical instance" in text.lower()
 
 
-# Revit's own "identical instances" warning is built around point-placed
-# family instances and does not reliably fire for these line-based MEP
-# categories — two perfectly overlapping duct/pipe segments routinely
-# produce no warning at all. They get a geometry-based duplicate check of
-# their own (see find_geometric_duplicates) instead of relying on
-# doc.GetWarnings().
-GEOMETRIC_DUP_CATEGORIES = [
-    DB.BuiltInCategory.OST_DuctCurves,
-    DB.BuiltInCategory.OST_FlexDuctCurves,
-    DB.BuiltInCategory.OST_PipeCurves,
-    DB.BuiltInCategory.OST_FlexPipeCurves,
-    DB.BuiltInCategory.OST_CableTray,
-    DB.BuiltInCategory.OST_Conduit,
-]
+# Revit's own "identical instances" warning does not reliably fire for
+# every kind of duplicate — two perfectly overlapping duct/pipe/wall/beam
+# segments routinely produce no warning at all, and neither do some
+# point-placed instances. Every physical model element gets a geometry-based
+# duplicate check of its own (see find_geometric_duplicates) instead of
+# relying only on doc.GetWarnings().
 GEOMETRIC_DUP_TOLERANCE = 0.01  # feet (~3mm) — matches Revit's own snap tolerance
 
 
@@ -123,8 +118,18 @@ def get_scope_ids(scope):
 
 
 def _rounded_endpoint_key(curve):
-    """Curve endpoints rounded to GEOMETRIC_DUP_TOLERANCE and sorted so the
-    key is the same regardless of which end is "start" vs "end"."""
+    """Curve endpoints (rounded to GEOMETRIC_DUP_TOLERANCE, sorted so the
+    key doesn't depend on which end is "start" vs "end") plus the curve's
+    own length. Endpoints alone are enough for a straight segment (a line
+    *is* its endpoints) — but OST_FlexDuctCurves/OST_FlexPipeCurves only
+    have their two connector points fixed; two different physical flex
+    routes between the same two points (e.g. routed around different
+    obstacles) would otherwise collide into the same bucket as false
+    duplicates. Length is a cheap, effective discriminator: two distinct
+    paths between the same two points essentially never happen to also
+    have the identical length. This also narrows the equivalent (rarer)
+    risk for curved walls/framing that share a chord's endpoints but not
+    its bulge."""
     def rnd(pt):
         return (
             round(pt.X / GEOMETRIC_DUP_TOLERANCE),
@@ -132,64 +137,215 @@ def _rounded_endpoint_key(curve):
             round(pt.Z / GEOMETRIC_DUP_TOLERANCE),
         )
     a, b = rnd(curve.GetEndPoint(0)), rnd(curve.GetEndPoint(1))
-    return tuple(sorted((a, b)))
+    length_key = round(curve.Length / GEOMETRIC_DUP_TOLERANCE)
+    return (tuple(sorted((a, b))), length_key)
+
+
+def _rounded_point_key(pt):
+    """A point's coordinates rounded to GEOMETRIC_DUP_TOLERANCE."""
+    return (
+        round(pt.X / GEOMETRIC_DUP_TOLERANCE),
+        round(pt.Y / GEOMETRIC_DUP_TOLERANCE),
+        round(pt.Z / GEOMETRIC_DUP_TOLERANCE),
+    )
+
+
+def _rounded_bbox_key(bbox):
+    """A bounding box's Min/Max corners, each rounded to
+    GEOMETRIC_DUP_TOLERANCE. This is the fallback for elements that have
+    neither a LocationCurve nor a LocationPoint (e.g. some in-place
+    families, imports, or link instances) — coarser than an exact
+    curve/point match, but still enough to catch two literal copies
+    sitting in the exact same place."""
+    return (_rounded_point_key(bbox.Min), _rounded_point_key(bbox.Max))
+
+
+def _geometry_signature(elem):
+    """Identify an element's physical position/shape for duplicate
+    matching. Returns (geometry_type, signature) or None if the element has
+    nothing usable to compare (no Location and no BoundingBox) — those
+    elements are skipped entirely since there is no reliable "same place"
+    check for them.
+
+    - LocationCurve elements (ducts, pipes, walls, framing, ...) key off
+      endpoints + length (see _rounded_endpoint_key).
+    - LocationPoint elements (furniture, fixtures, rooms, columns, ...) key
+      off the rounded insertion point. Rotation/Type are deliberately not
+      part of the key, same as the curve-based check — anything this flags
+      still goes through the review screen before deletion, so a
+      same-position/different-type (or different-rotation) pair can simply
+      be unticked if it turns out not to be a real duplicate.
+    - Anything else falls back to its model bounding box, rounded Min/Max.
+    """
+    loc = elem.Location
+    if isinstance(loc, DB.LocationCurve):
+        try:
+            return ("curve", _rounded_endpoint_key(loc.Curve))
+        except Exception:
+            return None
+    if isinstance(loc, DB.LocationPoint):
+        try:
+            return ("point", _rounded_point_key(loc.Point))
+        except Exception:
+            return None
+    try:
+        bbox = elem.get_BoundingBox(None)
+    except Exception:
+        bbox = None
+    if bbox is None:
+        return None
+    try:
+        return ("bbox", _rounded_bbox_key(bbox))
+    except Exception:
+        return None
 
 
 def find_geometric_duplicates(scope_ids):
-    """Group same-type ducts/pipes/cable trays/conduit that occupy the exact
-    same curve (endpoints match within GEOMETRIC_DUP_TOLERANCE) and treat
-    every extra one in a group as a duplicate of the lowest-Id element —
-    this is the fallback for the MEP categories where Revit's own
-    "identical instances" warning does not reliably fire (see
-    GEOMETRIC_DUP_CATEGORIES above).
+    """Group every physical model element (any category — not a hardcoded
+    list) that occupies the exact same position/shape (within
+    GEOMETRIC_DUP_TOLERANCE, see _geometry_signature) — this is the fallback
+    for whatever Revit's own "identical instances" warning doesn't reliably
+    cover: line-based elements (ducts/pipes/walls/framing/...) as well as
+    point-placed instances that Revit's warning happens to miss.
+
+    Only elements whose Category.CategoryType is Model are considered —
+    this excludes annotation, view-specific, and internal elements (text,
+    tags, dimensions, view elements, etc.) that could never be a physical
+    duplicate in the first place. Elements with no usable geometry (no
+    Location, no BoundingBox — e.g. most Materials) are skipped by
+    _geometry_signature returning None.
+
+    Matching is by category + shape only, NOT by Type: two elements of the
+    same category that share the same position are already an overlap
+    regardless of which Type each happens to reference (a duplicate created
+    via copy/paste-in-place, an import, or a family swap can easily end up
+    on a different Type than the original). Anything this flags still goes
+    through the same review screen before deletion, so a same-position/
+    different-type pair can simply be unticked if it turns out not to be a
+    real duplicate.
 
     Returns:
-        groups_found - number of overlapping-curve groups found
-        to_delete    - {IntegerValue: ElementId} duplicates to delete
-        kept_of      - {IntegerValue: ElementId} the surviving element each
-                       entry in to_delete is a duplicate of
-        keep_ids     - set of IntegerValues treated as "the original" —
-                       these must never themselves be deleted
+        groups_found - number of overlapping-geometry clusters found
+        clusters     - list of lists of ElementId; each inner list holds
+                       every element (>= 2) found occupying the same
+                       position/shape. Deciding which one "survives" is left
+                       to the caller (find_duplicates_to_delete), which
+                       merges these clusters with the warning-based ones
+                       before picking a single global survivor per physical
+                       duplicate.
     """
-    buckets = defaultdict(list)  # (category, type, endpoint key) -> [ElementId]
-    for bic in GEOMETRIC_DUP_CATEGORIES:
-        collector = DB.FilteredElementCollector(doc).OfCategory(bic).WhereElementIsNotElementType()
-        for elem in collector:
-            if scope_ids is not None and elem.Id.IntegerValue not in scope_ids:
-                continue
-            loc = elem.Location
-            if not isinstance(loc, DB.LocationCurve):
-                continue
-            try:
-                key = (int(bic), elem.GetTypeId().IntegerValue, _rounded_endpoint_key(loc.Curve))
-            except Exception:
-                continue
-            buckets[key].append(elem.Id)
-
-    groups_found = 0
-    to_delete, kept_of, keep_ids = {}, {}, set()
-    for ids in buckets.values():
-        if len(ids) < 2:
+    buckets = defaultdict(list)  # (CategoryId, geometry_type, signature) -> [ElementId]
+    collector = DB.FilteredElementCollector(doc).WhereElementIsNotElementType()
+    for elem in collector:
+        if scope_ids is not None and elem.Id.IntegerValue not in scope_ids:
             continue
-        ordered = sorted(ids, key=lambda eid: eid.IntegerValue)
-        keep, dupes = ordered[0], ordered[1:]
-        groups_found += 1
-        keep_ids.add(keep.IntegerValue)
-        for eid in dupes:
-            to_delete[eid.IntegerValue] = eid
-            kept_of[eid.IntegerValue] = keep
+        cat = elem.Category
+        if cat is None or cat.CategoryType != DB.CategoryType.Model:
+            continue
+        sig = _geometry_signature(elem)
+        if sig is None:
+            continue
+        geom_type, signature = sig
+        key = (cat.Id.IntegerValue, geom_type, signature)
+        buckets[key].append(elem.Id)
 
-    return groups_found, to_delete, kept_of, keep_ids
+    clusters = [ids for ids in buckets.values() if len(ids) >= 2]
+    return len(clusters), clusters
+
+
+def debug_geometric_candidates(scope_ids):
+    """Diagnostic dump of every candidate in scope — prints category, Id,
+    type, and the geometry signature find_geometric_duplicates would use
+    (or the reason an element was skipped), so a pair that still isn't
+    grouped can be compared by eye. Only meant for a small scope (Current
+    Selection)."""
+    rows = []
+    collector = DB.FilteredElementCollector(doc).WhereElementIsNotElementType()
+    for elem in collector:
+        if scope_ids is not None and elem.Id.IntegerValue not in scope_ids:
+            continue
+        cat = elem.Category
+        cat_name = cat.Name if cat else "?"
+        if cat is None or cat.CategoryType != DB.CategoryType.Model:
+            rows.append((elem.Id.IntegerValue, cat_name, "?", "skipped (not a Model category)"))
+            continue
+        type_elem = doc.GetElement(elem.GetTypeId())
+        type_name = type_elem.Name if type_elem is not None else "?"
+        sig = _geometry_signature(elem)
+        if sig is None:
+            info = "skipped (no Location/BoundingBox)"
+        else:
+            geom_type, signature = sig
+            info = "{}: {}".format(geom_type, signature)
+        rows.append((elem.Id.IntegerValue, cat_name, type_name, info))
+
+    if not rows:
+        output.print_md("### Debug — no elements found in this scope")
+        return
+
+    output.show()
+    output.print_md("### Debug — geometric duplicate candidates in scope")
+    for iv, cat, tname, info in rows:
+        output.print_md("- Id `{}` — {} / {} — {}".format(iv, cat, tname, info))
+
+
+class _DSU(object):
+    """Minimal union-find so a single global survivor is chosen per
+    physical duplicate cluster, even when the warning-based and
+    geometric-based detectors report overlapping but not identical
+    pairings for the same element. Without this, an element that is "the
+    original" in one pairing but also "a duplicate" in a separate,
+    unrelated pairing could end up simultaneously protected from deletion
+    (via the first pairing) and promoted for whole-group deletion (via the
+    second) — deleting both the duplicate AND the element that should have
+    survived. Merging every pairing that touches a given element into one
+    cluster first means there is exactly one keep/delete decision per
+    physical duplicate, never one decision per detector per pairing."""
+
+    def __init__(self):
+        self._parent = {}
+
+    def find(self, x):
+        parent = self._parent
+        if x not in parent:
+            parent[x] = x
+            return x
+        root = x
+        while parent[root] != root:
+            root = parent[root]
+        while parent[x] != root:
+            parent[x], x = root, parent[x]
+        return root
+
+    def union(self, a, b):
+        ra, rb = self.find(a), self.find(b)
+        if ra != rb:
+            self._parent[ra] = rb
+
+    def clusters(self):
+        groups = defaultdict(set)
+        for x in self._parent:
+            groups[self.find(x)].add(x)
+        return list(groups.values())
 
 
 def find_duplicates_to_delete(scope_ids):
     """Scan Revit's own duplicate-instance warnings, plus a geometric
-    fallback check for MEP curve-based elements (see
+    fallback check across every physical model element (see
     find_geometric_duplicates), and sort the failing elements into what can
     be safely deleted.
 
+    Every pairing/cluster either detector reports is first merged into a
+    union-find (_DSU) rather than immediately deciding keep/delete per
+    pairing — an element that shows up in more than one pairing (e.g. the
+    survivor of one duplicate pair that is *itself* a duplicate of some
+    unrelated third element) is thereby resolved as a single physical
+    cluster with exactly one global survivor (its lowest Element Id), so
+    the keep/delete decision can never contradict itself between pairings.
+
     Returns:
-        groups_in_scope  - number of duplicate-instance warnings processed
+        groups_in_scope  - number of duplicate-instance warnings/clusters
+                            processed
         element_deletes  - {IntegerValue: ElementId} standalone elements
         group_deletes    - {IntegerValue: ElementId} whole Group instances
                             whose every member duplicates another group
@@ -203,16 +359,8 @@ def find_duplicates_to_delete(scope_ids):
                             changed" (the deleted thing obviously can't be
                             shown once it's gone)
     """
-    to_delete = {}
-    to_keep = set()
+    dsu = _DSU()
     groups_in_scope = 0
-    kept_of = {}  # dup IntegerValue -> kept ElementId (element-level)
-
-    # dup group IntegerValue -> set of that group's member IntegerValues
-    # seen as duplicates
-    group_dup_members = defaultdict(set)
-    # dup group IntegerValue -> kept group's ElementId
-    group_kept_of = {}
 
     for msg in doc.GetWarnings():
         if not is_duplicate_warning(msg):
@@ -224,37 +372,54 @@ def find_duplicates_to_delete(scope_ids):
         if scope_ids is not None and not all(eid.IntegerValue in scope_ids for eid in failing_ids):
             continue  # part of this duplicate group falls outside the chosen scope
 
-        ordered = sorted(failing_ids, key=lambda eid: eid.IntegerValue)
-        keep, dupes = ordered[0], ordered[1:]
-
         groups_in_scope += 1
-        to_keep.add(keep.IntegerValue)
+        ivs = [eid.IntegerValue for eid in failing_ids]
+        for iv in ivs[1:]:
+            dsu.union(ivs[0], iv)
+
+    # Geometric fallback across every physical model element, for whatever
+    # Revit's own warning doesn't reliably cover (see
+    # find_geometric_duplicates).
+    geo_groups, geo_clusters = find_geometric_duplicates(scope_ids)
+    groups_in_scope += geo_groups
+    for cluster in geo_clusters:
+        ivs = [eid.IntegerValue for eid in cluster]
+        for iv in ivs[1:]:
+            dsu.union(ivs[0], iv)
+
+    # Resolve one global survivor per merged cluster — the lowest Element
+    # Id — and build the same to_delete/kept_of/keep_ivs shape the rest of
+    # this function (and the group-promotion logic below) expects.
+    to_delete = {}
+    to_keep = set()
+    kept_of = {}  # dup IntegerValue -> kept ElementId (element-level)
+
+    # dup group IntegerValue -> set of that group's member IntegerValues
+    # seen as duplicates
+    group_dup_members = defaultdict(set)
+    # dup group IntegerValue -> kept group's ElementId
+    group_kept_of = {}
+
+    for members in dsu.clusters():
+        if len(members) < 2:
+            continue
+        ordered = sorted(members)
+        keep_iv, dupe_ivs = ordered[0], ordered[1:]
+        to_keep.add(keep_iv)
+        keep = DB.ElementId(keep_iv)
         keep_elem = doc.GetElement(keep)
         keep_group_id = keep_elem.GroupId if keep_elem is not None else DB.ElementId.InvalidElementId
 
-        for eid in dupes:
-            to_delete[eid.IntegerValue] = eid
-            kept_of[eid.IntegerValue] = keep
+        for iv in dupe_ivs:
+            eid = DB.ElementId(iv)
+            to_delete[iv] = eid
+            kept_of[iv] = keep
             dup_elem = doc.GetElement(eid)
             if dup_elem is not None and dup_elem.GroupId != DB.ElementId.InvalidElementId:
                 gid = dup_elem.GroupId.IntegerValue
-                group_dup_members[gid].add(eid.IntegerValue)
+                group_dup_members[gid].add(iv)
                 if keep_group_id != DB.ElementId.InvalidElementId:
                     group_kept_of.setdefault(gid, keep_group_id)
-
-    # Geometric fallback for MEP curve-based categories Revit's own warning
-    # doesn't reliably cover (see find_geometric_duplicates).
-    geo_groups, geo_to_delete, geo_kept_of, geo_keep_ids = find_geometric_duplicates(scope_ids)
-    groups_in_scope += geo_groups
-    to_keep.update(geo_keep_ids)
-    for iv, eid in geo_to_delete.items():
-        to_delete.setdefault(iv, eid)
-        kept_of.setdefault(iv, geo_kept_of[iv])
-
-    # An element already kept as "the original" for one group must never be
-    # deleted, even if it also shows up as a duplicate in another group.
-    for kept_id in to_keep:
-        to_delete.pop(kept_id, None)
 
     # Promote a Group instance to a whole-group deletion when every one of
     # its members was independently flagged as a duplicate — that means the
@@ -668,8 +833,8 @@ XAML = """
 
 BANNERS = [
     "Choose which part of the model to check for duplicate elements — this uses Revit's own "
-    "\"identical instances\" warning plus a geometry check for overlapping ducts/pipes/"
-    "cable trays/conduit, so it works for any category.",
+    "\"identical instances\" warning plus a geometry check across every physical model element, "
+    "so it works for any category.",
     "Review what will be deleted. Untick anything you want to keep — pinned elements and "
     "partially-duplicated groups are already excluded.",
 ]
@@ -729,7 +894,7 @@ class DeleteDuplicatesDialog(object):
         w.FindName("BackBtn").Click     += self._on_back
         w.FindName("NextBtn").Click     += self._on_next
         w.FindName("DeleteBtn").Click   += self._on_delete
-        w.FindName("CloseDoneBtn").Click += lambda s, e: w.Close()
+        w.FindName("CloseDoneBtn").Click += self._on_close_done
         w.FindName("ToggleAllBtn").Click += self._on_toggle_all
 
         self._populate_scope()
@@ -1111,9 +1276,17 @@ class DeleteDuplicatesDialog(object):
     # ── Event handlers ───────────────────────────────────────────────────────
 
     def _on_close_x(self, s, e):
-        if not self._done:
-            self._set_selection([])
-            self._clear_review_paint()
+        # Always clear — the Result screen leaves amber overrides on
+        # whatever was skipped, and those are real, transaction-committed
+        # graphic overrides that would otherwise persist into the saved
+        # file if left in place (not just a transient UI highlight).
+        self._set_selection([])
+        self._clear_review_paint()
+        self._window.Close()
+
+    def _on_close_done(self, s, e):
+        self._set_selection([])
+        self._clear_review_paint()
         self._window.Close()
 
     def _on_cancel(self, s, e):
@@ -1141,6 +1314,8 @@ class DeleteDuplicatesDialog(object):
         groups_in_scope, element_deletes, group_deletes, skipped_grouped, kept_for = \
             find_duplicates_to_delete(scope_ids)
         if not element_deletes and not group_deletes:
+            if self._sel_scope == SCOPE_SELECTION:
+                debug_geometric_candidates(scope_ids)
             forms.alert(
                 "No duplicate elements were found in this scope ({}).".format(self._sel_scope),
                 title="Delete Duplicates",
@@ -1174,9 +1349,9 @@ class DeleteDuplicatesDialog(object):
             self.cancelled = False
 
             try:
-                self._window.Topmost = True
+                # Reclaim focus after the delete transaction (Revit's own
+                # UI can steal it).
                 self._window.Activate()
-                self._window.Topmost = False
             except Exception:
                 pass
         except Exception:
@@ -1305,11 +1480,23 @@ class DeleteDuplicatesDialog(object):
         window = self._build()
         frame = DispatcherFrame()
 
+        # Parent the wizard to Revit's main window so it floats above Revit
+        # without being forced ahead of everything else (pyRevit's own
+        # output window, TaskDialogs, other apps) the way Topmost=True did.
+        # UIApplication.MainWindowHandle is the documented Revit API handle
+        # for exactly this (an AdWindows.ComponentManager-based Owner
+        # assignment failed silently here).
+        try:
+            WindowInteropHelper(window).Owner = System.IntPtr(revit.uiapp.MainWindowHandle.ToInt64())
+        except Exception:
+            pass
+
         def on_closed(s, e):
             frame.Continue = False
 
         window.Closed += on_closed
         window.Show()
+        window.Activate()
         Dispatcher.PushFrame(frame)
 
 
