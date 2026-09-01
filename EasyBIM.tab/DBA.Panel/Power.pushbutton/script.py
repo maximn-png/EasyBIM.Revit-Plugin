@@ -20,6 +20,7 @@ from System.Windows.Forms import (
     ColumnHeader, View, HorizontalAlignment,
     FormStartPosition, FormBorderStyle,
     RightToLeft as WinRTL, Panel, FlatStyle,
+    IWin32Window,
 )
 from System.Drawing import Font, FontStyle, Color, Size, Point
 import System
@@ -54,6 +55,25 @@ from easybim.dekel_shared_params import ensure_dekel_params
 
 doc   = revit.doc
 uidoc = revit.uidoc
+
+
+class _RevitMainWindow(IWin32Window):
+    """Minimal IWin32Window wrapper around Revit's raw main-window HWND, so
+    a WinForms dialog can be parented to it via ShowDialog(owner) — Revit's
+    main window is a native window, not a managed Form, so it can't be
+    passed to ShowDialog() directly the way one Form owns another."""
+    def __init__(self, handle):
+        self._handle = handle
+
+    @property
+    def Handle(self):
+        return self._handle
+
+
+try:
+    _REVIT_OWNER = _RevitMainWindow(revit.HOST_APP.uiapp.MainWindowHandle)
+except Exception:
+    _REVIT_OWNER = None
 
 # batch mode (pyrevit run): doc is None, open first model from __models__
 if doc is None:
@@ -413,7 +433,8 @@ dlg.Title       = u"בחר קבצי טבלאות דקל (ניתן לבחור מ�
 dlg.Filter      = "Excel Files (*.xlsx)|*.xlsx"
 dlg.Multiselect = True
 
-if dlg.ShowDialog() != DialogResult.OK or not dlg.FileNames:
+_dlg_result = dlg.ShowDialog(_REVIT_OWNER) if _REVIT_OWNER is not None else dlg.ShowDialog()
+if _dlg_result != DialogResult.OK or not dlg.FileNames:
     TaskDialog.Show("Dekel", u"לא נבחר קובץ.")
     import sys; sys.exit()
 
@@ -1238,7 +1259,7 @@ def show_details():
     bz2.Click += lambda s, e: zoom(); frm2.Controls.Add(bz2)
     bc2 = mkbtn(u"\u05e1\u05d2\u05d5\u05e8", 505, 474, 160, 38)
     bc2.Click += lambda s, e: frm2.Close(); frm2.Controls.Add(bc2)
-    frm2.ShowDialog()
+    frm2.ShowDialog(frm)
 
 
 _any_issues   = any([skipped_details, failed_details, tr_skipped, tr_failed, fix_skipped, fix_failed])
@@ -1341,7 +1362,10 @@ bc_close.Click += lambda s, e: frm.Close(); frm.Controls.Add(bc_close)
 lver = Label(); lver.Text = u"Yamit Bettman  |  EasyBIM  |  v4.0"
 lver.Font = Font(u"Segoe UI",8); lver.ForeColor = TLT
 lver.Location = Point(22,500); lver.Size = Size(446,16); frm.Controls.Add(lver)
-frm.ShowDialog()
+if _REVIT_OWNER is not None:
+    frm.ShowDialog(_REVIT_OWNER)
+else:
+    frm.ShowDialog()
 
 # פתח מבט הנחיות אחרי סגירת הדיאלוג
 if bq_view is not None:
