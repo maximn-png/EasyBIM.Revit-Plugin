@@ -1,0 +1,53 @@
+{
+  "ArchColor": {
+    "B": 200,
+    "G": 70,
+    "R": 0
+  },
+  "ArchLinkKeywords": [
+    "ARC",
+    "AR"
+  ],
+  "ArchPatternName": "Diagonal Down - 1.5mm",
+  "ConcreteKeywords": [
+    "Concrete",
+    "בטון",
+    "Con",
+    "Conc",
+    "ב-30",
+    "ב30",
+    "B15",
+    "B20",
+    "B25",
+    "B30",
+    "B35",
+    "B40",
+    "B45",
+    "B50",
+    "B60"
+  ],
+  "ExcludeKeywords": [
+    "Block",
+    "בלוק",
+    "Light",
+    "קל",
+    "מילוי",
+    "GYP"
+  ],
+  "StructColor": {
+    "B": 30,
+    "G": 30,
+    "R": 200
+  },
+  "StructLinkKeywords": [
+    "STR",
+    "ST"
+  ],
+  "StructPatternName": "Diagonal Up - 1.5mm",
+  "TrafficLinkKeywords": [
+    "TR",
+    "TRF",
+    "Traffic",
+    "תנועה"
+  ]
+}
