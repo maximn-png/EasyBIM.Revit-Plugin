@@ -200,6 +200,22 @@ def _geometry_signature(elem):
         return None
 
 
+def _scoped_model_collector(scope_ids):
+    """FilteredElementCollector narrowed to scope_ids up front (Current
+    Selection / Active View) via the FilteredElementCollector(doc, ids)
+    constructor, instead of walking every element in the whole document
+    and discarding most of them one at a time in Python — the latter turns
+    even a 2-element Current Selection check into a full-model scan, which
+    on a real project is slow enough to make the dialog look hung (no
+    progress indicator, so a multi-second synchronous scan on the UI
+    thread reads as an unresponsive Next button). Entire Model (scope_ids
+    is None) still needs the full document."""
+    if scope_ids is not None:
+        ids = SCG.List[DB.ElementId]([DB.ElementId(iv) for iv in scope_ids])
+        return DB.FilteredElementCollector(doc, ids).WhereElementIsNotElementType()
+    return DB.FilteredElementCollector(doc).WhereElementIsNotElementType()
+
+
 def find_geometric_duplicates(scope_ids):
     """Group every physical model element (any category — not a hardcoded
     list) that occupies the exact same position/shape (within
@@ -235,10 +251,7 @@ def find_geometric_duplicates(scope_ids):
                        duplicate.
     """
     buckets = defaultdict(list)  # (CategoryId, geometry_type, signature) -> [ElementId]
-    collector = DB.FilteredElementCollector(doc).WhereElementIsNotElementType()
-    for elem in collector:
-        if scope_ids is not None and elem.Id.IntegerValue not in scope_ids:
-            continue
+    for elem in _scoped_model_collector(scope_ids):
         cat = elem.Category
         if cat is None or cat.CategoryType != DB.CategoryType.Model:
             continue
@@ -260,10 +273,7 @@ def debug_geometric_candidates(scope_ids):
     grouped can be compared by eye. Only meant for a small scope (Current
     Selection)."""
     rows = []
-    collector = DB.FilteredElementCollector(doc).WhereElementIsNotElementType()
-    for elem in collector:
-        if scope_ids is not None and elem.Id.IntegerValue not in scope_ids:
-            continue
+    for elem in _scoped_model_collector(scope_ids):
         cat = elem.Category
         cat_name = cat.Name if cat else "?"
         if cat is None or cat.CategoryType != DB.CategoryType.Model:
@@ -1302,31 +1312,42 @@ class DeleteDuplicatesDialog(object):
             self._go_to_step(self._step - 1)
 
     def _on_next(self, s, e):
-        scope_ids = get_scope_ids(self._sel_scope)
-        if scope_ids is False:
-            forms.alert(
-                "Nothing is selected. Select the elements you want to check first, "
-                "or pick a different scope.",
-                title="Delete Duplicates",
-            )
-            return
+        # Wrapped in try/except (unlike a plain WPF Click handler) because an
+        # unhandled exception here can otherwise be silently swallowed by the
+        # dispatcher — Next would just stop responding with no error shown at
+        # all, indistinguishable from a hang.
+        try:
+            scope_ids = get_scope_ids(self._sel_scope)
+            if scope_ids is False:
+                forms.alert(
+                    "Nothing is selected. Select the elements you want to check first, "
+                    "or pick a different scope.",
+                    title="Delete Duplicates",
+                )
+                return
 
-        groups_in_scope, element_deletes, group_deletes, skipped_grouped, kept_for = \
-            find_duplicates_to_delete(scope_ids)
-        if not element_deletes and not group_deletes:
-            if self._sel_scope == SCOPE_SELECTION:
-                debug_geometric_candidates(scope_ids)
-            forms.alert(
-                "No duplicate elements were found in this scope ({}).".format(self._sel_scope),
-                title="Delete Duplicates",
-            )
-            return
+            groups_in_scope, element_deletes, group_deletes, skipped_grouped, kept_for = \
+                find_duplicates_to_delete(scope_ids)
+            if not element_deletes and not group_deletes:
+                if self._sel_scope == SCOPE_SELECTION:
+                    debug_geometric_candidates(scope_ids)
+                forms.alert(
+                    "No duplicate elements were found in this scope ({}).".format(self._sel_scope),
+                    title="Delete Duplicates",
+                )
+                return
 
-        self._groups_in_scope = groups_in_scope
-        self._skipped_grouped = skipped_grouped
-        self._kept_for = kept_for
-        self._populate_review(build_review_items(element_deletes, group_deletes))
-        self._go_to_step(2)
+            self._groups_in_scope = groups_in_scope
+            self._skipped_grouped = skipped_grouped
+            self._kept_for = kept_for
+            self._populate_review(build_review_items(element_deletes, group_deletes))
+            self._go_to_step(2)
+        except Exception:
+            forms.alert(
+                "Delete Duplicates failed while checking for duplicates:\n\n{}".format(
+                    traceback.format_exc()),
+                title="EasyBIM — Error",
+            )
 
     def _on_delete(self, s, e):
         w = self._window
