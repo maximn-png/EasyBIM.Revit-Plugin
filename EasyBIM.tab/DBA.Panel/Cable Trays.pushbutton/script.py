@@ -28,6 +28,7 @@ from System.Windows.Forms import (
     ColumnHeader, View, SortOrder, HorizontalAlignment,
     DockStyle, Padding, FormStartPosition, FormBorderStyle,
     RightToLeft as WinRTL, Panel, FlatStyle,
+    IWin32Window,
 )
 from System.Drawing import Font, FontStyle, Color, Size, Point, ContentAlignment, Pen, SolidBrush, Rectangle
 import System
@@ -57,6 +58,25 @@ from pyrevit import revit
 
 doc   = revit.doc
 uidoc = revit.uidoc
+
+
+class _RevitMainWindow(IWin32Window):
+    """Minimal IWin32Window wrapper around Revit's raw main-window HWND, so
+    a WinForms dialog can be parented to it via ShowDialog(owner) — Revit's
+    main window is a native window, not a managed Form, so it can't be
+    passed to ShowDialog() directly the way one Form owns another."""
+    def __init__(self, handle):
+        self._handle = handle
+
+    @property
+    def Handle(self):
+        return self._handle
+
+
+try:
+    _REVIT_OWNER = _RevitMainWindow(revit.HOST_APP.uiapp.MainWindowHandle)
+except Exception:
+    _REVIT_OWNER = None
 
 # ============================================================================
 # CONFIGURATION
@@ -420,7 +440,8 @@ except Exception as e:
 dlg        = OpenFileDialog()
 dlg.Title  = u"בחר קובץ טבלת דקל"
 dlg.Filter = "Excel Files (*.xlsx)|*.xlsx"
-if dlg.ShowDialog() != DialogResult.OK:
+_dlg_result = dlg.ShowDialog(_REVIT_OWNER) if _REVIT_OWNER is not None else dlg.ShowDialog()
+if _dlg_result != DialogResult.OK:
     TaskDialog.Show("Dekel", u"לא נבחר קובץ.")
     import sys; sys.exit()
 
@@ -1131,7 +1152,7 @@ def show_summary_dialog(total, updated, skipped, failed,
             22, btn_y, 180, 40, primary=True)
 
         def on_details(sender, args):
-            show_details_dialog(skipped_details, failed_details)
+            show_details_dialog(skipped_details, failed_details, owner=frm)
             if _zoom_element_id[0] is not None:
                 frm.Close()
 
@@ -1151,10 +1172,13 @@ def show_summary_dialog(total, updated, skipped, failed,
     lbl_ver.Size      = Size(380, 16)
     frm.Controls.Add(lbl_ver)
 
-    frm.ShowDialog()
+    if _REVIT_OWNER is not None:
+        frm.ShowDialog(_REVIT_OWNER)
+    else:
+        frm.ShowDialog()
 
 
-def show_details_dialog(skipped_details, failed_details):
+def show_details_dialog(skipped_details, failed_details, owner=None):
 
     frm = _make_form(u"פרטי תעלות שדולגו / נכשלו", 680, 530)
 
@@ -1276,7 +1300,11 @@ def show_details_dialog(skipped_details, failed_details):
     btn_close.Click += lambda s, e: frm.Close()
     frm.Controls.Add(btn_close)
 
-    frm.ShowDialog()
+    dialog_owner = owner if owner is not None else _REVIT_OWNER
+    if dialog_owner is not None:
+        frm.ShowDialog(dialog_owner)
+    else:
+        frm.ShowDialog()
 
 
 msg = (
