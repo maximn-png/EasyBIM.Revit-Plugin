@@ -28,6 +28,7 @@ from System.Windows.Forms import (
     ColumnHeader, View, SortOrder, HorizontalAlignment,
     DockStyle, Padding, FormStartPosition, FormBorderStyle,
     RightToLeft as WinRTL, Panel, FlatStyle,
+    IWin32Window,
 )
 from System.Drawing import Font, FontStyle, Color, Size, Point, ContentAlignment, Pen, SolidBrush, Rectangle
 import System
@@ -58,15 +59,24 @@ from pyrevit import revit
 doc   = revit.doc
 uidoc = revit.uidoc
 
-# --- ייבוא המודול המשותף לניהול פרמטרים (GUID קבועים + מיזוג קטגוריות) ---
-# מומלץ להניח את dekel_shared_params.py בתיקיית lib של תוסף ה-pyRevit.
-# הבלוק הבא מוסיף את תיקיית הסקריפט ל-sys.path כגיבוי, כך שגם אם הקובץ
-# יושב ליד הסקריפט עצמו — הוא יימצא.
-import sys
-_here = os.path.dirname(os.path.abspath(__file__))
-if _here not in sys.path:
-    sys.path.append(_here)
-from dekel_shared_params import ensure_dekel_params
+
+class _RevitMainWindow(IWin32Window):
+    """Minimal IWin32Window wrapper around Revit's raw main-window HWND, so
+    a WinForms dialog can be parented to it via ShowDialog(owner) — Revit's
+    main window is a native window, not a managed Form, so it can't be
+    passed to ShowDialog() directly the way one Form owns another."""
+    def __init__(self, handle):
+        self._handle = handle
+
+    @property
+    def Handle(self):
+        return self._handle
+
+
+try:
+    _REVIT_OWNER = _RevitMainWindow(revit.HOST_APP.uiapp.MainWindowHandle)
+except Exception:
+    _REVIT_OWNER = None
 
 # ============================================================================
 # CONFIGURATION
@@ -79,13 +89,163 @@ DESCRIPTION_MAP = {
     u"פלסטיק":      (u"08.023.0280", u"x1.304"),
     u"אלומניום":    (None,           u"BUSBAR"),
     u"אלומיניום":   (None,           u"BUSBAR"),
-    u"חסין אש":     (None,           u"לא נמדד"),
+    # אין בדקל סעיף לתעלה חסינת אש. הקוד הבסיסי (08.023.0040, ברירת מחדל
+    # כשאין Width/Height בפועל) נבחר בהתאם למידות התעלה מטבלת sheet_plain
+    # (ראה TRAY_CATALOG/DESCRIPTION_CATALOG_KEY למעלה), כפול מקדם
+    # אקסטרפולציה — ראה FIRE_RESISTANT_FACTOR למטה.
+    u"חסין אש":     (u"08.023.0040", u"x3.0 (אמדן)"),
 }
 # דפוס Description של פס צבירה עם אמפר, למשל: '1000A - פ"צ'
 BUSBAR_DESC_PATTERN = re.compile(r"^(\d+)\s*A?\s*[-–]\s*פ", re.UNICODE)
 PLASTIC_FACTOR = 1.304
 
+# מקדם אקסטרפולציה למחיר תעלה חסינת אש (לא קיים סעיף מקביל בדקל).
+# מבוסס על היחס העקבי (~2.95x) בדקל עצמו בין תעלת רשת ברזל לתעלת רשת
+# פלב"מ (נירוסטה) באותם רוחבים — 08.023.0100/0170, 0110/0172, 0120/0174,
+# 0130/0176 — כפרוקסי ליחס מחיר "חומר/עיטוף משודרג" מול תעלה בסיסית.
+# תואם גם לטווח כללי (150%-300% תוספת) של מיגון אש פסיבי לתעלות כבלים.
+# *** זהו אמדן בלבד — יש לאמת מול הצעת מחיר ממתקין מיגון אש בפועל. ***
+FIRE_RESISTANT_FACTOR = 3.0
+FIRE_RESISTANT_CODE   = u"אמדן-חסין אש"
+FIRE_RESISTANT_DESC   = (
+    u"תעלת כבלים חסינת אש — מחיר משוער (אקסטרפולציה x{:.1f} על בסיס "
+    u"תעלת פח דקל במידת התעלה בפועל), אינו סעיף דקל רשמי — טרם אומת מול ספק מיגון אש"
+).format(FIRE_RESISTANT_FACTOR)
+
 # BUSBAR_MAP ייבנה דינמית מתוך קובץ האקסל — ראה build_busbar_map
+
+# ============================================================================
+# התאמה לפי מידות (Width/Height בפועל של כל תעלה) — לא רק לפי חומר
+# ============================================================================
+# כל שורה: (רוחב מ"מ, עומק/גובה מ"מ, קוד דקל). נבנה פעם אחת מסריקת פרקי
+# 08.023 (תעלות) ו-08.024 (סולמות) בקובץ דקל, ומכוסה בו — הקודים עצמם
+# (מספור הסעיפים) יציבים בין גרסאות מחירון; המחירים בפועל מגיעים מ-dekel_data
+# בזמן ריצה, לא מכאן. כשלרוחב/עומק נתון יש כמה עוביים באקסל, נבחר עובי 1 מ"מ
+# (תואם לברירת המחדל הקודמת); אחרת העובי היחיד הקיים לאותו רוחב/עומק.
+TRAY_CATALOG = {
+    u"sheet_plain": [
+        (60,  40,  u"08.023.0010"),
+        (60,  60,  u"08.023.0012"),
+        (100, 60,  u"08.023.0015"),
+        (100, 100, u"08.023.0020"),
+        (120, 60,  u"08.023.0025"),
+        (200, 100, u"08.023.0030"),
+        (300, 100, u"08.023.0040"),
+        (400, 100, u"08.023.0050"),
+        (500, 100, u"08.023.0054"),
+        (600, 100, u"08.023.0056"),
+    ],
+    u"sheet_perforated": [
+        (100, 60,  u"08.023.0600"),
+        (100, 85,  u"08.023.0635"),
+        (100, 100, u"08.023.0655"),
+        (100, 110, u"08.023.1120"),
+        (200, 60,  u"08.023.0610"),
+        (200, 85,  u"08.023.0638"),
+        (200, 100, u"08.023.0660"),
+        (200, 110, u"08.023.1130"),
+        (300, 60,  u"08.023.0615"),
+        (300, 85,  u"08.023.0640"),
+        (300, 100, u"08.023.0665"),
+        (300, 110, u"08.023.1140"),
+        (400, 60,  u"08.023.0620"),
+        (400, 85,  u"08.023.0642"),
+        (400, 100, u"08.023.0670"),
+        (400, 110, u"08.023.1150"),
+        (500, 60,  u"08.023.0625"),
+        (500, 85,  u"08.023.0644"),
+        (500, 100, u"08.023.0675"),
+        (500, 110, u"08.023.1160"),
+        (600, 60,  u"08.023.0630"),
+        (600, 85,  u"08.023.0646"),
+        (600, 100, u"08.023.0680"),
+        (600, 110, u"08.023.1170"),
+    ],
+    u"mesh_steel": [
+        (100, 85, u"08.023.0100"),
+        (200, 85, u"08.023.0110"),
+        (300, 85, u"08.023.0120"),
+        (400, 85, u"08.023.0130"),
+        (500, 85, u"08.023.0140"),
+        (600, 85, u"08.023.0150"),
+    ],
+    u"plastic": [
+        (15,  15,  u"08.023.0190"),
+        (17,  17,  u"08.023.0200"),
+        (25,  60,  u"08.023.0220"),
+        (30,  17,  u"08.023.0202"),
+        (30,  25,  u"08.023.0205"),
+        (40,  25,  u"08.023.0210"),
+        (40,  42,  u"08.023.0215"),
+        (42,  60,  u"08.023.0230"),
+        (60,  60,  u"08.023.0240"),
+        (60,  70,  u"08.023.0250"),
+        (100, 60,  u"08.023.0265"),
+        (120, 60,  u"08.023.0270"),
+        (200, 100, u"08.023.0280"),
+    ],
+    u"ladder_steel": [
+        (100, 60,  u"08.024.0008"),
+        (100, 70,  u"08.024.0040"),
+        (200, 60,  u"08.024.0010"),
+        (200, 70,  u"08.024.0050"),
+        (200, 100, u"08.024.0100"),
+        (300, 60,  u"08.024.0013"),
+        (300, 70,  u"08.024.0060"),
+        (300, 100, u"08.024.0110"),
+        (400, 60,  u"08.024.0016"),
+        (400, 70,  u"08.024.0070"),
+        (400, 100, u"08.024.0120"),
+        (500, 60,  u"08.024.0020"),
+        (500, 70,  u"08.024.0080"),
+        (500, 100, u"08.024.0125"),
+        (600, 60,  u"08.024.0030"),
+        (600, 70,  u"08.024.0090"),
+        (600, 100, u"08.024.0130"),
+    ],
+}
+
+# Description → מפתח בטבלה. "חסין אש" משתמש בטבלת הפח הרגיל (התעלה מתחת
+# למיגון האש היא תעלת פח), עם מקדם ה-אקסטרפולציה שמופעל בנפרד למטה.
+DESCRIPTION_CATALOG_KEY = {
+    u"פח":       u"sheet_plain",
+    u"פח מחורץ": u"sheet_perforated",
+    u"רשת":      u"mesh_steel",
+    u"סולם":     u"ladder_steel",
+    u"פלסטיק":   u"plastic",
+    u"חסין אש":  u"sheet_plain",
+}
+
+_DIM_TOLERANCE_MM = 2.0
+
+def get_mm_param(elem, name):
+    """קריאת פרמטר מידה (Width/Height) בפועל והמרה ממ' רגל למ"מ."""
+    p = elem.LookupParameter(name)
+    if not p:
+        return None
+    try:
+        v = p.AsDouble()
+    except Exception:
+        return None
+    if v is None:
+        return None
+    return v * 304.8
+
+def pick_code_by_dimensions(catalog_key, width_mm, depth_mm):
+    """מוצא בטבלה את הקוד הקרוב ביותר לרוחב/עומק בפועל.
+    מחזיר (code, is_exact) — is_exact=False כשנבחרה המידה הקרובה ביותר
+    ולא התאמה מדויקת (למ"מ) לרוחב ולעומק גם יחד."""
+    rows = TRAY_CATALOG.get(catalog_key)
+    if not rows or width_mm is None:
+        return None, False
+    if depth_mm is None:
+        best = min(rows, key=lambda r: abs(r[0] - width_mm))
+        exact = abs(best[0] - width_mm) <= _DIM_TOLERANCE_MM
+    else:
+        best = min(rows, key=lambda r: (abs(r[0] - width_mm), abs(r[1] - depth_mm)))
+        exact = (abs(best[0] - width_mm) <= _DIM_TOLERANCE_MM
+                  and abs(best[1] - depth_mm) <= _DIM_TOLERANCE_MM)
+    return best[2], exact
 
 PARAM_CODE  = u"מספר סעיף דקל"
 PARAM_DESC  = u"תיאור סעיף דקל"
@@ -111,68 +271,182 @@ PRICE_PARAM_NAMES = {PARAM_PRICE, PARAM_ADDON_PRICE, PARAM_TOTAL}
 NS = "http://schemas.openxmlformats.org/spreadsheetml/2006/main"
 
 # ============================================================================
-# SHARED PARAMETERS - יצירה/קישור דרך המודול המשותף (GUID קבועים + מיזוג קטגוריות)
+# SHARED PARAMETERS - בדיקה ויצירה אוטומטית
 # ============================================================================
-from Autodesk.Revit.DB import BuiltInCategory
+def get_existing_param_names():
+    existing = set()
+    it = doc.ParameterBindings.ForwardIterator()
+    while it.MoveNext():
+        existing.add(it.Key.Name)
+    return existing
 
-# כלי התעלות עובד על שתי קטגוריות: תעלות + פיטינגים של תעלות
-TRAY_CATEGORIES = [
-    BuiltInCategory.OST_CableTray,
-    BuiltInCategory.OST_CableTrayFitting,
-]
+def create_missing_shared_params(missing):
+    spf_path = os.path.join(
+        str(System.Environment.GetFolderPath(
+            System.Environment.SpecialFolder.ApplicationData)),
+        "DekelSharedParams_tmp.txt"
+    )
 
-t_params = Transaction(doc, u"Dekel - Ensure Shared Parameters")
-t_params.Start()
+    header = (
+        u"# Revit Shared Parameters\n"
+        u"*META\tVERSION\tMINVERSION\n"
+        u"META\t2\t1\n"
+        u"*GROUP\tID\tNAME\n"
+        u"GROUP\t1\tDekel\n"
+        u"*PARAM\tGUID\tNAME\tDATATYPE\tDATACATEGORY\tGROUP\tVISIBLE\tDESCRIPTION\tUSERMODIFIABLE\tHIDEWHENNOVALUEISSHOWN\n"
+    )
+    param_lines = u""
+    for name, dtype in missing:
+        guid = str(System.Guid.NewGuid())
+        param_lines += u"PARAM\t{}\t{}\t{}\t\t1\t1\t\t1\t0\n".format(guid, name, dtype)
+
+    # Revit דורש קובץ Shared Parameters ב-UTF-16
+    with codecs.open(spf_path, "w", encoding="utf-16") as f:
+        f.write(header + param_lines)
+
+    old_spf = doc.Application.SharedParametersFilename
+    doc.Application.SharedParametersFilename = spf_path
+    try:
+        spf = doc.Application.OpenSharedParameterFile()
+        if not spf:
+            raise Exception(u"לא ניתן לפתוח קובץ Shared Parameters")
+        grp = spf.Groups.get_Item("Dekel")
+        if not grp:
+            raise Exception(u"קבוצת Dekel לא נמצאה")
+
+        cat_set = CategorySet()
+        cat_set.Insert(
+            doc.Settings.Categories.get_Item(BuiltInCategory.OST_CableTray))
+        cat_set.Insert(
+            doc.Settings.Categories.get_Item(BuiltInCategory.OST_CableTrayFitting))
+
+        for name, dtype in missing:
+            defn = grp.Definitions.get_Item(name)
+            if not defn:
+                print(u"  אזהרה: הגדרה '{}' לא נמצאה".format(name))
+                continue
+            doc.ParameterBindings.Insert(
+                defn, InstanceBinding(cat_set),
+                _PARAM_GROUP)   # "Other" group
+            print(u"  נוצר: {}".format(name))
+    finally:
+        doc.Application.SharedParametersFilename = old_spf or ""
+        try:
+            os.remove(spf_path)
+        except Exception:
+            pass
+
+def remove_old_number_bindings():
+    """Remove NUMBER-type bindings for price params so they are recreated as TEXT."""
+    to_remove = []
+    it = doc.ParameterBindings.ForwardIterator()
+    while it.MoveNext():
+        defn = it.Key
+        if defn.Name not in PRICE_PARAM_NAMES:
+            continue
+        try:
+            if u"Number" in str(defn.ParameterType):
+                to_remove.append(defn)
+        except Exception:
+            try:
+                if u"string" not in str(defn.GetDataType()).lower():
+                    to_remove.append(defn)
+            except Exception:
+                pass
+    removed = 0
+    for defn in to_remove:
+        try:
+            doc.ParameterBindings.Remove(defn)
+            removed += 1
+        except Exception:
+            pass
+    return removed
+
+t_migrate = Transaction(doc, u"Dekel - Migrate Price Params to TEXT")
+t_migrate.Start()
 try:
-    rep = ensure_dekel_params(doc, PARAM_DEFS, TRAY_CATEGORIES)
-    t_params.Commit()
-    if rep["created"]:
-        print(u"נוצרו {} פרמטרים: {}".format(
-            len(rep["created"]), u", ".join(rep["created"])))
-    if rep["extended"]:
-        print(u"קושרו לקטגוריות התעלות {} פרמטרים קיימים: {}".format(
-            len(rep["extended"]), u", ".join(rep["extended"])))
-    if rep["ok"]:
-        print(u"{} פרמטרים כבר היו מקושרים כראוי".format(len(rep["ok"])))
-    if rep["failed"]:
-        print(u"  [אזהרה] לא ניתן לטפל ב-{} פרמטרים: {}".format(
-            len(rep["failed"]), u", ".join(rep["failed"])))
-        TaskDialog.Show("Dekel", u"חלק מהפרמטרים לא נוצרו/קושרו:\n{}".format(
-            u", ".join(rep["failed"])))
+    n_migrated = remove_old_number_bindings()
+    t_migrate.Commit()
+    if n_migrated:
+        print(u"  הומרו {} פרמטרי מחיר מ-NUMBER ל-TEXT (₪)".format(n_migrated))
 except Exception as e:
-    try: t_params.RollBack()
-    except Exception: pass
-    TaskDialog.Show("Dekel", u"שגיאה ביצירת/קישור פרמטרים:\n{}".format(e))
-    import sys; sys.exit()
+    t_migrate.RollBack()
+    print(u"  [אזהרה] לא ניתן להמיר פרמטרים: {}".format(e))
+
+# בדוק ויצור פרמטרים חסרים
+existing_names = get_existing_param_names()
+missing_params  = [(n, t) for n, t in PARAM_DEFS if n not in existing_names]
+
+if missing_params:
+    print(u"יוצר {} פרמטרים חסרים...".format(len(missing_params)))
+    t0 = Transaction(doc, u"Dekel - Create Shared Parameters")
+    t0.Start()
+    try:
+        create_missing_shared_params(missing_params)
+        t0.Commit()
+        print(u"פרמטרים נוצרו!")
+    except Exception as e:
+        t0.RollBack()
+        TaskDialog.Show("Dekel", u"שגיאה ביצירת פרמטרים:\n{}".format(e))
+        import sys; sys.exit()
+else:
+    print(u"כל הפרמטרים קיימים.")
+
+# --- ודא שהפרמטרים מקושרים גם ל-CableTrayFitting ---
+def ensure_fitting_category():
+    fitting_cat = doc.Settings.Categories.get_Item(BuiltInCategory.OST_CableTrayFitting)
+    param_names = set(n for n, _ in PARAM_DEFS)
+
+    # שלב 1: אסוף את כל ההגדרות — בלי לשנות כלום
+    to_update = []
+    it = doc.ParameterBindings.ForwardIterator()
+    while it.MoveNext():
+        defn = it.Key
+        if defn.Name in param_names:
+            to_update.append(defn)
+
+    # שלב 2: עדכן כל פרמטר — אחרי שהאיטרציה נגמרה
+    added = 0
+    for defn in to_update:
+        binding = doc.ParameterBindings.get_Item(defn)
+        if not binding:
+            continue
+        cats = binding.Categories
+        cats.Insert(fitting_cat)
+        new_binding = InstanceBinding(cats)
+        doc.ParameterBindings.ReInsert(
+            defn, new_binding,
+            _PARAM_GROUP)
+        added += 1
+
+    print(u"  [DEBUG] ensure_fitting: found {} params, updated {}".format(
+        len(to_update), added))
+    return added
+
+t_bind = Transaction(doc, u"Dekel - Bind Fitting Category")
+t_bind.Start()
+try:
+    n_bound = ensure_fitting_category()
+    t_bind.Commit()
+    if n_bound > 0:
+        print(u"קושרו {} פרמטרים ל-Cable Tray Fittings".format(n_bound))
+except Exception as e:
+    t_bind.RollBack()
+    print(u"  אזהרה: לא ניתן לקשר פרמטרים ל-Fittings: {}".format(e))
 
 # ============================================================================
 # 1. בחירת קובץ Excel
-#    אם הכפתור המאוחד (Run All) כבר בחר קובץ — נשתמש בו ולא נפתח דיאלוג.
-#    הנתיב מועבר דרך משתנה הסביבה DEKEL_XLSX_PATHS (מופרד ב-';').
 # ============================================================================
-_preselected = os.environ.get("DEKEL_XLSX_PATHS", "")
-if _preselected:
-    _paths = [p for p in _preselected.split(";") if p]
-    # ייתכנו כמה נתיבים (למשל גם קובץ גנרטורים ל-Power). נבחר את קובץ
-    # החשמל/תעלות: עדיפות לשם שמכיל 'electricity' או '08'; אחרת — הראשון.
-    def _pick_tray_file(paths):
-        for p in paths:
-            low = os.path.basename(p).lower()
-            if u"electric" in low or u"_08" in low or u"08." in low:
-                return p
-        return paths[0]
-    excel_path = _pick_tray_file(_paths)
-    print(u"קובץ (מ-Run All): {}".format(excel_path))
-else:
-    dlg        = OpenFileDialog()
-    dlg.Title  = u"בחר קובץ טבלת דקל"
-    dlg.Filter = "Excel Files (*.xlsx)|*.xlsx"
-    if dlg.ShowDialog() != DialogResult.OK:
-        TaskDialog.Show("Dekel", u"לא נבחר קובץ.")
-        import sys; sys.exit()
-    excel_path = dlg.FileName
-    print(u"קובץ: {}".format(excel_path))
+dlg        = OpenFileDialog()
+dlg.Title  = u"בחר קובץ טבלת דקל"
+dlg.Filter = "Excel Files (*.xlsx)|*.xlsx"
+_dlg_result = dlg.ShowDialog(_REVIT_OWNER) if _REVIT_OWNER is not None else dlg.ShowDialog()
+if _dlg_result != DialogResult.OK:
+    TaskDialog.Show("Dekel", u"לא נבחר קובץ.")
+    import sys; sys.exit()
 
+excel_path = dlg.FileName
+print(u"קובץ: {}".format(excel_path))
 
 # ============================================================================
 # 2. קריאת Excel
@@ -370,6 +644,9 @@ if not BUSBAR_MAP:
 # ============================================================================
 # 3. עדכון תעלות
 # ============================================================================
+print(u"  [!] מחיר תעלות 'חסין אש' הוא אמדן (x{:.1f} על בסיס תעלת פח) — "
+      u"אין סעיף מקביל בדקל. יש לאמת מול ספק מיגון אש.".format(FIRE_RESISTANT_FACTOR))
+
 trays = list(
     FilteredElementCollector(doc)
     .OfCategory(BuiltInCategory.OST_CableTray)
@@ -383,6 +660,7 @@ if not trays:
     import sys; sys.exit()
 
 updated = skipped = failed = 0
+dim_exact_count = dim_approx_count = dim_fallback_count = 0
 grand_total = 0.0
 skipped_details = []   # [(element_id, description, reason), ...]
 failed_details  = []   # [(element_id, description, reason), ...]
@@ -421,6 +699,21 @@ for tray in trays:
 
         code, note = mapping
         addon_code = None
+
+        # --- התאמה לפי מידות בפועל (Width/Height), במקום קוד קבוע לפי חומר ---
+        catalog_key = DESCRIPTION_CATALOG_KEY.get(desc)
+        if catalog_key:
+            width_mm = get_mm_param(tray, "Width")
+            depth_mm = get_mm_param(tray, "Height")
+            dim_code, dim_exact = pick_code_by_dimensions(catalog_key, width_mm, depth_mm)
+            if dim_code:
+                code = dim_code
+                if dim_exact:
+                    dim_exact_count += 1
+                else:
+                    dim_approx_count += 1
+            else:
+                dim_fallback_count += 1
 
         # --- פסי צבירה: חלץ אמפר מ-MARK או מ-Description ---
         if note in (u"BUSBAR", u"BUSBAR_FROM_DESC"):
@@ -469,6 +762,11 @@ for tray in trays:
         title = dekel_data[code]["title"]
         if desc == u"פלסטיק" and price:
             price = round(float(price) * PLASTIC_FACTOR, 2)
+        elif desc == u"חסין אש" and price:
+            # אין סעיף דקל לתעלה חסינת אש — מחיר משוער, ראה FIRE_RESISTANT_FACTOR
+            price = round(float(price) * FIRE_RESISTANT_FACTOR, 2)
+            code  = FIRE_RESISTANT_CODE
+            title = FIRE_RESISTANT_DESC
 
         # מחיר תוספת (פסי צבירה בלבד)
         addon_price = 0.0
@@ -550,6 +848,10 @@ for tray in trays:
         failed_details.append((str(tray.Id.IntegerValue), u"---", u"שגיאה: {}".format(e)))
 
 t.Commit()
+
+print(u"התאמה לפי מידות: {} מדויקות, {} מקורבות (מידה קרובה ביותר בדקל), "
+      u"{} ללא Width/Height בפועל (ברירת מחדל)".format(
+          dim_exact_count, dim_approx_count, dim_fallback_count))
 
 # ============================================================================
 # 3b. עדכון Fittings של פסי צבירה (ברכים אופקיות / אנכיות)
@@ -850,7 +1152,7 @@ def show_summary_dialog(total, updated, skipped, failed,
             22, btn_y, 180, 40, primary=True)
 
         def on_details(sender, args):
-            show_details_dialog(skipped_details, failed_details)
+            show_details_dialog(skipped_details, failed_details, owner=frm)
             if _zoom_element_id[0] is not None:
                 frm.Close()
 
@@ -870,10 +1172,13 @@ def show_summary_dialog(total, updated, skipped, failed,
     lbl_ver.Size      = Size(380, 16)
     frm.Controls.Add(lbl_ver)
 
-    frm.ShowDialog()
+    if _REVIT_OWNER is not None:
+        frm.ShowDialog(_REVIT_OWNER)
+    else:
+        frm.ShowDialog()
 
 
-def show_details_dialog(skipped_details, failed_details):
+def show_details_dialog(skipped_details, failed_details, owner=None):
 
     frm = _make_form(u"פרטי תעלות שדולגו / נכשלו", 680, 530)
 
@@ -995,7 +1300,11 @@ def show_details_dialog(skipped_details, failed_details):
     btn_close.Click += lambda s, e: frm.Close()
     frm.Controls.Add(btn_close)
 
-    frm.ShowDialog()
+    dialog_owner = owner if owner is not None else _REVIT_OWNER
+    if dialog_owner is not None:
+        frm.ShowDialog(dialog_owner)
+    else:
+        frm.ShowDialog()
 
 
 msg = (
@@ -1184,8 +1493,32 @@ except Exception as e:
     except Exception: pass
     print(u"שגיאה ביצירת טבלאות: {}".format(e))
 
+# ──────────────────────────────────────────────────────────────────────────────
+# DRAFTING VIEW — הנחיות כתב כמויות (מבט משותף לכל כלי הדקל, ראה
+# lib/easybim/dekel_bq_notes.py — כל כלי בונה מחדש את אותו מבט מאותה רשימת
+# הערות, כדי שההרצה של כלי אחד לא תמחק את ההנחיות של כלי אחר)
+# ──────────────────────────────────────────────────────────────────────────────
+from easybim.dekel_bq_notes import create_bq_drafting_view, BQ_VIEW_NAME
+
+bq_view = None
+try:
+    t_bq = Transaction(doc, u"Dekel Cable Trays - BQ Notes View")
+    t_bq.Start()
+    bq_view = create_bq_drafting_view(doc)
+    t_bq.Commit()
+    print(u"מבט הנחיות נוצר: {}".format(BQ_VIEW_NAME))
+except Exception as e:
+    try: t_bq.RollBack()
+    except Exception: pass
+    print(u"[!] שגיאה ביצירת מבט הנחיות: {}".format(e))
+
 show_summary_dialog(len(trays) + len(fittings), updated, skipped, failed,
                     skipped_details, failed_details, grand_total)
+
+# פתח מבט הנחיות אחרי סגירת הדיאלוג
+if bq_view is not None:
+    try: uidoc.ActiveView = bq_view
+    except Exception: pass
 
 # ============================================================================
 # 6. הצגת אלמנט במודל — אם המשתמש בחר שורה מהטבלה
