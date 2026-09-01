@@ -35,6 +35,7 @@ import System.Windows.Media
 import System.Windows.Input
 
 from System.Windows.Markup import XamlReader
+from System.Windows.Interop import WindowInteropHelper
 from System.IO             import StringReader
 from System.Xml            import XmlReader as SysXmlReader
 
@@ -53,7 +54,11 @@ doc    = revit.doc
 # CONSTANTS
 # ─────────────────────────────────────────────────────────────────────────────
 
-TOLERANCE = 0.0001   # feet — for elevation matching
+TOLERANCE = 0.01   # feet (~3mm) — for elevation matching.
+# Must be looser than the display rounding (2 decimal cm = ~0.0003 ft) and
+# than the floating-point noise from combining two independently-sourced
+# offsets (e.g. raw + pbp_z vs raw + tz — see true_z below), otherwise
+# levels that are visibly identical in the report still fail comparison.
 
 CM = 30.48           # 1 ft → cm
 
@@ -543,20 +548,6 @@ def _get_levels_for_instance(link_info, inst, debug_output=False):
         base = get_elev_base_label(lvl)
         raw  = lvl.Elevation
 
-        # ── true_z (used ONLY for comparison between models) ─────────────────
-        # We compare Level.Elevation directly (in feet, Revit internal units).
-        # This is the correct approach because:
-        #   - Both arch and consultant files are designed in the same internal
-        #     coordinate system (shared coordinates / same origin).
-        #   - GetTotalTransform().Origin.Z reflects how the link is *placed*
-        #     in the *host* model, which varies per project setup and should
-        #     NOT be used for level-to-level comparison between linked files.
-        #
-        # For PBP-based levels:  true_z = Level.Elevation (raw API value)
-        # For SP-based levels:   true_z = Level.Elevation (raw API value)
-        # Both use the same formula — the Elevation Base affects only display.
-        true_z = raw
-
         # ── display columns (what the user sees in UI / Excel) ────────────────
         if base == "Project Base Point":
             disp_elev = raw          # UI shows relative-to-PBP value
@@ -566,6 +557,18 @@ def _get_levels_for_instance(link_info, inst, debug_output=False):
             disp_elev = raw + tz     # Survey Point: show absolute in host
             disp_pbp  = None
             disp_abs  = raw + tz
+
+        # ── true_z (used ONLY for comparison between models) ─────────────────
+        # A level's raw Elevation is relative to whatever "Elevation Base" it
+        # uses (Project Base Point or Survey Point). Two files legitimately
+        # use different bases for the same physical level (e.g. architecture
+        # on Survey Point, HVAC on Project Base Point) — comparing raw values
+        # directly is invalid in that case even though both levels sit at the
+        # same real-world height. disp_abs already normalizes each level to
+        # an absolute elevation (PBP branch adds the file's own PBP offset,
+        # SP branch adds the link's placement transform), so reuse it here
+        # instead of comparing raw.
+        true_z = disp_abs
 
         if debug_output:
             output.print_md(
@@ -2455,11 +2458,21 @@ class SelectionDialog(object):
         window = self._build()
         frame  = DispatcherFrame()
 
+        # Parent the dialog to Revit's main window so it floats above Revit
+        # without being lost behind it, but without forcing itself ahead of
+        # everything else (pyRevit's own output window, TaskDialogs, other
+        # apps) the way a global Topmost would.
+        try:
+            WindowInteropHelper(window).Owner = System.IntPtr(revit.uiapp.MainWindowHandle.ToInt64())
+        except Exception:
+            pass
+
         def on_closed(sender, e):
             frame.Continue = False
 
         window.Closed += on_closed
         window.Show()
+        window.Activate()
         Dispatcher.PushFrame(frame)
 
 
